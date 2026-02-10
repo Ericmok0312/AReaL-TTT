@@ -1,0 +1,290 @@
+# areal/experimental/ttt_discover/actor.py
+from areal.engine.fsdp_engine import FSDPEngine
+from areal.utils.perf_tracer import trace_perf
+from areal.utils.functional import reward_overlong_penalty
+
+from typing import TYPE_CHECKING, Any, List
+import torch
+import math
+import numpy as np
+
+if TYPE_CHECKING:
+    from areal.api.scheduler_api import Scheduler
+    from .config import TTTDPPOActorConfig
+
+
+class TTTDPPOActor(FSDPEngine):
+    """PPO Actor with TTT-Discover Entropic Objective support.
+    
+    Key difference from standard PPO:
+    - Uses entropic objective for advantage computation: w_beta(a) - 1
+    - Applies KL penalty at token level: A = (w_beta - 1) - lambda * KL
+    - Operates on sequence-level rewards but produces token-level advantages
+    """
+    
+    def __init__(self, config: "TTTDPPOActorConfig"):
+        from areal.trainer.ppo.actor import PPOActor
+        
+        super().__init__(config)
+        self.actor = PPOActor(config, self)
+        
+        # Validate configuration type
+        if not hasattr(config, 'is_tttd_config'):
+            import warnings
+            warnings.warn(
+                "Using standard PPOActorConfig with TTTDPPOActor. "
+                "Entropic advantages will use default parameters (adv_estimator='gae'). "
+                "Consider using TTTDPPOActorConfig for full functionality.",
+                UserWarning
+            )
+        
+        self.config = config
+    
+    @trace_perf("tttd_ppo_actor.compute_logp", category="compute")
+    @torch.no_grad()
+    def compute_logp(self, *args, **kwargs) -> torch.Tensor | None:
+        return self.actor.compute_logp(*args, **kwargs)
+
+    @trace_perf("tttd_ppo_actor.compute_advantages", category="compute")
+    @torch.no_grad()
+    def compute_advantages(self, data: dict[str, Any]) -> dict[str, Any]:
+        """
+        Compute advantages using TTT-Discover entropic objective.
+        
+        Formula: A(a;s) = w_{beta(s)}(a) - 1 - lambda * log(pi_theta(a|s) / pi_ref(a|s))
+        
+        where:
+        - w_{beta(s)}(a) = exp(beta * R(a)) / sum(exp(beta * R(a')))
+        - R(a) is the external reward (sequence-level)
+        - KL penalty is applied at token level
+        """
+        bs = data["input_ids"].shape[0]
+        max_seqlen = data["input_ids"].shape[1]
+        batch_indices = torch.arange(bs, device=data["input_ids"].device, dtype=torch.long)
+
+        # Reward Penalty on length
+        if self.config.overlong_reward_penalty:
+            overlong_tokens = self.config.overlong_tokens
+            overlong_penalty_factor = self.config.overlong_penalty_factor
+
+            assert overlong_tokens is not None
+            assert overlong_penalty_factor is not None
+            data = reward_overlong_penalty(
+                data,
+                overlong_tokens=overlong_tokens,
+                overlong_penalty_factor=overlong_penalty_factor,
+                max_response_length=self.config.max_new_tokens,
+            )
+
+        # Reward Scaling
+        reward_score = data["rewards"]
+        reward_score = (reward_score + self.actor.reward_bias) * self.actor.reward_scaling
+        reward_score = torch.clip(
+            reward_score, max=self.actor.reward_clip, min=-self.actor.reward_clip
+        )
+        if self.actor.reward_norm:
+            reward_score = self.actor.reward_norm(reward_score)
+
+        loss_mask = data["loss_mask"].float()
+        loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
+        
+        # Apply the mask to log probabilities.
+        if not self.config.use_decoupled_loss and self.config.recompute_logprob:
+            # Overwrite logprobs produced by the inference engine
+            prox_logp_value = data["prox_logp"]
+            if prox_logp_value is None:
+                raise ValueError(
+                    "prox_logp is None but recompute_logprob=True. "
+                    "This indicates compute_logp() was skipped incorrectly."
+                )
+            old_logp = data["logprobs"] = prox_logp_value
+        else:
+            old_logp = torch.roll(data["logprobs"], shifts=-1, dims=-1)
+            if not self.config.use_decoupled_loss:
+                # prox logp not available, use inferenced logp
+                data["prox_logp"] = old_logp
+        ref_logp = data.get("ref_logp")
+        if ref_logp is None:
+            ref_logp = torch.zeros_like(old_logp)
+        ref_logp *= loss_mask
+        old_logp *= loss_mask
+
+        # Compute KL divergence.
+        attn_mask = data["attention_mask"]
+        seqlens = attn_mask.sum(-1).long()
+        
+        kl_div = self.actor.kl_estimator(old_logp, ref_logp)
+        kl_penalty = self.actor.kl_ctl * kl_div  # [bs, seqlen]
+        kl_rewards = -kl_penalty
+        kl_rewards[batch_indices, seqlens - 1] = 0
+        
+        # Store kl_rewards for logging compatibility
+        data["kl_rewards"] = kl_rewards * loss_mask
+
+        # Compute Entropic Advantages.
+        # TTT-Discover uses sequence-level external reward only (no KL aggregation)
+        # to compute w_{beta(s)}(a), then subtracts token-level KL penalty.
+        group_ids = self._extract_group_ids(data, bs)
+        
+        # Compute sequence-level entropic advantages: w_beta - 1
+        entropic_adv_seq = self._compute_entropic_advantages(
+            reward_score, group_ids, self.config.adv_estimator
+        )  # [bs]
+        
+        # Broadcast to token level: [bs] -> [bs, seqlen]
+        entropic_adv_token = entropic_adv_seq.unsqueeze(-1).expand(-1, max_seqlen)
+        
+        # Apply TTT-Discover formula: A = (w_beta - 1) - lambda * KL
+        advantages = entropic_adv_token - kl_penalty
+        advantages = advantages * loss_mask
+        
+        # Returns equal advantages since TTT-Discover has no value function baseline
+        data["returns"] = advantages
+
+        # Optionally perform advantage normalization.
+        if self.actor.adv_norm is not None:
+            advantages = self.actor.adv_norm(advantages, loss_mask)
+
+        # Store data in the dict.
+        data["advantages"] = advantages
+        data["loss_mask"] = loss_mask
+        data["logprobs"] = old_logp
+
+        return data
+
+    def _extract_group_ids(self, data: dict, batch_size: int) -> torch.Tensor:
+        """Extract group ids from data or auto-generate based on group_size config."""
+        device = data["input_ids"].device
+        
+        # Use explicit group_ids if provided
+        if "group_ids" in data:
+            return data["group_ids"]
+        
+        # Auto-generate from group_size config
+        group_size = getattr(self.config, "group_size", None)
+        if group_size is not None and group_size > 0:
+            group_ids = torch.arange(batch_size, device=device) // group_size
+            return group_ids
+        
+        # Default: entire batch as one group (standard TTT-Discover behavior)
+        return torch.zeros(batch_size, device=device, dtype=torch.long)
+
+    def _compute_entropic_advantages(
+        self, 
+        rewards: torch.Tensor, 
+        group_ids: torch.Tensor, 
+        method: str
+    ) -> torch.Tensor:
+        """Compute sequence-level entropic advantages (w_beta - 1) for each group."""
+        unique_groups = torch.unique(group_ids)
+        advantages = torch.zeros_like(rewards)
+        
+        for gid in unique_groups:
+            mask = (group_ids == gid)
+            group_rewards = rewards[mask]
+            
+            if method == "mean_baseline":
+                # Simple mean baseline: R - mean(R)
+                adv = group_rewards - group_rewards.mean()
+            elif method == "entropic":
+                # Fixed beta entropic: w_beta - 1
+                beta = self.config.adv_estimator_beta
+                adv = self._entropic_weight_minus_one(group_rewards, beta)
+            elif method == "entropic_adaptive_beta":
+                # Adaptive beta based on KL constraint
+                delta = getattr(self.config, "adv_estimator_target_kl", 0.693)
+                beta_max = getattr(self.config, "adv_estimator_beta_max", 1e6)
+                iters = getattr(self.config, "adv_estimator_beta_iters", 60)
+                
+                beta = self._solve_adaptive_beta(group_rewards, delta, beta_max, iters)
+                adv = self._entropic_weight_minus_one(group_rewards, beta)
+            else:
+                raise ValueError(f"Unknown advantage estimator: {method}")
+            
+            advantages[mask] = adv
+        
+        return advantages
+
+    def _entropic_weight_minus_one(self, rewards_G: torch.Tensor, beta: float) -> torch.Tensor:
+        """
+        Compute w_beta - 1 where w_beta = exp(beta * R) / E[exp(beta * R)].
+        
+        Uses leave-one-out (LOO) estimation for Z to reduce variance:
+        Z = (sum(exp(beta * R)) - exp(beta * R_i)) / (k - 1)
+        """
+        if beta == 0:
+            return torch.zeros_like(rewards_G)
+            
+        # Numerical stability: subtract max before exp
+        s_safe = rewards_G - rewards_G.max()
+        exp_beta_r = torch.exp(beta * s_safe)
+        k = exp_beta_r.shape[0]
+        
+        if k == 1:
+            # Single sample: uniform weight
+            Z = exp_beta_r
+        else:
+            # Leave-one-out estimation of partition function
+            sum_exp = exp_beta_r.sum()
+            Z = (sum_exp - exp_beta_r) / (k - 1)
+        
+        # w_beta = exp(beta * R) / Z
+        w_beta = exp_beta_r / (Z + 1e-12)
+        
+        # Return w_beta - 1 (so that E[w_beta - 1] = 0)
+        return w_beta - 1.0
+
+    def _solve_adaptive_beta(
+        self, 
+        rewards_G: torch.Tensor, 
+        delta: float, 
+        beta_max: float, 
+        iters: int
+    ) -> torch.Tensor:
+        """Solve for beta such that KL(q_beta || uniform) = delta."""
+
+        r = rewards_G.float()
+        k = r.shape[0]
+        
+        if k < 2:
+            return r.new_tensor(0.0)
+            
+        logK = math.log(k)
+        
+        def kl_hat(beta_scalar: float) -> float:
+            """Compute KL(q_beta || uniform) for given beta."""
+            b = r.new_tensor(beta_scalar)
+            logits = b * (r - r.max())
+            logq = logits - torch.logsumexp(logits, dim=0)
+            q = torch.exp(logq)
+            kl = (q * (logq + logK)).sum()
+            return float(kl.item())
+        
+        # Binary search for beta
+        lo, hi = 0.0, 1.0
+        
+        # Expand search range if needed
+        if kl_hat(hi) < delta:
+            while hi < beta_max and kl_hat(hi) < delta:
+                hi *= 2.0
+            if kl_hat(hi) < delta:
+                return r.new_tensor(hi)
+            
+        
+        # Binary search
+        for _ in range(iters):
+            mid = 0.5 * (lo + hi)
+            if kl_hat(mid) < delta:
+                lo = mid
+            else:
+                hi = mid
+                
+        return r.new_tensor(hi)
+
+    def ppo_update(self, *args, **kwargs) -> None:
+        self.actor.ppo_update(*args, **kwargs)
+
+    @classmethod
+    def as_controller(cls, config: "TTTDPPOActorConfig", scheduler: Scheduler):
+        from areal.trainer.ppo.actor import PPOActorController
+        return PPOActorController(train_engine=cls, config=config, scheduler=scheduler)
