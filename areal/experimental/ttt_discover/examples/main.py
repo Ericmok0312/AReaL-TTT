@@ -7,14 +7,13 @@ import torch.distributed as dist
 
 from areal import current_platform
 from areal.api.alloc_mode import AllocationMode
-from areal.api.cli_args import GRPOConfig, load_expr_config
+from areal.api.cli_args import load_expr_config
 from areal.api.io_struct import FinetuneSpec, StepInfo, WeightUpdateMeta
 from areal.dataset import get_custom_dataset
-from areal.engine.fsdp_engine import FSDPPPOActor
 from areal.engine.vllm_remote import RemotevLLMEngine
 from areal.reward.gsm8k import gsm8k_reward_fn
 from areal.utils import seeding, stats_tracker
-from areal.utils.dataloader import create_dataloader
+
 from areal.utils.evaluator import Evaluator
 from areal.utils.hf_utils import load_hf_tokenizer
 from areal.utils.recover import RecoverHandler
@@ -22,12 +21,17 @@ from areal.utils.saver import Saver
 from areal.utils.stats_logger import StatsLogger
 from areal.workflow.rlvr import RLVRWorkflow
 
+from areal.experimental.ttt_discover.config import TTTDPPOActorConfig
+from areal.experimental.ttt_discover.actor import TTTDActor
+from areal.experimental.ttt_discover.dataloader import create_tttd_dataloader
+from areal.experimental.ttt_discover.sampler import create_sampler
+
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
 def main(args):
-    config, _ = load_expr_config(args, GRPOConfig)
-    config: GRPOConfig
+    config, _ = load_expr_config(args, TTTDPPOActorConfig)
+    config: TTTDPPOActorConfig
 
     rank = int(os.getenv("RANK"))
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
@@ -38,29 +42,25 @@ def main(args):
     assert parallel_strategy is not None
 
     # Initialize train engine
-    actor = FSDPPPOActor(config=config.actor)
+    actor = TTTDActor(config=config.actor)
     actor.create_process_group(parallel_strategy=parallel_strategy)
 
     # Create dataset and dataloaders
+    # TODO: create dataset for TTT-Discover
     train_dataset = get_custom_dataset(
         split="train", dataset_config=config.train_dataset, tokenizer=tokenizer
     )
-    valid_dataset = get_custom_dataset(
-        split="test", dataset_config=config.valid_dataset, tokenizer=tokenizer
-    )
 
-    train_dataloader = create_dataloader(
-        train_dataset,
+    # Replace dataloader with TTT-Discover specific PUCT dataloader
+    sampler = create_sampler(config.sampler, train_dataset, tokenizer)
+
+    train_dataloader = create_tttd_dataloader(
+        sampler=sampler,
         rank=actor.data_parallel_rank,
         world_size=actor.data_parallel_world_size,
         dataset_config=config.train_dataset,
     )
-    valid_dataloader = create_dataloader(
-        valid_dataset,
-        rank=actor.data_parallel_rank,
-        world_size=actor.data_parallel_world_size,
-        dataset_config=config.valid_dataset,
-    )
+
     ft_spec = FinetuneSpec(
         total_train_epochs=config.total_train_epochs,
         dataset_size=len(train_dataloader) * config.train_dataset.batch_size,
@@ -104,7 +104,7 @@ def main(args):
 
     ref = None
     if config.actor.kl_ctl > 0 and config.ref is not None:
-        ref = FSDPPPOActor(config=config.ref)
+        ref = TTTDActor(config=config.ref)
         ref.create_process_group(parallel_strategy=parallel_strategy)
         ref.initialize(None, ft_spec)
 

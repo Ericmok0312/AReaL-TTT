@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from .config import TTTDPPOActorConfig
 
 
-class TTTDPPOActor(FSDPEngine):
+class TTTDActor(FSDPEngine):
     """PPO Actor with TTT-Discover Entropic Objective support.
     
     Key difference from standard PPO:
