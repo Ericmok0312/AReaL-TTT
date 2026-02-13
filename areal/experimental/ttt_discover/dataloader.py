@@ -33,6 +33,7 @@ class _StateSamplerIterableDataset(IterableDataset):
         self.state_to_prompt_fn = state_to_prompt_fn or self._default_prompt_extractor
         self._iteration_count = 0
         
+    # TODO: Change to return a Message content, or ensure state_to_prompt_fn is a function returns such pattern 
     def _default_prompt_extractor(self, state: "State") -> str:
         """Extract prompt from state for LLM input."""
         if hasattr(state, 'code') and state.code:
