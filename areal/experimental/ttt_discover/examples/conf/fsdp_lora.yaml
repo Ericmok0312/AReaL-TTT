@@ -96,8 +96,8 @@ cluster:
     type: nfs
     nfs_record_root: /tmp/areal/name_resolve
 
-# FSDP only for LoRA (no tensor/pipeline parallelism)
-allocation_mode: sglang:d8p1t1+d8p1t1
+# FSDP + SGLang for LoRA (4 GPUs for SGLang inference, 4 GPUs for FSDP training)
+allocation_mode: sglang:d4+fsdp:d4
 
 scheduler:
   type: null
