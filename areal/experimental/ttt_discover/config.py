@@ -158,6 +158,10 @@ class TTTDPPOActorConfig(PPOActorConfig):
         default_factory=dict,
         metadata={"help": "SGLang configuration"}
     )
+    vllm: dict = field(
+        default_factory=dict,
+        metadata={"help": "vLLM configuration"}
+    )
     sampler: SamplerConfig = field(
         default_factory=SamplerConfig,
         metadata={"help": "Configuration for PUCTSampler"}
