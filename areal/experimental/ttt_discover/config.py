@@ -1,6 +1,6 @@
 # areal/experimental/ttt_discover/config.py
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Any
 from areal.api.cli_args import (
     PPOActorConfig,
     ClusterSpecConfig,
@@ -243,14 +243,13 @@ class TTTDPPOActorConfig(PPOActorConfig):
         metadata={"help": "Internal flag to identify TTT-D config"}
     )
     
-    @property
-    def actor(self):
-        """Return self as the actor config.
-        
-        This allows the training script to access config.actor when the config
-        itself is the actor configuration (flattened structure).
-        """
-        return self
+    # Actor field for local launcher compatibility
+    # This field exists to satisfy the launcher validation, but the actual
+    # actor config is this object itself (flattened structure)
+    actor: Any = field(
+        default=None,
+        metadata={"help": "Actor configuration (for local launcher compatibility)"}
+    )
     
     def __post_init__(self):
         """Validate configuration consistency"""
