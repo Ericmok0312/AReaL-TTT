@@ -6,7 +6,30 @@ import time
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
-from tinker_cookbook.recipes.ttt.state import to_json_serializable
+def to_json_serializable(obj: Any) -> Any:
+    """Convert an object to a JSON-serializable format.
+    
+    Handles common types like numpy arrays, tensors, and nested structures.
+    Falls back to returning the object as-is for simple types.
+    """
+    import numpy as np
+    
+    if obj is None:
+        return None
+    elif isinstance(obj, (str, int, float, bool)):
+        return obj
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (list, tuple)):
+        return [to_json_serializable(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {str(k): to_json_serializable(v) for k, v in obj.items()}
+    elif hasattr(obj, 'tolist'):  # For torch tensors or similar
+        return obj.tolist()
+    elif hasattr(obj, '__dict__'):
+        return to_json_serializable(obj.__dict__)
+    else:
+        return str(obj)
 
 
 # -----------------------------
