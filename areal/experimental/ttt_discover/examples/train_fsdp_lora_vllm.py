@@ -137,38 +137,25 @@ def main(args):
         train_batch_size=batch_size,
     )
     
-    # Initialize FSDP actor first (saves initial LoRA weights)
+    # Initialize FSDP actor first
     actor.initialize(None, ft_spec)
     
-    # Save initial LoRA weights for vLLM to load
-    if config.use_lora and actor.is_data_parallel_head():
-        lora_save_path = os.path.join(
-            config.saver.fileroot, 
-            config.saver.experiment_name, 
-            config.saver.trial_name, 
-            "lora"
+    # Setup weight update meta for LoRA (handles initial weight saving)
+    if config.weight_update_mode == "disk":
+        weight_update_meta = WeightUpdateMeta.from_disk(
+            config.saver.experiment_name,
+            config.saver.trial_name,
+            config.saver.fileroot,
+            use_lora=config.use_lora,
+            lora_name=config.gconfig.lora_name,
+            lora_int_id=1,
+            base_model_name=config.path,
         )
-        os.makedirs(lora_save_path, exist_ok=True)
-        # Save initial LoRA adapter
-        from peft import LoraConfig, get_peft_model, PeftModel
-        if hasattr(actor, 'model') and actor.model is not None:
-            if not isinstance(actor.model, PeftModel):
-                # Model not yet wrapped with LoRA, skip saving for now
-                pass
-            else:
-                actor.model.save_pretrained(lora_save_path)
-        print(f"[Rank {rank}] Saved initial LoRA weights to {lora_save_path}")
-    
-    # Wait for all ranks to ensure LoRA is saved
-    if dist.is_initialized():
-        dist.barrier()
-    
-    weight_update_meta = WeightUpdateMeta.from_disk(
-        config.saver.experiment_name,
-        config.saver.trial_name,
-        config.saver.fileroot,
-        use_lora=True,
-    )
+    else:
+        raise ValueError(
+            f"Invalid weight_update_mode: {config.weight_update_mode}. "
+            "Expected 'disk'."
+        )
     
     # vLLM: distributed rollout (initialized after LoRA weights are saved)
     rollout = RemotevLLMEngine(config.rollout)
