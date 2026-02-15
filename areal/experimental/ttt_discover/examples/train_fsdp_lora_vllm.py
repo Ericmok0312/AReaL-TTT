@@ -142,7 +142,6 @@ def main(args):
     
     # Save initial LoRA weights for vLLM to load
     if config.use_lora and actor.is_data_parallel_head():
-        import os
         lora_save_path = os.path.join(
             config.saver.fileroot, 
             config.saver.experiment_name, 
