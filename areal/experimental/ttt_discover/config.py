@@ -63,6 +63,35 @@ class SamplerConfig:
         default="cp",
         metadata={"help": "Environment type: 'cp', 'ac1', 'ac2', 'mla_decode_nvidia', 'trimul', 'erdos', 'denoising', 'ahc039', 'ahc058'"}
     )
+    
+    # Environment-specific parameters
+    # Circle Packing (cp)
+    n_item: int = field(
+        default=26,
+        metadata={"help": "Number of circles for Circle Packing: 26 or 32"}
+    )
+    
+    # GPU Mode (trimul, mla_decode_nvidia)
+    gpu_type: str = field(
+        default="H100",
+        metadata={"help": "GPU type for Modal execution: H100, H200, etc."}
+    )
+    eval_timeout: int = field(
+        default=60,
+        metadata={"help": "Timeout for code execution (seconds)"}
+    )
+    
+    # Erdos (erdos)
+    n: int = field(
+        default=100,
+        metadata={"help": "Size parameter for Erdos construction"}
+    )
+    
+    # Inequalities/AC1 (ac1)
+    budget_s: int = field(
+        default=1000,
+        metadata={"help": "Budget parameter for inequalities"}
+    )
 
 
 @dataclass
