@@ -285,6 +285,6 @@ class TTTDActor(FSDPEngine):
         self.actor.ppo_update(*args, **kwargs)
 
     @classmethod
-    def as_controller(cls, config: "TTTDPPOActorConfig", scheduler: Scheduler):
+    def as_controller(cls, config: "TTTDPPOActorConfig", scheduler: "Scheduler"):
         from areal.trainer.ppo.actor import PPOActorController
         return PPOActorController(train_engine=cls, config=config, scheduler=scheduler)
