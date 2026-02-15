@@ -232,10 +232,13 @@ def main(args):
             f"Please set config.sampler.env_type to a supported value."
         )
     
-    if tokenizer.pad_token_id not in config.gconfig.stop_token_ids:
-        config.gconfig.stop_token_ids.append(tokenizer.pad_token_id)
-    if tokenizer.eos_token_id not in config.gconfig.stop_token_ids:
-        config.gconfig.stop_token_ids.append(tokenizer.eos_token_id)
+    # Ensure stop_token_ids exists in gconfig
+    if 'stop_token_ids' not in config.gconfig:
+        config.gconfig['stop_token_ids'] = []
+    if tokenizer.pad_token_id not in config.gconfig['stop_token_ids']:
+        config.gconfig['stop_token_ids'].append(tokenizer.pad_token_id)
+    if tokenizer.eos_token_id not in config.gconfig['stop_token_ids']:
+        config.gconfig['stop_token_ids'].append(tokenizer.eos_token_id)
     
     workflow = TTTDiscoverWorkflow(
         env=env,
@@ -244,7 +247,7 @@ def main(args):
         enable_thinking=False,
     )
     
-    group_size = config.gconfig.n_samples
+    group_size = config.gconfig.get('n_samples', 64)
     
     saver = Saver(config.saver, ft_spec)
     stats_logger = StatsLogger(config, ft_spec)

@@ -7,6 +7,8 @@ from areal.api.cli_args import (
     StatsLoggerConfig,
     SaverConfig,
     InferenceEngineConfig,
+    EvaluatorConfig,
+    RecoverConfig,
 )
 
 
@@ -178,12 +180,12 @@ class TTTDPPOActorConfig(PPOActorConfig):
         default_factory=SaverConfig,
         metadata={"help": "Model saver configuration"}
     )
-    recover: dict = field(
-        default_factory=dict,
+    recover: RecoverConfig = field(
+        default_factory=RecoverConfig,
         metadata={"help": "Recovery configuration"}
     )
-    evaluator: dict = field(
-        default_factory=dict,
+    evaluator: EvaluatorConfig = field(
+        default_factory=EvaluatorConfig,
         metadata={"help": "Evaluator configuration"}
     )
     stats_logger: StatsLoggerConfig = field(
