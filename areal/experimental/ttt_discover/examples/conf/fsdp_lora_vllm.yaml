@@ -83,6 +83,40 @@ scheduling_spec:
     cmd: python3 -m areal.infra.rpc.rpc_server
     env_vars: {}
 
+# Actor configuration (required by local launcher)
+actor:
+  path: ${path}
+  init_from_scratch: ${init_from_scratch}
+  disable_dropout: ${disable_dropout}
+  gradient_checkpointing: ${gradient_checkpointing}
+  dtype: ${dtype}
+  mb_spec: ${mb_spec}
+  optimizer: ${optimizer}
+  eps_clip: ${eps_clip}
+  temperature: ${temperature}
+  reward_scaling: ${reward_scaling}
+  reward_bias: ${reward_bias}
+  kl_ctl: ${kl_ctl}
+  ppo_n_minibatches: ${ppo_n_minibatches}
+  recompute_logprob: ${recompute_logprob}
+  use_decoupled_loss: ${use_decoupled_loss}
+  behav_imp_weight_cap: ${behav_imp_weight_cap}
+  reward_norm: ${reward_norm}
+  adv_norm: ${adv_norm}
+  max_new_tokens: ${max_new_tokens}
+  use_lora: ${use_lora}
+  peft_type: ${peft_type}
+  lora_rank: ${lora_rank}
+  lora_alpha: ${lora_alpha}
+  target_modules: ${target_modules}
+  weight_update_mode: ${weight_update_mode}
+  adv_estimator: ${adv_estimator}
+  adv_estimator_beta: ${adv_estimator_beta}
+  adv_estimator_target_kl: ${adv_estimator_target_kl}
+  adv_estimator_beta_max: ${adv_estimator_beta_max}
+  adv_estimator_beta_iters: ${adv_estimator_beta_iters}
+  scheduling_spec: ${scheduling_spec}
+
 # ============================================================================
 # Other Configurations
 # ============================================================================

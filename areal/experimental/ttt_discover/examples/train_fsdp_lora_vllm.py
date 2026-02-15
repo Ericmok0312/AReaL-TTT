@@ -104,7 +104,8 @@ def main(args):
     parallel_strategy = allocation_mode.train
     assert parallel_strategy is not None
     
-    actor = TTTDActor(config=config.actor)
+    # TTTDPPOActorConfig extends PPOActorConfig, so we use config directly
+    actor = TTTDActor(config=config)
     actor.create_process_group(parallel_strategy=parallel_strategy)
     
     # TTT-Discover does not require a traditional dataset.
@@ -154,8 +155,14 @@ def main(args):
     actor.connect_engine(rollout, weight_update_meta)
     
     ref = None
-    if config.actor.kl_ctl > 0 and config.ref is not None:
-        ref = TTTDActor(config=config.ref)
+    if config.kl_ctl > 0 and config.ref is not None:
+        # Convert ref dict to config object if needed
+        from areal.api.cli_args import PPOActorConfig
+        if isinstance(config.ref, dict):
+            ref_config = PPOActorConfig(**config.ref)
+        else:
+            ref_config = config.ref
+        ref = TTTDActor(config=ref_config)
         ref.create_process_group(parallel_strategy=parallel_strategy)
         ref.initialize(None, ft_spec)
     
@@ -285,7 +292,7 @@ def main(args):
         
         dist.barrier(group=actor.cpu_group)
         
-        if config.actor.should_compute_prox_logp():
+        if config.should_compute_prox_logp():
             with stats_tracker.record_timing("recompute_logp"):
                 training_batch["prox_logp"] = actor.compute_logp(training_batch)
         
