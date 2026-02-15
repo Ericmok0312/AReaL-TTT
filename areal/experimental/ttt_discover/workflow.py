@@ -117,6 +117,7 @@ class TTTDiscoverWorkflow(RolloutWorkflow):
         tokenizer: PreTrainedTokenizerFast | str,
         enable_thinking: bool = False,
     ):
+        self._last_metadata: dict = {}
         """
         Initialize TTTDiscoverWorkflow.
         
@@ -261,7 +262,8 @@ class TTTDiscoverWorkflow(RolloutWorkflow):
             trajectory = self._create_trajectory(resp, reward)
             
             # Store metadata for potential sampler update (external)
-            trajectory["_tttd_metadata"] = {
+            # Note: Metadata is NOT included in trajectory to avoid concatenation issues
+            self._last_metadata = {
                 "parent_state": state,
                 "reward": reward,
                 "is_valid": result.is_valid,
@@ -316,8 +318,8 @@ class TTTDiscoverWorkflow(RolloutWorkflow):
                 ))
                 continue
             
-            # Extract metadata
-            metadata = trajectory.pop("_tttd_metadata", {})
+            # Get metadata from instance variable
+            metadata = self._last_metadata
             
             # Create child state if valid
             child_state = None
