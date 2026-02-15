@@ -142,12 +142,15 @@ def main(args):
     
     # Setup weight update meta for LoRA (handles initial weight saving)
     if config.weight_update_mode == "disk":
+        # gconfig is loaded as a dict, extract lora_name from it
+        gconfig_dict = config.gconfig if isinstance(config.gconfig, dict) else vars(config.gconfig)
+        lora_name = gconfig_dict.get('lora_name', 'tttd_lora_adapter')
         weight_update_meta = WeightUpdateMeta.from_disk(
             config.saver.experiment_name,
             config.saver.trial_name,
             config.saver.fileroot,
             use_lora=config.use_lora,
-            lora_name=config.gconfig.lora_name,
+            lora_name=lora_name,
             lora_int_id=1,
             base_model_name=config.path,
         )
