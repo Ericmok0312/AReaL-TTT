@@ -1,6 +1,6 @@
 # areal/experimental/ttt_discover/config.py
 from dataclasses import dataclass, field
-from typing import Optional, Literal
+from typing import Optional
 from areal.api.cli_args import PPOActorConfig
 
 
@@ -73,7 +73,7 @@ class TTTDPPOActorConfig(PPOActorConfig):
     """
     
     # Advantage estimator selection
-    adv_estimator: Literal["gae", "mean_baseline", "entropic", "entropic_adaptive_beta"] = field(
+    adv_estimator: str = field(
         default="gae",
         metadata={
             "help": "Advantage estimation method. "
@@ -136,6 +136,11 @@ class TTTDPPOActorConfig(PPOActorConfig):
     def __post_init__(self):
         """Validate configuration consistency"""
         super().__post_init__()  # Call parent validation
+        
+        # Validate adv_estimator value
+        valid_estimators = ["gae", "mean_baseline", "entropic", "entropic_adaptive_beta"]
+        if self.adv_estimator not in valid_estimators:
+            raise ValueError(f"adv_estimator must be one of {valid_estimators}, got {self.adv_estimator}")
         
         if self.adv_estimator in ["entropic", "entropic_adaptive_beta"]:
             if self.adv_estimator_beta <= 0 and self.adv_estimator == "entropic":
