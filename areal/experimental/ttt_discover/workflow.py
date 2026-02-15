@@ -155,7 +155,7 @@ class TTTDiscoverWorkflow(RolloutWorkflow):
             "logprobs": torch.tensor(logprobs, dtype=torch.float32).unsqueeze(0),
             "versions": torch.tensor(versions, dtype=torch.int32).unsqueeze(0),
             "attention_mask": torch.ones(len(seq), dtype=torch.bool).unsqueeze(0),
-            "rewards": torch.tensor(reward, dtype=torch.float32),
+            "rewards": torch.tensor([reward], dtype=torch.float32),
         }
 
     @trace_session("reward")
