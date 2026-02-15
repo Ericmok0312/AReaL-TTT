@@ -137,12 +137,32 @@ def main(args):
         train_batch_size=batch_size,
     )
     
-    # vLLM: distributed rollout
-    rollout = RemotevLLMEngine(config.rollout)
-    eval_rollout = RemotevLLMEngine(deepcopy(config.rollout))
-    rollout.initialize(train_data_parallel_size=parallel_strategy.dp_size)
-    eval_rollout.config.max_head_offpolicyness = int(1e12)
-    eval_rollout.initialize()
+    # Initialize FSDP actor first (saves initial LoRA weights)
+    actor.initialize(None, ft_spec)
+    
+    # Save initial LoRA weights for vLLM to load
+    if config.use_lora and actor.is_data_parallel_head():
+        import os
+        lora_save_path = os.path.join(
+            config.saver.fileroot, 
+            config.saver.experiment_name, 
+            config.saver.trial_name, 
+            "lora"
+        )
+        os.makedirs(lora_save_path, exist_ok=True)
+        # Save initial LoRA adapter
+        from peft import LoraConfig, get_peft_model, PeftModel
+        if hasattr(actor, 'model') and actor.model is not None:
+            if not isinstance(actor.model, PeftModel):
+                # Model not yet wrapped with LoRA, skip saving for now
+                pass
+            else:
+                actor.model.save_pretrained(lora_save_path)
+        print(f"[Rank {rank}] Saved initial LoRA weights to {lora_save_path}")
+    
+    # Wait for all ranks to ensure LoRA is saved
+    if dist.is_initialized():
+        dist.barrier()
     
     weight_update_meta = WeightUpdateMeta.from_disk(
         config.saver.experiment_name,
@@ -151,7 +171,13 @@ def main(args):
         use_lora=True,
     )
     
-    actor.initialize(None, ft_spec)
+    # vLLM: distributed rollout (initialized after LoRA weights are saved)
+    rollout = RemotevLLMEngine(config.rollout)
+    eval_rollout = RemotevLLMEngine(deepcopy(config.rollout))
+    rollout.initialize(train_data_parallel_size=parallel_strategy.dp_size)
+    eval_rollout.config.max_head_offpolicyness = int(1e12)
+    eval_rollout.initialize()
+    
     actor.connect_engine(rollout, weight_update_meta)
     
     ref = None

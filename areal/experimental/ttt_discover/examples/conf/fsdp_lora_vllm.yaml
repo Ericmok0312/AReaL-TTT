@@ -196,11 +196,9 @@ vllm:
   dtype: ${dtype}
   max_model_len: 32768
   gpu_memory_utilization: 0.9
-  # LoRA support
+  # LoRA support - dynamically loaded after FSDP initializes
+  # Initial LoRA is loaded from base model path (will be updated during training)
   enable_lora: ${use_lora}
-  # lora_modules format: JSON string with name, path, and base_model_name
-  # The actual LoRA weights will be updated from FSDP training
-  lora_modules: '{"name": "${gconfig.lora_name}", "path": "${cluster.fileroot}/${experiment_name}/${trial_name}/lora", "base_model_name": "${path}"}'
 
 # ============================================================================
 # PUCT Sampler Configuration
