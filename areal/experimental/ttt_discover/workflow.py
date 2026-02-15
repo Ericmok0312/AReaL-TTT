@@ -117,7 +117,6 @@ class TTTDiscoverWorkflow(RolloutWorkflow):
         tokenizer: PreTrainedTokenizerFast | str,
         enable_thinking: bool = False,
     ):
-        self._last_metadata: dict = {}
         """
         Initialize TTTDiscoverWorkflow.
         
@@ -127,6 +126,9 @@ class TTTDiscoverWorkflow(RolloutWorkflow):
             tokenizer: Tokenizer or path to tokenizer
             enable_thinking: Whether to enable thinking tokens
         """
+        # Storage for batch metadata - cleared at start of each batch by training script
+        self._batch_metadata: list[dict] = []
+        
         self.env = env
         
         # Initialize tokenizer
@@ -261,16 +263,16 @@ class TTTDiscoverWorkflow(RolloutWorkflow):
             # Create trajectory
             trajectory = self._create_trajectory(resp, reward)
             
-            # Store metadata for potential sampler update (external)
-            # Note: Metadata is NOT included in trajectory to avoid concatenation issues
-            self._last_metadata = {
+            # Store metadata in workflow's batch storage
+            # This provides a side-channel for non-tensor data
+            self._batch_metadata.append({
                 "parent_state": state,
                 "reward": reward,
                 "is_valid": result.is_valid,
                 "code": code,
                 "observation": result.observation,
                 "metadata": result.metadata,
-            }
+            })
             
             return trajectory
             
@@ -318,8 +320,9 @@ class TTTDiscoverWorkflow(RolloutWorkflow):
                 ))
                 continue
             
-            # Get metadata from instance variable
-            metadata = self._last_metadata
+            # Get metadata from workflow's batch storage
+            # Note: In rollout_group, metadata was stored during arun_episode
+            metadata = self._batch_metadata[len(results)] if len(results) < len(self._batch_metadata) else {}
             
             # Create child state if valid
             child_state = None

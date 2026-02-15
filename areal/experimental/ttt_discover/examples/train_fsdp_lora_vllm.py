@@ -43,6 +43,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 def process_batch_and_update_sampler(
     batch: dict,
+    metadata: list[dict],
     sampler,
     env: BaseEnv,
     group_size: int,
@@ -52,8 +53,14 @@ def process_batch_and_update_sampler(
     
     Assumes AReaL returns ordered: [parent_0_x64, parent_1_x64, ...]
     Each DP rank processes its local batch.
+    
+    Args:
+        batch: The trajectory batch from prepare_batch
+        metadata: List of metadata dicts from workflow._batch_metadata
+        sampler: The state sampler (PUCTSampler)
+        env: The environment
+        group_size: Number of rollouts per parent
     """
-    metadata = batch["_tttd_metadata"]
     batch_size = batch["rewards"].shape[0]
     num_parents = batch_size // group_size
     
@@ -271,6 +278,9 @@ def main(args):
             steps_per_epoch=max_steps,
         )
         
+        # Clear workflow's metadata storage before rollout
+        workflow._batch_metadata.clear()
+        
         # vLLM: each rank does its own rollout (no broadcast needed)
         with stats_tracker.record_timing("rollout"):
             batch = actor.prepare_batch(
@@ -281,8 +291,11 @@ def main(args):
             )
         
         with stats_tracker.record_timing("group_processing"):
+            # Get metadata from workflow's side-channel storage
+            batch_metadata = workflow._batch_metadata
             training_batch = process_batch_and_update_sampler(
                 batch=batch,
+                metadata=batch_metadata,
                 sampler=sampler,
                 env=env,
                 group_size=group_size,
