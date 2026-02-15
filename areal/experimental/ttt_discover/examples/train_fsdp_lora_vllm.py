@@ -240,6 +240,9 @@ def main(args):
     # NOT epochs, since PUCTSampler manages states internally
     max_steps = getattr(config, 'max_steps', 50)
     
+    # Track best reward for logging
+    best_reward = float('-inf')
+    
     for global_step in range(start_step, max_steps):
         step_info = StepInfo(
             global_step=global_step,
@@ -267,6 +270,18 @@ def main(args):
             # Only rank 0 flushes to avoid conflicts
             if actor.is_data_parallel_head():
                 sampler.flush(step=global_step)
+            
+            # Track and log best reward
+            step_rewards = training_batch["rewards"].cpu().numpy()
+            step_max_reward = float(step_rewards.max())
+            step_mean_reward = float(step_rewards.mean())
+            best_reward = max(best_reward, step_max_reward)
+            
+            if actor.is_data_parallel_head():
+                print(f"[Step {global_step}] "
+                      f"Max Reward: {step_max_reward:.4f} | "
+                      f"Mean Reward: {step_mean_reward:.4f} | "
+                      f"Best Overall: {best_reward:.4f}")
         
         dist.barrier(group=actor.cpu_group)
         
