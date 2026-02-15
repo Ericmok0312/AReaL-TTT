@@ -175,13 +175,8 @@ def main(args):
     
     ref = None
     if config.kl_ctl > 0 and config.ref is not None:
-        # Convert ref dict to config object if needed
-        from areal.api.cli_args import PPOActorConfig
-        if isinstance(config.ref, dict):
-            ref_config = PPOActorConfig(**config.ref)
-        else:
-            ref_config = config.ref
-        ref = TTTDActor(config=ref_config)
+        # ref is now a PPOActorConfig object (properly typed in TTTDPPOActorConfig)
+        ref = TTTDActor(config=config.ref)
         ref.create_process_group(parallel_strategy=parallel_strategy)
         ref.initialize(None, ft_spec)
     

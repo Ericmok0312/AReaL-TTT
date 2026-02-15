@@ -11,6 +11,7 @@ from areal.api.cli_args import (
     RecoverConfig,
     GenerationHyperparameters,
     MicroBatchSpec,
+    PPOCriticConfig,
 )
 
 
@@ -154,9 +155,13 @@ class TTTDPPOActorConfig(PPOActorConfig):
         default_factory=GenerationHyperparameters,
         metadata={"help": "Generation configuration"}
     )
-    ref: dict = field(
-        default_factory=dict,
+    ref: PPOActorConfig | None = field(
+        default=None,
         metadata={"help": "Reference model configuration"}
+    )
+    critic: PPOCriticConfig | None = field(
+        default=None,
+        metadata={"help": "Critic model configuration"}
     )
     sglang: dict = field(
         default_factory=dict,
