@@ -132,16 +132,21 @@ class CirclePackingEnv(BaseEnv):
             # Import task for verification
             from tasks.alphaevolve_cp.task import CirclePackingTask
             
-            # Create task instance
+            # Create task instance with proper config object
+            class TTRMConfig:
+                pass
+            
             class Config:
                 pass
             
             config = Config()
-            config.ttt_rm = {
-                "n_item": self.n_item,
-                "eval_timeout": self.eval_timeout,
-                "num_cpus_per_task": 1,
-            }
+            config.ttt_rm = TTRMConfig()
+            config.ttt_rm.n_item = self.n_item
+            config.ttt_rm.eval_timeout = self.eval_timeout
+            config.ttt_rm.num_cpus_per_task = 1
+            config.ttt_rm.rew_type = "neg_linear"  # Default reward type
+            config.ttt_rm.fail_score = -1.0  # Default fail score
+            config.ttt_rm.worst_perf_log = 0.0  # Default worst performance
             
             task = CirclePackingTask(config, str(self.log_dir))
             
