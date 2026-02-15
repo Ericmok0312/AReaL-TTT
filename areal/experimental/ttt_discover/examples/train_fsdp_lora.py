@@ -145,7 +145,7 @@ def main(args):
     batch_size = config.sampler.batch_size
     
     train_dataloader = create_tttd_dataloader(
-        sampler=sampler,
+        state_sampler=sampler,
         rank=actor.data_parallel_rank,
         world_size=actor.data_parallel_world_size,
         batch_size=batch_size,

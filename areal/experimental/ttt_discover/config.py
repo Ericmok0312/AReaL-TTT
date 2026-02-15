@@ -1,7 +1,13 @@
 # areal/experimental/ttt_discover/config.py
 from dataclasses import dataclass, field
 from typing import Optional
-from areal.api.cli_args import PPOActorConfig
+from areal.api.cli_args import (
+    PPOActorConfig,
+    ClusterSpecConfig,
+    StatsLoggerConfig,
+    SaverConfig,
+    InferenceEngineConfig,
+)
 
 
 @dataclass
@@ -124,8 +130,8 @@ class TTTDPPOActorConfig(PPOActorConfig):
     )
     
     # Nested configuration objects
-    cluster: dict = field(
-        default_factory=dict,
+    cluster: ClusterSpecConfig = field(
+        default_factory=ClusterSpecConfig,
         metadata={"help": "Cluster configuration"}
     )
     allocation_mode: str = field(
@@ -136,8 +142,8 @@ class TTTDPPOActorConfig(PPOActorConfig):
         default=None,
         metadata={"help": "Scheduler configuration"}
     )
-    rollout: dict = field(
-        default_factory=dict,
+    rollout: InferenceEngineConfig = field(
+        default_factory=InferenceEngineConfig,
         metadata={"help": "Rollout configuration"}
     )
     gconfig: dict = field(
@@ -164,8 +170,8 @@ class TTTDPPOActorConfig(PPOActorConfig):
         default_factory=dict,
         metadata={"help": "Validation dataset configuration"}
     )
-    saver: dict = field(
-        default_factory=dict,
+    saver: SaverConfig = field(
+        default_factory=SaverConfig,
         metadata={"help": "Model saver configuration"}
     )
     recover: dict = field(
@@ -176,8 +182,8 @@ class TTTDPPOActorConfig(PPOActorConfig):
         default_factory=dict,
         metadata={"help": "Evaluator configuration"}
     )
-    stats_logger: dict = field(
-        default_factory=dict,
+    stats_logger: StatsLoggerConfig = field(
+        default_factory=StatsLoggerConfig,
         metadata={"help": "Stats logger configuration"}
     )
     perf_tracer: dict = field(
@@ -232,6 +238,15 @@ class TTTDPPOActorConfig(PPOActorConfig):
         repr=False,
         metadata={"help": "Internal flag to identify TTT-D config"}
     )
+    
+    @property
+    def actor(self):
+        """Return self as the actor config.
+        
+        This allows the training script to access config.actor when the config
+        itself is the actor configuration (flattened structure).
+        """
+        return self
     
     def __post_init__(self):
         """Validate configuration consistency"""
