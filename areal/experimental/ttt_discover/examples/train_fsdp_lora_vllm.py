@@ -21,7 +21,7 @@ import torch.distributed as dist
 
 from areal import current_platform
 from areal.api.alloc_mode import AllocationMode
-from areal.api.cli_args import load_expr_config
+from areal.api.cli_args import load_expr_config, GenerationHyperparameters
 from areal.api.io_struct import FinetuneSpec, StepInfo, WeightUpdateMeta
 from areal.engine.vllm_remote import RemotevLLMEngine
 from areal.utils import seeding, stats_tracker
@@ -232,22 +232,23 @@ def main(args):
             f"Please set config.sampler.env_type to a supported value."
         )
     
-    # Ensure stop_token_ids exists in gconfig
-    if 'stop_token_ids' not in config.gconfig:
-        config.gconfig['stop_token_ids'] = []
-    if tokenizer.pad_token_id not in config.gconfig['stop_token_ids']:
-        config.gconfig['stop_token_ids'].append(tokenizer.pad_token_id)
-    if tokenizer.eos_token_id not in config.gconfig['stop_token_ids']:
-        config.gconfig['stop_token_ids'].append(tokenizer.eos_token_id)
+    # Convert gconfig dict to GenerationHyperparameters
+    gconfig = GenerationHyperparameters(**config.gconfig)
+    
+    # Ensure stop_token_ids are set
+    if tokenizer.pad_token_id not in gconfig.stop_token_ids:
+        gconfig.stop_token_ids.append(tokenizer.pad_token_id)
+    if tokenizer.eos_token_id not in gconfig.stop_token_ids:
+        gconfig.stop_token_ids.append(tokenizer.eos_token_id)
     
     workflow = TTTDiscoverWorkflow(
         env=env,
-        gconfig=config.gconfig,
+        gconfig=gconfig,
         tokenizer=tokenizer,
         enable_thinking=False,
     )
     
-    group_size = config.gconfig.get('n_samples', 64)
+    group_size = gconfig.n_samples
     
     saver = Saver(config.saver, ft_spec)
     stats_logger = StatsLogger(config, ft_spec)
