@@ -195,13 +195,6 @@ class TTTDPPOActorConfig(PPOActorConfig):
         metadata={"help": "Performance tracer configuration"}
     )
     
-    # Actor configuration (for local launcher compatibility)
-    # Local launcher requires this to get scheduling_spec
-    actor: Optional[dict] = field(
-        default=None,
-        metadata={"help": "Actor configuration (for local launcher)"}
-    )
-    
     # Advantage estimator selection
     adv_estimator: str = field(
         default="gae",
