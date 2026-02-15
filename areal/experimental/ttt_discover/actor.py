@@ -147,6 +147,8 @@ class TTTDActor(FSDPEngine):
 
         # Store data in the dict.
         data["advantages"] = advantages
+        data["kl_rewards"] = kl_rewards * loss_mask
+        data["tot_rewards"] = reward_score
         data["loss_mask"] = loss_mask
         data["logprobs"] = old_logp
 
