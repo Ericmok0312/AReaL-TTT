@@ -10,6 +10,7 @@ from areal.api.cli_args import (
     EvaluatorConfig,
     RecoverConfig,
     GenerationHyperparameters,
+    MicroBatchSpec,
 )
 
 
@@ -255,8 +256,13 @@ class TTTDPPOActorConfig(PPOActorConfig):
     )
     
     def __post_init__(self):
-        """Validate configuration consistency"""
-        super().__post_init__()  # Call parent validation
+        """Validate configuration consistency and convert nested dicts to objects"""
+        # Convert mb_spec from dict to MicroBatchSpec if needed
+        if isinstance(self.mb_spec, dict):
+            self.mb_spec = MicroBatchSpec(**self.mb_spec)
+        
+        # Call parent validation
+        super().__post_init__()
         
         # Validate adv_estimator value
         valid_estimators = ["gae", "mean_baseline", "entropic", "entropic_adaptive_beta"]
