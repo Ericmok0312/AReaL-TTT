@@ -76,14 +76,20 @@ class TTTDActor(FSDPEngine):
                 max_response_length=self.config.max_new_tokens,
             )
 
-        # Reward Scaling
+        # Reward Scaling (keep as 1D sequence-level rewards)
         reward_score = data["rewards"]
+        # Ensure reward_score is 1D [bs]
+        if reward_score.dim() > 1:
+            reward_score = reward_score.squeeze(-1)
         reward_score = (reward_score + self.actor.reward_bias) * self.actor.reward_scaling
         reward_score = torch.clip(
             reward_score, max=self.actor.reward_clip, min=-self.actor.reward_clip
         )
         if self.actor.reward_norm:
             reward_score = self.actor.reward_norm(reward_score)
+        # Ensure it stays 1D after normalization
+        if reward_score.dim() > 1:
+            reward_score = reward_score.squeeze(-1)
 
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
