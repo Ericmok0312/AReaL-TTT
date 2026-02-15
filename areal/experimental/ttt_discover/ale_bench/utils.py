@@ -13,16 +13,31 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
 
-import cairosvg
-import ray
-from PIL import Image
-from ahocorapy.keywordtree import KeywordTree
+# Optional imports - may not be available in all environments
+try:
+    import cairosvg
+except ImportError:
+    cairosvg = None
+
+try:
+    import ray
+    # Initialize Ray if not already initialized
+    if not ray.is_initialized():
+        ray.init(ignore_reinit_error=True)
+except ImportError:
+    ray = None
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+try:
+    from ahocorapy.keywordtree import KeywordTree
+except ImportError:
+    KeywordTree = None
 
 from ale_bench.constants import DEFAULT_CACHE_DIR
-
-# Initialize Ray if not already initialized
-if not ray.is_initialized():
-    ray.init(ignore_reinit_error=True)
 
 
 # Ray-based command execution
@@ -492,6 +507,9 @@ def docker_client() -> Generator[dict, None, None]:
     Yields:
         dict: A mock docker client interface for compatibility.
     """
+    if ray is None:
+        raise ImportError("ray is required for docker_client. Install with: pip install ray[default]")
+    
     # Return a mock object that provides the same interface
     class MockDockerClient:
         class containers:
@@ -690,6 +708,8 @@ def parse_statement(
             A list of contents, where each content is either a text or an image.
     """
     # Search for image names in the statement by using Aho-Corasick algorithm
+    if KeywordTree is None:
+        raise ImportError("ahocorapy is required for parse_statement. Install with: pip install ahocorapy")
     kwtree = KeywordTree(case_insensitive=False)
     for image_name in images:
         if isinstance(images[image_name], list) and ignore_video:
@@ -814,7 +834,10 @@ def read_svg(svg_text: str, size: int | tuple[int, int] = 1000) -> Image.Image:
 
     Raises:
         ValueError: If the SVG text is empty.
+        ImportError: If cairosvg is not installed.
     """
+    if cairosvg is None:
+        raise ImportError("cairosvg is required for read_svg. Install with: pip install cairosvg")
     if len(svg_text) == 0:
         raise ValueError("SVG text is empty.")
     if isinstance(size, int):

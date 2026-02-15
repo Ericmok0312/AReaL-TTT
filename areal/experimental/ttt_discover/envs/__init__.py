@@ -20,10 +20,18 @@ from areal.experimental.ttt_discover.envs.circle_packing import (
     CirclePackingEnv,
     create_initial_state_cp,
 )
-from areal.experimental.ttt_discover.envs.gpu_mode import (
-    GpuModeEnv,
-    create_initial_state_gpu_mode,
-)
+
+# GpuModeEnv is optional and requires additional dependencies
+try:
+    from areal.experimental.ttt_discover.envs.gpu_mode import (
+        GpuModeEnv,
+        create_initial_state_gpu_mode,
+    )
+    _GPU_MODE_AVAILABLE = True
+except ImportError:
+    _GPU_MODE_AVAILABLE = False
+    GpuModeEnv = None  # type: ignore
+    create_initial_state_gpu_mode = None  # type: ignore
 
 __all__ = [
     "CirclePackingEnv",

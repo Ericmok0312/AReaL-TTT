@@ -26,9 +26,6 @@ from areal.utils import logging
 logger = logging.getLogger("GpuModeEnv")
 
 
-from tasks.gpu_mode.task import run_gpu_mode_task
-
-
 
 class GpuModeEnv(BaseEnv):
     """
@@ -126,6 +123,7 @@ class GpuModeEnv(BaseEnv):
         # Actual GPU execution via Modal
         try:
             import asyncio
+            from tasks.gpu_mode.task import run_gpu_mode_task
             
             # Determine app_name based on task
             if self.task_name == "mla_decode":
