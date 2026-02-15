@@ -9,6 +9,7 @@ from areal.api.cli_args import (
     InferenceEngineConfig,
     EvaluatorConfig,
     RecoverConfig,
+    GenerationHyperparameters,
 )
 
 
@@ -148,8 +149,8 @@ class TTTDPPOActorConfig(PPOActorConfig):
         default_factory=InferenceEngineConfig,
         metadata={"help": "Rollout configuration"}
     )
-    gconfig: dict = field(
-        default_factory=dict,
+    gconfig: GenerationHyperparameters = field(
+        default_factory=GenerationHyperparameters,
         metadata={"help": "Generation configuration"}
     )
     ref: dict = field(

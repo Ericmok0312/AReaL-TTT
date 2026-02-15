@@ -138,7 +138,6 @@ gconfig:
   top_p: 0.95
   # LoRA configuration
   lora_name: tttd_lora_adapter
-  lora_path: null
 
 # ============================================================================
 # Reference Model Configuration

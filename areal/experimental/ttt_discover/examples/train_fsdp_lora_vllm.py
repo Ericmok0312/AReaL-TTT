@@ -21,7 +21,7 @@ import torch.distributed as dist
 
 from areal import current_platform
 from areal.api.alloc_mode import AllocationMode
-from areal.api.cli_args import load_expr_config, GenerationHyperparameters
+from areal.api.cli_args import load_expr_config
 from areal.api.io_struct import FinetuneSpec, StepInfo, WeightUpdateMeta
 from areal.engine.vllm_remote import RemotevLLMEngine
 from areal.utils import seeding, stats_tracker
@@ -142,15 +142,12 @@ def main(args):
     
     # Setup weight update meta for LoRA (handles initial weight saving)
     if config.weight_update_mode == "disk":
-        # gconfig is loaded as a dict, extract lora_name from it
-        gconfig_dict = config.gconfig if isinstance(config.gconfig, dict) else vars(config.gconfig)
-        lora_name = gconfig_dict.get('lora_name', 'tttd_lora_adapter')
         weight_update_meta = WeightUpdateMeta.from_disk(
             config.saver.experiment_name,
             config.saver.trial_name,
             config.saver.fileroot,
             use_lora=config.use_lora,
-            lora_name=lora_name,
+            lora_name=config.gconfig.lora_name,
             lora_int_id=1,
             base_model_name=config.path,
         )
@@ -232,23 +229,20 @@ def main(args):
             f"Please set config.sampler.env_type to a supported value."
         )
     
-    # Convert gconfig dict to GenerationHyperparameters
-    gconfig = GenerationHyperparameters(**config.gconfig)
-    
     # Ensure stop_token_ids are set
-    if tokenizer.pad_token_id not in gconfig.stop_token_ids:
-        gconfig.stop_token_ids.append(tokenizer.pad_token_id)
-    if tokenizer.eos_token_id not in gconfig.stop_token_ids:
-        gconfig.stop_token_ids.append(tokenizer.eos_token_id)
+    if tokenizer.pad_token_id not in config.gconfig.stop_token_ids:
+        config.gconfig.stop_token_ids.append(tokenizer.pad_token_id)
+    if tokenizer.eos_token_id not in config.gconfig.stop_token_ids:
+        config.gconfig.stop_token_ids.append(tokenizer.eos_token_id)
     
     workflow = TTTDiscoverWorkflow(
         env=env,
-        gconfig=gconfig,
+        gconfig=config.gconfig,
         tokenizer=tokenizer,
         enable_thinking=False,
     )
     
-    group_size = gconfig.n_samples
+    group_size = config.gconfig.n_samples
     
     saver = Saver(config.saver, ft_spec)
     stats_logger = StatsLogger(config, ft_spec)
