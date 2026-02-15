@@ -1,0 +1,269 @@
+# TTT-Discover FSDP + LoRA + vLLM Configuration
+# vLLM uses distributed rollout - each DP rank handles its own parents
+
+experiment_name: tttd-lora-vllm
+trial_name: trial0
+
+seed: 1
+enable_offload: false
+
+# TTT-Discover uses fixed number of steps (not epochs)
+# Paper: 50 steps with 512 rollouts per step (8 parents × 64 group_size)
+max_steps: 50
+total_train_epochs: 10  # Ignored for TTT-Discover, use max_steps instead
+
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 1
+  n_gpus_per_node: 8
+  fileroot: ./outputs  # Output directory under project root
+  name_resolve:
+    type: nfs
+    nfs_record_root: /tmp/areal/name_resolve
+
+# FSDP for training
+allocation_mode: fsdp:d8p1t1+d8p1t1
+
+scheduler:
+  type: null
+
+# ============================================================================
+# Rollout Configuration (vLLM)
+# ============================================================================
+rollout:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  max_concurrent_rollouts: 256
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 4
+  enable_rollout_tracing: false
+  pause_grace_period: 1.0
+  scheduling_spec: ${actor.scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+
+# ============================================================================
+# Generation Configuration
+# ============================================================================
+gconfig:
+  # Group rollout: 64 samples per parent state
+  n_samples: 64
+  min_new_tokens: 0
+  max_new_tokens: 1024
+  greedy: false
+  temperature: 1.0
+  top_p: 0.95
+  # LoRA configuration
+  lora_name: tttd_lora_adapter
+  lora_path: null
+
+# ============================================================================
+# Actor (FSDP + LoRA) Configuration
+# ============================================================================
+actor:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: Qwen/Qwen2.5-1.5B-Instruct
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  mb_spec:
+    max_tokens_per_mb: 10240
+  optimizer:
+    type: adam
+    lr: 3e-5
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.001
+  
+  # PPO parameters
+  eps_clip: 0.4
+  temperature: ${gconfig.temperature}
+  reward_scaling: 10.0
+  reward_bias: -0.5
+  kl_ctl: 0.01
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  behav_imp_weight_cap: 5.0
+  
+  # Reward normalization
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+  
+  # Advantage normalization
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+  
+  max_new_tokens: ${gconfig.max_new_tokens}
+  
+  # LoRA configuration
+  use_lora: true
+  peft_type: lora
+  lora_rank: 32
+  lora_alpha: 16
+  target_modules: [all-linear]
+  weight_update_mode: disk
+  
+  # TTT-Discover specific: Entropic Advantage
+  adv_estimator: entropic
+  adv_estimator_beta: 1.0
+  adv_estimator_target_kl: 0.693
+  adv_estimator_beta_max: 1000000.0
+  adv_estimator_beta_iters: 60
+  
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars: {}
+
+# ============================================================================
+# Reference Model Configuration
+# ============================================================================
+ref:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${actor.path}
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${actor.dtype}
+  mb_spec:
+    max_tokens_per_mb: 10240
+  optimizer: null
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  scheduling_spec: ${actor.scheduling_spec}
+
+# ============================================================================
+# vLLM Configuration
+# ============================================================================
+vllm:
+  model: ${actor.path}
+  seed: ${seed}
+  skip_tokenizer_init: false
+  dtype: ${actor.dtype}
+  max_model_len: 32768
+  gpu_memory_utilization: 0.9
+  # LoRA support
+  enable_lora: ${actor.use_lora}
+  max_lora_rank: ${actor.lora_rank}
+  lora_target_modules: ${actor.target_modules}
+
+# ============================================================================
+# PUCT Sampler Configuration
+# ============================================================================
+sampler:
+  type: puct
+  batch_size: 8  # Parents per DP rank (total = 8 × dp_size)
+  
+  # PUCT parameters
+  c_puct: 1.5
+  gamma: 0.95
+  max_children: 100
+  
+  # State management
+  max_states: 10000
+  top_k: 1000
+  
+  # Exploration
+  temperature: 1.0
+  
+  # Checkpointing
+  save_freq: 100
+  checkpoint_dir: ${cluster.fileroot}/${experiment_name}/${trial_name}/sampler
+  
+  # Initial state: 'best_available', 'none', 'random', 'random_no_code'
+  initial_exp_type: best_available
+  
+  # Environment type for initial state creation
+  # Options: 'cp', 'ac1', 'ac2', 'mla_decode_nvidia', 'trimul', 'erdos', 'denoising'
+  env_type: cp
+  
+  # Environment-specific parameters (used based on env_type)
+  # Circle Packing (cp)
+  n_item: 26  # Number of circles: 26 or 32
+  
+  # GPU Mode (trimul, mla_decode_nvidia)
+  gpu_type: H100  # GPU type for Modal execution: H100, H200, etc.
+  eval_timeout: 60  # Timeout for code execution (seconds)
+  
+  # Erdos (erdos)
+  n: 100  # Size parameter for Erdos construction
+  
+  # Inequalities/AC1 (ac1)
+  budget_s: 1000  # Budget parameter for inequalities
+
+# ============================================================================
+# Dataset Configuration
+# ============================================================================
+# NOTE: TTT-Discover does NOT use a traditional dataset.
+# PUCTSampler manages states internally and creates initial states
+# automatically based on sampler.initial_exp_type and sampler.env_type.
+# The batch_size here determines how many parent states to sample per step per DP rank.
+train_dataset:
+  batch_size: 8  # Parents per DP rank (each expanded to 64 rollouts)
+  # Other fields are kept for API compatibility but not used for data loading
+
+valid_dataset:
+  batch_size: 8
+  # Not used in TTT-Discover (no validation set needed)
+
+# ============================================================================
+# Utilities Configuration
+# ============================================================================
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: 3600
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+    project: tttd-lora-vllm
+    entity: null
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false

@@ -352,9 +352,7 @@ class PUCTSampler(StateSampler):
         self.topk_children = topk_children
         self.puct_c = float(puct_c)
         self.group_size = int(group_size)
-        # TODO(mert): remove this
-        self.group_size = 1
-        
+    
         self._states: list[State] = []
         self._initial_states: list[State] = []
         self._last_sampled_states: list[State] = []
@@ -363,12 +361,12 @@ class PUCTSampler(StateSampler):
         self._current_step = resume_step if resume_step is not None else 0
         
         # PUCT stats
-        self._n: dict[str, int] = {}
-        self._m: dict[str, float] = {}
-        self._T: int = 0
+        self._n: dict[str, int] = {} # Number of times state (or its descendants) has been expanded
+        self._m: dict[str, float] = {} # Maximum reward among states generated when the initial state was s
+        self._T: int = 0 # Total number of expansions across all states
         self._last_scale: float = 1.0
-        self._last_puct_stats: list[tuple[int, float, float, float, float]] = []
-        
+        self._last_puct_stats: list[tuple[int, float, float, float, float]] = [] # n, Q, P, bonus, score
+
         if resume_step is not None:
             self._load(resume_step)
         if not self._states:
@@ -497,7 +495,7 @@ class PUCTSampler(StateSampler):
             score = Q + bonus
             scores.append((score, vals[i], s, n, Q, P[i], bonus))
 
-        scores.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        scores.sort(key=lambda x: (x[0], x[1]), reverse=True) # Rank by score,then expected value of starting from this state as tiebreaker
 
         if num_states > 1:
             children_map = self._build_children_map()
@@ -717,6 +715,70 @@ def create_sampler(
                           resume_step=resume_step, **kwargs)
 
     raise ValueError(f"Unknown sampler_type: {sampler_type}")
+
+
+def create_sampler_from_config(
+    config,
+    log_path: str | None = None,
+    env_type: str = "custom",
+) -> StateSampler:
+    """
+    Create sampler from TTTDPPOActorConfig.sampler configuration.
+    
+    TTT-Discover does not require a traditional dataset as PUCTSampler
+    manages states internally. Initial states are created based on
+    config.initial_exp_type and config.env_type.
+    
+    Args:
+        config: SamplerConfig dataclass from TTTDPPOActorConfig
+        log_path: Optional override for log path (defaults to config.checkpoint_dir)
+        env_type: Environment type identifier
+    
+    Returns:
+        Configured StateSampler instance
+    """
+    # Determine log path
+    if log_path is None:
+        log_path = getattr(config, 'checkpoint_dir', None)
+    if log_path is None:
+        raise ValueError(
+            "log_path must be provided either as argument or via config.checkpoint_dir"
+        )
+    
+    # Create directory if needed
+    os.makedirs(log_path, exist_ok=True)
+    
+    # Extract parameters from config
+    sampler_type = getattr(config, 'type', 'puct')
+    batch_size = getattr(config, 'batch_size', 8)
+    initial_exp_type = getattr(config, 'initial_exp_type', 'best_available')
+    config_env_type = getattr(config, 'env_type', env_type)  # Use config value if available
+    
+    # PUCT-specific parameters
+    c_puct = getattr(config, 'c_puct', 1.5)
+    gamma = getattr(config, 'gamma', 0.95)
+    max_children = getattr(config, 'max_children', 100)
+    max_states = getattr(config, 'max_states', 10000)
+    top_k = getattr(config, 'top_k', 1000)
+    temperature = getattr(config, 'temperature', 1.0)
+    save_freq = getattr(config, 'save_freq', 100)
+    
+    return create_sampler(
+        sampler_type=sampler_type,
+        log_path=log_path,
+        env_type=config_env_type,
+        budget_s=save_freq,  # Use save_freq as budget proxy
+        initial_exp_type=initial_exp_type,
+        batch_size=batch_size,
+        resume_step=None,
+        # PUCT-specific kwargs
+        c_puct=c_puct,
+        gamma=gamma,
+        max_children=max_children,
+        max_states=max_states,
+        top_k=top_k,
+        temperature=temperature,
+    )
 
 
 def get_or_create_sampler_with_default(

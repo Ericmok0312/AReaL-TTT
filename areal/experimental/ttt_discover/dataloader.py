@@ -85,10 +85,15 @@ class TTTDiscoverDataLoader(StatefulDataLoader):
     """
     StatefulDataLoader for TTT-Discover StateSampler.
     
+    TTT-Discover does not use a traditional dataset. Instead, PUCTSampler
+    manages states internally and generates initial states automatically.
+    
     Usage:
         from areal.experimental.ttt_discover.dataloader import create_tttd_dataloader
         sampler = create_sampler(...)
-        dataloader = create_tttd_dataloader(sampler, rank, world_size, config)
+        dataloader = create_tttd_dataloader(
+            sampler, rank, world_size, batch_size=8
+        )
         
         # Access PUCT features via dataloader.sampler
         for batch in dataloader:
@@ -101,14 +106,15 @@ class TTTDiscoverDataLoader(StatefulDataLoader):
         state_sampler: "StateSampler",
         rank: int,
         world_size: int,
-        dataset_config: Any,
+        batch_size: int,
         collate_fn: Callable | None = None,
         state_to_prompt_fn: Callable[["State"], str] | None = None,
+        drop_last: bool = True,
         **kwargs
     ):
-        if dataset_config.batch_size % world_size != 0:
+        if batch_size % world_size != 0:
             raise ValueError(
-                f"batch_size ({dataset_config.batch_size}) must be divisible by "
+                f"batch_size ({batch_size}) must be divisible by "
                 f"world_size ({world_size})"
             )
             
@@ -116,7 +122,7 @@ class TTTDiscoverDataLoader(StatefulDataLoader):
         self._rank = rank
         self._world_size = world_size
         
-        local_batch_size = dataset_config.batch_size // world_size
+        local_batch_size = batch_size // world_size
         
         # Create underlying iterable dataset
         self._dataset = _StateSamplerIterableDataset(
@@ -133,7 +139,7 @@ class TTTDiscoverDataLoader(StatefulDataLoader):
             batch_size=local_batch_size,
             collate_fn=collate_fn or (lambda x: x),
             num_workers=0,  # Enforced in dataset
-            drop_last=getattr(dataset_config, 'drop_last', True),
+            drop_last=drop_last,
             **kwargs
         )
         
@@ -168,22 +174,25 @@ def create_tttd_dataloader(
     state_sampler: "StateSampler",
     rank: int,
     world_size: int,
-    dataset_config: Any,
+    batch_size: int,
     collate_fn: Callable | None = None,
+    drop_last: bool = True,
     **kwargs
 ) -> TTTDiscoverDataLoader:
     """
     Create TTTDiscoverDataLoader for StateSampler (PUCT/Greedy).
     
-    This is the explicit import alternative to the original create_dataloader.
-    Does NOT interfere with existing code using areal.dataset.utils.create_dataloader.
+    TTT-Discover does not require a traditional dataset. PUCTSampler manages
+    states internally and creates initial states automatically based on
+    initial_exp_type and env_type configuration.
     
     Args:
         state_sampler: PUCTSampler, GreedySampler, or FixedSampler instance
         rank: Process rank for distributed training
         world_size: Total number of processes
-        dataset_config: Config object with batch_size, drop_last, etc.
+        batch_size: Total batch size (number of parent states per step)
         collate_fn: Optional custom collation function
+        drop_last: Whether to drop last incomplete batch
         **kwargs: Additional args passed to StatefulDataLoader
         
     Returns:
@@ -195,7 +204,7 @@ def create_tttd_dataloader(
         >>> 
         >>> sampler = create_sampler("puct", log_path="./logs", env_type="ac1")
         >>> dataloader = create_tttd_dataloader(
-        ...     sampler, rank=0, world_size=4, dataset_config=config
+        ...     sampler, rank=0, world_size=4, batch_size=8
         ... )
         >>> 
         >>> # Training loop
@@ -207,8 +216,9 @@ def create_tttd_dataloader(
         state_sampler=state_sampler,
         rank=rank,
         world_size=world_size,
-        dataset_config=dataset_config,
+        batch_size=batch_size,
         collate_fn=collate_fn,
+        drop_last=drop_last,
         **kwargs
     )
 

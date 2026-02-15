@@ -5,6 +5,67 @@ from areal.api.cli_args import PPOActorConfig
 
 
 @dataclass
+class SamplerConfig:
+    """Configuration for PUCTSampler"""
+    type: str = field(
+        default="puct",
+        metadata={"help": "Sampler type: 'puct' or 'random'"}
+    )
+    batch_size: int = field(
+        default=8,
+        metadata={"help": "Number of parent states to sample per step"}
+    )
+    # PUCT parameters
+    c_puct: float = field(
+        default=1.5,
+        metadata={"help": "PUCT exploration constant"}
+    )
+    gamma: float = field(
+        default=0.95,
+        metadata={"help": "Discount factor for future rewards"}
+    )
+    max_children: int = field(
+        default=100,
+        metadata={"help": "Maximum children per state"}
+    )
+    # State management
+    max_states: int = field(
+        default=10000,
+        metadata={"help": "Maximum number of states to keep in memory"}
+    )
+    top_k: int = field(
+        default=1000,
+        metadata={"help": "Keep top-k states after each iteration"}
+    )
+    # Exploration
+    temperature: float = field(
+        default=1.0,
+        metadata={"help": "Temperature for state sampling"}
+    )
+    # Checkpointing
+    save_freq: int = field(
+        default=100,
+        metadata={"help": "Save sampler state every N steps"}
+    )
+    checkpoint_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Directory to save sampler checkpoints"}
+    )
+    
+    # Initial state
+    initial_exp_type: str = field(
+        default="best_available",
+        metadata={"help": "Initial experience type: 'best_available', 'none', 'random', 'random_no_code'"}
+    )
+    
+    # Environment type for initial state creation
+    env_type: str = field(
+        default="cp",
+        metadata={"help": "Environment type: 'cp', 'ac1', 'ac2', 'mla_decode_nvidia', 'trimul', 'erdos', 'denoising', 'ahc039', 'ahc058'"}
+    )
+
+
+@dataclass
 class TTTDPPOActorConfig(PPOActorConfig):
     """
     Extended PPO config for TTT-Discover with Entropic Objective support.
@@ -50,6 +111,19 @@ class TTTDPPOActorConfig(PPOActorConfig):
         default=None,
         metadata={"help": "Number of samples per group for advantage calculation. "
                          "If None, infer from batch structure or treat whole batch as one group"}
+    )
+    
+    # Sampler configuration
+    sampler: SamplerConfig = field(
+        default_factory=SamplerConfig,
+        metadata={"help": "Configuration for PUCTSampler"}
+    )
+    
+    # Training steps (TTT-Discover uses fixed steps, not epochs)
+    max_steps: int = field(
+        default=50,
+        metadata={"help": "Maximum training steps. TTT-Discover paper uses 50 steps. "
+                         "Note: total_train_epochs is ignored for TTT-Discover."}
     )
     
     # Compatibility flag (for type checking)
