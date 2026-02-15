@@ -5,7 +5,10 @@ import math
 import typing
 from typing import Optional, Union
 
-from better_profanity import profanity
+try:
+    from better_profanity import profanity
+except ImportError:
+    profanity = None
 
 from libkernelbot.consts import RankCriterion
 from libkernelbot.db_types import RunItem, SubmissionItem
@@ -47,7 +50,7 @@ def prepare_submission(
             "The bot is currently not accepting any new submissions, please try again later."
         )
 
-    if profanity.contains_profanity(req.file_name):
+    if profanity is not None and profanity.contains_profanity(req.file_name):
         raise KernelBotError("Please provide a non-rude filename")
 
     # check file extension
