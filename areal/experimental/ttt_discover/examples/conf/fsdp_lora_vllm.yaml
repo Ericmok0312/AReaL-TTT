@@ -198,8 +198,9 @@ vllm:
   gpu_memory_utilization: 0.9
   # LoRA support
   enable_lora: ${use_lora}
-  max_lora_rank: ${lora_rank}
-  lora_target_modules: ${target_modules}
+  # lora_modules format: JSON string with name, path, and base_model_name
+  # The actual LoRA weights will be updated from FSDP training
+  lora_modules: '{"name": "${gconfig.lora_name}", "path": "${cluster.fileroot}/${experiment_name}/${trial_name}/lora", "base_model_name": "${path}"}'
 
 # ============================================================================
 # PUCT Sampler Configuration
