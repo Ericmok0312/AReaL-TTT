@@ -12,7 +12,81 @@ enable_offload: false
 max_steps: 50
 total_train_epochs: 10  # Ignored for TTT-Discover, use max_steps instead
 
-tokenizer_path: ${actor.path}
+# ============================================================================
+# Actor (FSDP + LoRA) Configuration - Top level fields for TTTDPPOActorConfig
+# ============================================================================
+# These fields map to TTTDPPOActorConfig which inherits from PPOActorConfig/TrainEngineConfig
+path: Qwen/Qwen2.5-1.5B-Instruct
+init_from_scratch: false
+disable_dropout: true
+gradient_checkpointing: true
+dtype: bfloat16
+
+mb_spec:
+  max_tokens_per_mb: 10240
+
+optimizer:
+  type: adam
+  lr: 3e-5
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1e-8
+  lr_scheduler_type: constant
+  gradient_clipping: 1.0
+  warmup_steps_proportion: 0.001
+
+# PPO parameters
+eps_clip: 0.4
+temperature: ${gconfig.temperature}
+reward_scaling: 10.0
+reward_bias: -0.5
+kl_ctl: 0.01
+ppo_n_minibatches: 1
+recompute_logprob: true
+use_decoupled_loss: true
+behav_imp_weight_cap: 5.0
+
+# Reward normalization
+reward_norm:
+  mean_level: group
+  std_level: group
+  group_size: ${gconfig.n_samples}
+
+# Advantage normalization
+adv_norm:
+  mean_level: batch
+  std_level: batch
+
+max_new_tokens: ${gconfig.max_new_tokens}
+
+# LoRA configuration
+use_lora: true
+peft_type: lora
+lora_rank: 32
+lora_alpha: 16
+target_modules: [all-linear]
+weight_update_mode: disk  # or 'xccl' for in-memory weight transfer
+
+# TTT-Discover specific: Entropic Advantage
+adv_estimator: entropic  # or 'entropic_adaptive_beta'
+adv_estimator_beta: 1.0
+adv_estimator_target_kl: 0.693  # log(2), for adaptive beta
+adv_estimator_beta_max: 1000000.0
+adv_estimator_beta_iters: 60
+
+scheduling_spec:
+  - task_type: worker
+    port_count: 2
+    gpu: 1
+    mem: 32
+    cmd: python3 -m areal.infra.rpc.rpc_server
+    env_vars: {}
+
+# ============================================================================
+# Other Configurations
+# ============================================================================
+tokenizer_path: ${path}
 
 cluster:
   n_nodes: 1
@@ -40,7 +114,7 @@ rollout:
   max_head_offpolicyness: 4
   enable_rollout_tracing: false
   pause_grace_period: 1.0
-  scheduling_spec: ${actor.scheduling_spec}
+  scheduling_spec: ${scheduling_spec}
   fileroot: ${cluster.fileroot}
   tokenizer_path: ${tokenizer_path}
   dump_to_file: true
@@ -61,109 +135,38 @@ gconfig:
   lora_path: null  # Will be set automatically
 
 # ============================================================================
-# Actor (FSDP + LoRA) Configuration
-# ============================================================================
-actor:
-  experiment_name: ${experiment_name}
-  trial_name: ${trial_name}
-  path: Qwen/Qwen2.5-1.5B-Instruct
-  init_from_scratch: false
-  disable_dropout: true
-  gradient_checkpointing: true
-  dtype: bfloat16
-  mb_spec:
-    max_tokens_per_mb: 10240
-  optimizer:
-    type: adam
-    lr: 3e-5
-    weight_decay: 0.01
-    beta1: 0.9
-    beta2: 0.999
-    eps: 1e-8
-    lr_scheduler_type: constant
-    gradient_clipping: 1.0
-    warmup_steps_proportion: 0.001
-  
-  # PPO parameters
-  eps_clip: 0.4
-  temperature: ${gconfig.temperature}
-  reward_scaling: 10.0
-  reward_bias: -0.5
-  kl_ctl: 0.01
-  ppo_n_minibatches: 1
-  recompute_logprob: true
-  use_decoupled_loss: true
-  behav_imp_weight_cap: 5.0
-  
-  # Reward normalization
-  reward_norm:
-    mean_level: group
-    std_level: group
-    group_size: ${gconfig.n_samples}
-  
-  # Advantage normalization
-  adv_norm:
-    mean_level: batch
-    std_level: batch
-  
-  max_new_tokens: ${gconfig.max_new_tokens}
-  
-  # LoRA configuration
-  use_lora: true
-  peft_type: lora
-  lora_rank: 32
-  lora_alpha: 16
-  target_modules: [all-linear]
-  weight_update_mode: disk  # or 'xccl' for in-memory weight transfer
-  
-  # TTT-Discover specific: Entropic Advantage
-  adv_estimator: entropic  # or 'entropic_adaptive_beta'
-  adv_estimator_beta: 1.0
-  adv_estimator_target_kl: 0.693  # log(2), for adaptive beta
-  adv_estimator_beta_max: 1000000.0
-  adv_estimator_beta_iters: 60
-  
-  scheduling_spec:
-    - task_type: worker
-      port_count: 2
-      gpu: 1
-      mem: 32
-      cmd: python3 -m areal.infra.rpc.rpc_server
-      env_vars: {}
-
-# ============================================================================
 # Reference Model Configuration
 # ============================================================================
 ref:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  path: ${actor.path}
+  path: ${path}
   init_from_scratch: false
   disable_dropout: true
-  dtype: ${actor.dtype}
+  dtype: ${dtype}
   mb_spec:
     max_tokens_per_mb: 10240
   optimizer: null
   scheduling_strategy:
     type: colocation
     target: actor
-  scheduling_spec: ${actor.scheduling_spec}
+  scheduling_spec: ${scheduling_spec}
 
 # ============================================================================
 # SGLang Configuration
 # ============================================================================
 sglang:
-  model_path: ${actor.path}
+  model_path: ${path}
   random_seed: ${seed}
   skip_tokenizer_init: true
-  dtype: ${actor.dtype}
+  dtype: ${dtype}
   max_running_requests: null
   context_length: 32768
   mem_fraction_static: 0.8
   # LoRA support
-  enable_lora: ${actor.use_lora}
-  max_lora_rank: ${actor.lora_rank}
-  lora_target_modules: ${actor.target_modules}
+  enable_lora: ${use_lora}
+  max_lora_rank: ${lora_rank}
+  lora_target_modules: ${target_modules}
   schedule_policy: fcfs
 
 # ============================================================================
@@ -172,58 +175,44 @@ sglang:
 sampler:
   type: puct
   batch_size: 8  # Number of parent states to sample per step (8 × 64 = 512)
-  
+
   # PUCT parameters
   c_puct: 1.5
   gamma: 0.95
   max_children: 100
-  
+
   # State management
   max_states: 10000
   top_k: 1000  # Keep top-1000 states
-  
+
   # Exploration
   temperature: 1.0
-  
+
   # Checkpointing
   save_freq: 100
   checkpoint_dir: ${cluster.fileroot}/${experiment_name}/${trial_name}/sampler
-  
-  # Initial state: 'best_available', 'none', 'random', 'random_no_code'
+
+  # Initial state
   initial_exp_type: best_available
-  
+
   # Environment type for initial state creation
-  # Options: 'cp', 'ac1', 'ac2', 'mla_decode_nvidia', 'trimul', 'erdos', 'denoising'
   env_type: cp
-  
-  # Environment-specific parameters (used based on env_type)
-  # Circle Packing (cp)
-  n_item: 26  # Number of circles: 26 or 32
-  
-  # GPU Mode (trimul, mla_decode_nvidia)
-  gpu_type: H100  # GPU type for Modal execution: H100, H200, etc.
-  eval_timeout: 60  # Timeout for code execution (seconds)
-  
-  # Erdos (erdos)
-  n: 100  # Size parameter for Erdos construction
-  
-  # Inequalities/AC1 (ac1)
-  budget_s: 1000  # Budget parameter for inequalities
+
+  # Environment-specific parameters
+  n_item: 26
+  gpu_type: H100
+  eval_timeout: 60
+  n: 100
+  budget_s: 1000
 
 # ============================================================================
 # Dataset Configuration
 # ============================================================================
-# NOTE: TTT-Discover does NOT use a traditional dataset.
-# PUCTSampler manages states internally and creates initial states
-# automatically based on sampler.initial_exp_type and sampler.env_type.
-# The batch_size here determines how many parent states to sample per step.
 train_dataset:
   batch_size: 8  # Number of parents per step (each expanded to 64 rollouts = 512 total)
-  # Other fields are kept for API compatibility but not used for data loading
 
 valid_dataset:
   batch_size: 8
-  # Not used in TTT-Discover (no validation set needed)
 
 # ============================================================================
 # Utilities Configuration
