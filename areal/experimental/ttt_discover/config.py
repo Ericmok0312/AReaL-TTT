@@ -72,6 +72,90 @@ class TTTDPPOActorConfig(PPOActorConfig):
     Inherits all standard PPO parameters while adding discovery-specific options.
     """
     
+    # Basic configuration fields that YAML expects
+    seed: int = field(
+        default=1,
+        metadata={"help": "Random seed for reproducibility"}
+    )
+    enable_offload: bool = field(
+        default=False,
+        metadata={"help": "Enable parameter offloading to CPU"}
+    )
+    max_steps: int = field(
+        default=50,
+        metadata={"help": "Maximum training steps for TTT-Discover"}
+    )
+    total_train_epochs: int = field(
+        default=10,
+        metadata={"help": "Total training epochs (ignored for TTT-Discover)"}
+    )
+    tokenizer_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to tokenizer"}
+    )
+    
+    # Nested configuration objects
+    cluster: dict = field(
+        default_factory=dict,
+        metadata={"help": "Cluster configuration"}
+    )
+    allocation_mode: str = field(
+        default="sglang:d8p1t1+d8p1t1",
+        metadata={"help": "GPU allocation mode"}
+    )
+    scheduler: Optional[dict] = field(
+        default=None,
+        metadata={"help": "Scheduler configuration"}
+    )
+    rollout: dict = field(
+        default_factory=dict,
+        metadata={"help": "Rollout configuration"}
+    )
+    gconfig: dict = field(
+        default_factory=dict,
+        metadata={"help": "Generation configuration"}
+    )
+    ref: dict = field(
+        default_factory=dict,
+        metadata={"help": "Reference model configuration"}
+    )
+    sglang: dict = field(
+        default_factory=dict,
+        metadata={"help": "SGLang configuration"}
+    )
+    sampler: SamplerConfig = field(
+        default_factory=SamplerConfig,
+        metadata={"help": "Configuration for PUCTSampler"}
+    )
+    train_dataset: dict = field(
+        default_factory=dict,
+        metadata={"help": "Training dataset configuration"}
+    )
+    valid_dataset: dict = field(
+        default_factory=dict,
+        metadata={"help": "Validation dataset configuration"}
+    )
+    saver: dict = field(
+        default_factory=dict,
+        metadata={"help": "Model saver configuration"}
+    )
+    recover: dict = field(
+        default_factory=dict,
+        metadata={"help": "Recovery configuration"}
+    )
+    evaluator: dict = field(
+        default_factory=dict,
+        metadata={"help": "Evaluator configuration"}
+    )
+    stats_logger: dict = field(
+        default_factory=dict,
+        metadata={"help": "Stats logger configuration"}
+    )
+    perf_tracer: dict = field(
+        default_factory=dict,
+        metadata={"help": "Performance tracer configuration"}
+    )
+    
     # Advantage estimator selection
     adv_estimator: str = field(
         default="gae",
@@ -111,19 +195,6 @@ class TTTDPPOActorConfig(PPOActorConfig):
         default=None,
         metadata={"help": "Number of samples per group for advantage calculation. "
                          "If None, infer from batch structure or treat whole batch as one group"}
-    )
-    
-    # Sampler configuration
-    sampler: SamplerConfig = field(
-        default_factory=SamplerConfig,
-        metadata={"help": "Configuration for PUCTSampler"}
-    )
-    
-    # Training steps (TTT-Discover uses fixed steps, not epochs)
-    max_steps: int = field(
-        default=50,
-        metadata={"help": "Maximum training steps. TTT-Discover paper uses 50 steps. "
-                         "Note: total_train_epochs is ignored for TTT-Discover."}
     )
     
     # Compatibility flag (for type checking)
