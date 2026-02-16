@@ -145,7 +145,7 @@ class CirclePackingEnv(BaseEnv):
             config.ttt_rm.eval_timeout = self.eval_timeout
             config.ttt_rm.num_cpus_per_task = 1
             config.ttt_rm.rew_type = "neg_linear"  # Default reward type
-            config.ttt_rm.fail_score = -1.0  # Default fail score
+            config.ttt_rm.fail_score = 1.0  # Default fail score
             config.ttt_rm.worst_perf_log = 0.0  # Default worst performance
             
             task = CirclePackingTask(config, str(self.log_dir))
