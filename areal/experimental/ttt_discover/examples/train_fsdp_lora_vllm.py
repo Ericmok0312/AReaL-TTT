@@ -213,7 +213,7 @@ def main(args):
     seeding.set_random_seed(config.seed, key=f"trainer{rank}")
     
     allocation_mode = AllocationMode.from_str(config.allocation_mode)
-    parallel_strategy = allocation_mode.train
+    parallel_strategy = allocation_mode["actor"].parallel
     assert parallel_strategy is not None
     
     # TTTDPPOActorConfig extends PPOActorConfig, so we use config directly
