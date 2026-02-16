@@ -171,8 +171,9 @@ vllm:
   enforce_eager: true
   # LoRA support - dynamically loaded after FSDP initializes
   enable_lora: ${use_lora}
-  # Initial LoRA module - will be updated during training
-  lora_modules: '{"name": "${gconfig.lora_name}", "path": "${path}", "base_model_name": "${path}"}'
+  # Initial LoRA module - empty for training from scratch
+  # LoRA will be loaded dynamically after first FSDP checkpoint save
+  lora_modules: ''
 
 # ============================================================================
 # PUCT Sampler Configuration
