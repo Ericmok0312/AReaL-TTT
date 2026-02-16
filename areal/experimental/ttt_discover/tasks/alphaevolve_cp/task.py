@@ -1,4 +1,5 @@
 import inspect
+import re
 import numpy as np
 
 from tasks.base_reward_task import BaseRewardTask
@@ -9,6 +10,29 @@ class CirclePackingTask(BaseRewardTask):
 
     def get_function_name(self) -> str:
         return "run_packing"
+    
+    def _extract_code(self, response: str) -> str | None:
+        """Extract Python code with fallback for raw code without markdown."""
+        # Try markdown code block first
+        m = re.search(r"```python\s+([\s\S]*?)\s*```", response)
+        if m is not None:
+            return m.group(1).strip()
+        
+        # Fallback: look for any code block
+        m = re.search(r"```\s*([\s\S]*?)\s*```", response)
+        if m is not None:
+            return m.group(1).strip()
+        
+        # Fallback: try to find function definitions in raw text
+        m = re.search(r"(def\s+\w+\s*\([^)]*\):[\s\S]*)", response)
+        if m is not None:
+            return m.group(1).strip()
+        
+        # Last resort: if response looks like code
+        if any(kw in response for kw in ["def ", "import ", "return ", "class "]):
+            return response.strip()
+        
+        return None
 
     def preprocess_generation(self, generation, *args, **kwargs) -> str:
         """Inject validate_packing into the code so it's available if needed."""
