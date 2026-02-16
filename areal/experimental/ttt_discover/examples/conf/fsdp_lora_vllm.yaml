@@ -178,6 +178,7 @@ vllm:
   enforce_eager: true
   # LoRA support
   enable_lora: ${use_lora}
+  max_lora_rank: 32  # Must be >= lora_rank
   # Initial LoRA module - MUST exist before training starts
   # Run prepare_lora_init.py first to create it
   lora_modules: '{"name": "${gconfig.lora_name}", "path": "./lora_init", "base_model_name": "${path}"}'
