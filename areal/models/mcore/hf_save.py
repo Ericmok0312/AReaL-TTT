@@ -523,7 +523,7 @@ def save_weights_to_hf_with_mbridge_fast(
                 weight_map[k] = output_filename.format(shard=shard_idx + 1)
         ep_pp_group = mpu.get_expert_tensor_model_pipeline_parallel_group()
         weight_map_list = [None for _ in range(dist.get_world_size(ep_pp_group))]
-        dist.all_gather_object(
+        dist.all_gather【】_object(
             weight_map_list,
             weight_map,
             group=ep_pp_group,

@@ -146,7 +146,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         state = task_data.get("_state_obj")
         try:
             result = self.env.execute(code, state)
-            logger.info(f"Execution result: reward={result.reward}, is_valid={result.is_valid}")
+            logger.info(f"Execution result: reward={result.reward}, is_valid={result.is_valid}, observation={result.observation!r}")
         except Exception as e:
             logger.warning(f"Environment execution failed: {e}")
             result = EnvResult(reward=-1.0, observation=str(e), is_valid=False)
@@ -203,6 +203,10 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             
             # Compute reward
             reward, result, code = await self._compute_reward(resp, data)
+            
+            # DEBUG: Log validation failure reason
+            if not result.is_valid:
+                logger.warning(f"Validation failed: observation={result.observation!r}")
             
             # Create trajectory
             trajectory = self._create_trajectory(resp, reward)
