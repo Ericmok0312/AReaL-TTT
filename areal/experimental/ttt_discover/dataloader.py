@@ -24,6 +24,7 @@ class _StateSamplerIterableDataset(IterableDataset):
         world_size: int,
         local_batch_size: int,
         state_to_prompt_fn: Callable[["State"], str] | None = None,
+        only_dp_head: bool = False,
     ):
         super().__init__()
         self.state_sampler = state_sampler
@@ -31,6 +32,7 @@ class _StateSamplerIterableDataset(IterableDataset):
         self.world_size = world_size
         self.local_batch_size = local_batch_size
         self.state_to_prompt_fn = state_to_prompt_fn or self._default_prompt_extractor
+        self.only_dp_head = only_dp_head
         self._iteration_count = 0
         
     # TODO: Change to return a Message content, or ensure state_to_prompt_fn is a function returns such pattern 
@@ -50,29 +52,51 @@ class _StateSamplerIterableDataset(IterableDataset):
             raise RuntimeError(
                 "TTTDiscoverDataLoader requires num_workers=0 due to PUCT state management"
             )
-            
-        while True:
-            # Sample global batch from PUCT/Greedy
-            global_batch_size = self.local_batch_size * self.world_size
-            states = self.state_sampler.sample_states(global_batch_size)
-            
-            # Shard for current rank
-            start_idx = self.rank * self.local_batch_size
-            end_idx = start_idx + self.local_batch_size
-            local_states = states[start_idx:end_idx]
-            
-            # Yield individual samples for collation
-            for state in local_states:
-                yield {
-                    "prompt": self.state_to_prompt_fn(state),
-                    "state_id": state.id,
-                    "state_value": state.value,
-                    "state_timestep": state.timestep,
-                    "parent_values": state.parent_values,
-                    "parents": state.parents,
-                    "_state_obj": state,  # Full state for advanced usage
-                }
-                self._iteration_count += 1
+        
+        # Mode 1: Only DP head (rank 0) produces data
+        # This is used when rollout is done only on DP head and broadcast to all ranks
+        if self.only_dp_head:
+            if self.rank != 0:
+                # Non-head ranks: don't produce any data
+                # prepare_batch will receive data via broadcast from rank 0
+                return
+            # Rank 0: produce all data
+            while True:
+                states = self.state_sampler.sample_states(self.local_batch_size)
+                for state in states:
+                    yield {
+                        "prompt": self.state_to_prompt_fn(state),
+                        "state_id": state.id,
+                        "state_value": state.value,
+                        "state_timestep": state.timestep,
+                        "parent_values": state.parent_values,
+                        "parents": state.parents,
+                        "_state_obj": state,
+                    }
+                    self._iteration_count += 1
+        else:
+            # Mode 2: Standard distributed sharding (each rank samples its own shard)
+            while True:
+                global_batch_size = self.local_batch_size * self.world_size
+                states = self.state_sampler.sample_states(global_batch_size)
+                
+                # Shard for current rank
+                start_idx = self.rank * self.local_batch_size
+                end_idx = start_idx + self.local_batch_size
+                local_states = states[start_idx:end_idx]
+                
+                # Yield individual samples for collation
+                for state in local_states:
+                    yield {
+                        "prompt": self.state_to_prompt_fn(state),
+                        "state_id": state.id,
+                        "state_value": state.value,
+                        "state_timestep": state.timestep,
+                        "parent_values": state.parent_values,
+                        "parents": state.parents,
+                        "_state_obj": state,
+                    }
+                    self._iteration_count += 1
                 
     def state_dict(self) -> dict:
         return {"iteration_count": self._iteration_count}
@@ -110,19 +134,26 @@ class TTTDiscoverDataLoader(StatefulDataLoader):
         collate_fn: Callable | None = None,
         state_to_prompt_fn: Callable[["State"], str] | None = None,
         drop_last: bool = True,
+        only_dp_head: bool = False,
         **kwargs
     ):
-        if batch_size % world_size != 0:
-            raise ValueError(
-                f"batch_size ({batch_size}) must be divisible by "
-                f"world_size ({world_size})"
-            )
-            
         self.sampler = state_sampler  # Expose for update_states, flush, etc.
         self._rank = rank
         self._world_size = world_size
+        self._only_dp_head = only_dp_head
         
-        local_batch_size = batch_size // world_size
+        if only_dp_head:
+            # Only DP head produces data, others yield empty
+            # batch_size is the total size (not divided by world_size)
+            local_batch_size = batch_size
+        else:
+            # Standard distributed sharding
+            if batch_size % world_size != 0:
+                raise ValueError(
+                    f"batch_size ({batch_size}) must be divisible by "
+                    f"world_size ({world_size})"
+                )
+            local_batch_size = batch_size // world_size
         
         # Create underlying iterable dataset
         self._dataset = _StateSamplerIterableDataset(
@@ -131,6 +162,7 @@ class TTTDiscoverDataLoader(StatefulDataLoader):
             world_size=world_size,
             local_batch_size=local_batch_size,
             state_to_prompt_fn=state_to_prompt_fn,
+            only_dp_head=only_dp_head,
         )
         
         # Initialize parent StatefulDataLoader
@@ -177,6 +209,7 @@ def create_tttd_dataloader(
     batch_size: int,
     collate_fn: Callable | None = None,
     drop_last: bool = True,
+    only_dp_head: bool = False,
     **kwargs
 ) -> TTTDiscoverDataLoader:
     """
@@ -193,6 +226,8 @@ def create_tttd_dataloader(
         batch_size: Total batch size (number of parent states per step)
         collate_fn: Optional custom collation function
         drop_last: Whether to drop last incomplete batch
+        only_dp_head: If True, only rank 0 produces data (for prepare_batch mode
+                     where DP head does rollout and broadcasts to all ranks)
         **kwargs: Additional args passed to StatefulDataLoader
         
     Returns:
@@ -219,6 +254,7 @@ def create_tttd_dataloader(
         batch_size=batch_size,
         collate_fn=collate_fn,
         drop_last=drop_last,
+        only_dp_head=only_dp_head,
         **kwargs
     )
 

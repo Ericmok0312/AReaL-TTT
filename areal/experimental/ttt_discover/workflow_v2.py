@@ -132,23 +132,19 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         """Compute reward by executing code in environment."""
         completion_str = self.tokenizer.decode(resp.output_tokens)
         
-        # DEBUG: Log completion preview
-        logger.info(f"Raw completion (first 200 chars): {completion_str[:200]!r}")
-        
         code = self.env.extract_code(completion_str)
         if code is None:
-            logger.warning(f"Code extraction failed. Completion preview: {completion_str[:200]!r}")
+            logger.warning(f"Code extraction failed")
             return -1.0, EnvResult(reward=-1.0, observation="Code extraction failed", is_valid=False), ""
-        
-        # DEBUG: Log extracted code
-        logger.info(f"Extracted code (first 200 chars): {code[:200]!r}")
         
         state = task_data.get("_state_obj")
         try:
             result = self.env.execute(code, state)
-            logger.info(f"Execution result: reward={result.reward}, is_valid={result.is_valid}, observation={result.observation!r}")
+            # Only log essential execution result (no prompt/output details)
+            metadata = result.metadata if result.metadata else {}
+            logger.info(f"reward={result.reward:.4f}, valid={result.is_valid}")
         except Exception as e:
-            logger.warning(f"Environment execution failed: {e}")
+            logger.warning(f"Execution failed: {e}")
             result = EnvResult(reward=-1.0, observation=str(e), is_valid=False)
         
         stats_tracker.get("rollout").scalar(
@@ -203,14 +199,14 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             
             # Check if generation was truncated
             if resp.stop_reason == "length":
-                logger.warning(f"Generation truncated due to length limit (max_tokens={self.gconfig.max_new_tokens}). Output may be incomplete.")
+                logger.warning(f"Generation truncated (max_tokens={self.gconfig.max_new_tokens})")
             
             # Compute reward
             reward, result, code = await self._compute_reward(resp, data)
             
-            # DEBUG: Log validation failure reason
+            # Log validation failure (concise)
             if not result.is_valid:
-                logger.warning(f"Validation failed: observation={result.observation!r}")
+                logger.warning(f"Validation failed: reward={reward:.4f}")
             
             # Create trajectory
             trajectory = self._create_trajectory(resp, reward)

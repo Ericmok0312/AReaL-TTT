@@ -111,14 +111,18 @@ def main(args):
         env_type="custom",
     )
     
-    batch_size = config.sampler.batch_size
-    group_size = config.gconfig.n_samples
+    batch_size = config.sampler.batch_size  # Total parents per step (e.g., 8)
+    group_size = config.gconfig.n_samples   # Rollouts per parent (e.g., 64)
     
+    # Use only_dp_head=True because AReaL's prepare_batch only runs rollout on DP head
+    # and broadcasts results to all ranks. This ensures correct total rollout count.
+    # world_size=1: Treat as single-process dataset (rank 0 produces all data)
     train_dataloader = create_tttd_dataloader(
         state_sampler=sampler,
-        rank=actor.data_parallel_rank,
-        world_size=actor.data_parallel_world_size,
-        batch_size=batch_size,
+        rank=0 if actor.dp_rank == 0 else -1,
+        world_size=1,
+        batch_size=batch_size,  # Total batch size (8 parents total, not per rank)
+        only_dp_head=True,      # Only DP head produces data
     )
     
     ft_spec = FinetuneSpec(
@@ -247,6 +251,7 @@ def main(args):
             )
         
         # Flush sampler updates (commits all buffered updates from this batch)
+        # Should we wait for all codes executed?
         with stats_tracker.record_timing("sampler_update"):
             # Get local updates from this rank
             local_children, local_parents = workflow.get_pending_updates_sync(clear=True)
@@ -257,13 +262,13 @@ def main(args):
             )
             
             # Only rank 0 updates sampler and saves
-            if actor.is_data_parallel_head():
+            if actor.dp_rank == 0:
                 if all_children:
                     sampler.update_states(all_children, all_parents, save=False)
                     sampler.flush(step=global_step)
-                    print(f"[Step {global_step}] Aggregated {len(all_children)} updates "
-                          f"from {actor.data_parallel_world_size} ranks, "
-                          f"{len(set(p.id for p in all_parents))} unique parents")
+                    logger.info(f"[Step {global_step}] Aggregated {len(all_children)} updates "
+                                f"from {actor.data_parallel_world_size} ranks, "
+                                f"{len(set(p.id for p in all_parents))} unique parents")
         
         # Log rewards
         step_rewards = batch["rewards"].cpu().numpy()
@@ -271,13 +276,12 @@ def main(args):
         step_mean_reward = float(step_rewards.mean())
         best_reward = max(best_reward, step_max_reward)
         
-        if actor.is_data_parallel_head(): # intentionally kept to check communication
-            print(f"[Step {global_step}] "
-                  f"Max Reward: {step_max_reward:.4f} | "
-                  f"Mean Reward: {step_mean_reward:.4f} | "
-                  f"Best Overall: {best_reward:.4f}")
-        
-        dist.barrier(group=actor.cpu_group)
+        # Collect metrics for stats_logger
+        metrics = {
+            "reward/max": step_max_reward,
+            "reward/mean": step_mean_reward,
+            "reward/best_overall": best_reward,
+        }
         
         # Training (same as V1)
         if config.should_compute_prox_logp():
@@ -291,25 +295,41 @@ def main(args):
         with stats_tracker.record_timing("compute_advantage"):
             actor.compute_advantages(batch)
         
-        # Print advantage statistics
+        # Add advantage statistics
         if "advantages" in batch:
             adv = batch["advantages"].cpu().numpy()
-            if int(os.getenv("RANK", 0)) == 0:
-                print(f"[Step {global_step}] Advantage: mean={adv.mean():.4f}, std={adv.std():.4f}, "
-                      f"min={adv.min():.4f}, max={adv.max():.4f}")
+            metrics.update({
+                "advantage/mean": float(adv.mean()),
+                "advantage/std": float(adv.std()),
+                "advantage/min": float(adv.min()),
+                "advantage/max": float(adv.max()),
+            })
         
         with stats_tracker.record_timing("train_step"):
             actor.ppo_update(batch)
             actor.step_lr_scheduler()
         
-        # Print training stats (includes entropy)
+        # Add training stats
         stats = actor.export_stats()
-        if int(os.getenv("RANK", 0)) == 0:
-            entropy = stats.get('entropy', 0.0)
-            actor_loss = stats.get('actor_loss', 0.0)
-            approx_kl = stats.get('approx_kl', 0.0)
-            print(f"[Step {global_step}] Entropy: {entropy:.4f}, Actor Loss: {actor_loss:.4f}, Approx KL: {approx_kl:.4f}")
+        metrics.update({
+            "train/entropy": stats.get('entropy/avg', 0.0),
+            "train/actor_loss": stats.get('actor_loss/avg', 0.0),
+            "train/approx_kl": stats.get('approx_kl/avg', 0.0),
+        })
         
+        # Log to stats_logger (wandb/swanlab/tensorboard)
+        if actor.dp_rank == 0:
+            stats_logger.commit(
+                epoch=step_info.epoch,
+                step=step_info.epoch_step,
+                global_step=global_step,
+                data=metrics,
+            )
+            # Also print concise summary
+            logger.info(f"[Step {global_step}] "
+                       f"Reward: max={step_max_reward:.4f}, mean={step_mean_reward:.4f}, best={best_reward:.4f} | "
+                       f"Loss: {metrics['train/actor_loss']:.4f}, KL: {metrics['train/approx_kl']:.4f}")
+                
         rollout.pause()
         
         with stats_tracker.record_timing("update_weights"):
