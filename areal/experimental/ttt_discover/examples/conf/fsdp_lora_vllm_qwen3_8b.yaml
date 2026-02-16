@@ -21,7 +21,7 @@ gradient_checkpointing: true
 dtype: bfloat16
 
 mb_spec:
-  max_tokens_per_mb: 10240
+  max_tokens_per_mb: 32768
 
 optimizer:
   type: adam
