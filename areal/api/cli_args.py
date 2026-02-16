@@ -1152,6 +1152,7 @@ class vLLMConfig:
     enable_sleep_mode: bool = False
     uvicorn_log_level: str = "warning"
     enable_lora: bool = False
+    max_lora_rank: int = 16
     lora_modules: str = ""
 
     @staticmethod
