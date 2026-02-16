@@ -168,9 +168,11 @@ vllm:
   dtype: ${dtype}
   max_model_len: 32768
   gpu_memory_utilization: 0.9
+  enforce_eager: true
   # LoRA support - dynamically loaded after FSDP initializes
-  # Initial LoRA is loaded from base model path (will be updated during training)
   enable_lora: ${use_lora}
+  # Initial LoRA module - will be updated during training
+  lora_modules: '{"name": "${gconfig.lora_name}", "path": "${path}", "base_model_name": "${path}"}'
 
 # ============================================================================
 # PUCT Sampler Configuration
