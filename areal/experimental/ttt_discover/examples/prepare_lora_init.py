@@ -116,7 +116,7 @@ def main():
     args = parser.parse_args()
     
     # Load config
-    config, _ = load_expr_config([f"--config-path={args.config_path}"], TTTDPPOActorConfig)
+    config, _ = load_expr_config([f"--config={args.config_path}"], TTTDPPOActorConfig)
     
     if not config.use_lora:
         print("LoRA is not enabled in config (use_lora=false). Nothing to do.")
