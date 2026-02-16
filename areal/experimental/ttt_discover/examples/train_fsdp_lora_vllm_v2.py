@@ -12,7 +12,6 @@ Usage:
         --config-path conf/fsdp_lora_vllm.yaml
 """
 
-import asyncio
 import os
 import sys
 import warnings
@@ -89,7 +88,7 @@ def gather_states_across_ranks(actor, local_children, local_parents):
         return None, None
 
 
-async def main(args):
+def main(args):
     config, _ = load_expr_config(args, TTTDPPOActorConfig)
     config: TTTDPPOActorConfig
     
@@ -236,7 +235,7 @@ async def main(args):
         )
         
         # Reset workflow buffers (clears any stale pending updates)
-        await workflow.reset()
+        workflow.reset_sync()
         
         # Rollout - workflow updates sampler internally!
         with stats_tracker.record_timing("rollout"):
@@ -250,7 +249,7 @@ async def main(args):
         # Flush sampler updates (commits all buffered updates from this batch)
         with stats_tracker.record_timing("sampler_update"):
             # Get local updates from this rank
-            local_children, local_parents = await workflow.get_pending_updates(clear=True)
+            local_children, local_parents = workflow.get_pending_updates_sync(clear=True)
             
             # Aggregate updates from all ranks using all_gather_object
             all_children, all_parents = gather_states_across_ranks(
@@ -326,4 +325,4 @@ async def main(args):
 
 
 if __name__ == "__main__":
-    asyncio.run(main(sys.argv[1:]))
+    main(sys.argv[1:])

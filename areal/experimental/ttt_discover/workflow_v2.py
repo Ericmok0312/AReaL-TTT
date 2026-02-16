@@ -307,15 +307,32 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             self._pending_parents.clear()
             self._parent_stats.clear()
 
+    def reset_sync(self):
+        """Synchronous version of reset()."""
+        self._pending_children.clear()
+        self._pending_parents.clear()
+        self._parent_stats.clear()
+
+    def get_pending_updates_sync(self, clear: bool = True) -> tuple[list, list]:
+        """Synchronous version of get_pending_updates()."""
+        children = self._pending_children.copy()
+        parents = self._pending_parents.copy()
+        
+        if clear:
+            self._pending_children.clear()
+            self._pending_parents.clear()
+            self._parent_stats.clear()
+        
+        return children, parents
+
     # Backward compatibility - these are no-ops in V2
-    # Note: In V2, you should use await workflow.reset() and await workflow.flush()
     def init_batch_metadata(self):
-        """No-op in V2. Use await workflow.reset() instead."""
-        # Cannot call async reset() from sync context - just return empty list
+        """No-op in V2. Use reset_sync() instead."""
+        self.reset_sync()
         return []
     
     def reset_batch_metadata(self):
-        """No-op in V2. Use await workflow.reset() instead."""
+        """No-op in V2. Use reset_sync() instead."""
         pass
     
     @property
