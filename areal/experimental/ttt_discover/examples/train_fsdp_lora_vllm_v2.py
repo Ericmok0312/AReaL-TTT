@@ -267,8 +267,8 @@ def main(args):
         
         # Log rewards
         step_rewards = batch["rewards"].cpu().numpy()
-        step_max_reward = -float(step_rewards.min())
-        step_mean_reward = -float(step_rewards.mean())
+        step_max_reward = float(step_rewards.max())
+        step_mean_reward = float(step_rewards.mean())
         best_reward = max(best_reward, step_max_reward)
         
         if actor.is_data_parallel_head(): # intentionally kept to check communication
