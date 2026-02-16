@@ -427,28 +427,31 @@ def main(args):
             steps_per_epoch=max_steps,
         )
         
-        # Clear workflow's metadata storage before rollout
-        workflow._batch_metadata.clear()
+        # Initialize metadata context for this batch.
+        # This must be done before prepare_batch so that metadata can be collected
+        # even when workflow is wrapped by GroupedRolloutWorkflow.
+        batch_metadata = workflow.init_batch_metadata()
         
-        # vLLM: each rank does its own rollout (no broadcast needed)
-        with stats_tracker.record_timing("rollout"):
-            batch = actor.prepare_batch(
-                train_dataloader,
-                workflow=workflow,
-                group_size=group_size,
-                should_accept_fn=lambda sample: True,
-            )
-        
-        with stats_tracker.record_timing("group_processing"):
-            # Get metadata from workflow's side-channel storage
-            batch_metadata = workflow._batch_metadata
-            training_batch = process_batch_and_update_sampler(
-                batch=batch,
-                metadata=batch_metadata,
-                sampler=sampler,
-                env=env,
-                group_size=group_size,
-            )
+        try:
+            # vLLM: each rank does its own rollout (no broadcast needed)
+            with stats_tracker.record_timing("rollout"):
+                batch = actor.prepare_batch(
+                    train_dataloader,
+                    workflow=workflow,
+                    group_size=group_size,
+                    should_accept_fn=lambda sample: True,
+                )
+            
+            with stats_tracker.record_timing("group_processing"):
+                # Metadata was collected via contextvars during rollout,
+                # so it's available here even with GroupedRolloutWorkflow.
+                training_batch = process_batch_and_update_sampler(
+                    batch=batch,
+                    metadata=batch_metadata,
+                    sampler=sampler,
+                    env=env,
+                    group_size=group_size,
+                )
             # Only rank 0 flushes to avoid conflicts
             if actor.is_data_parallel_head():
                 sampler.flush(step=global_step)
@@ -464,6 +467,10 @@ def main(args):
                       f"Max Reward: {step_max_reward:.4f} | "
                       f"Mean Reward: {step_mean_reward:.4f} | "
                       f"Best Overall: {best_reward:.4f}")
+        
+        finally:
+            # Clean up metadata context after batch processing
+            workflow.reset_batch_metadata()
         
         dist.barrier(group=actor.cpu_group)
         
