@@ -88,6 +88,8 @@ scheduling_spec:
 
 # Actor reference for launcher validation (TTTDPPOActorConfig inherits from PPOActorConfig)
 actor:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
   path: ${path}
   dtype: ${dtype}
   scheduling_spec: ${scheduling_spec}
