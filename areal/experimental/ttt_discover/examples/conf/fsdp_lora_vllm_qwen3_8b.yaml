@@ -1,5 +1,5 @@
 # TTT-Discover FSDP + LoRA + vLLM Configuration for Qwen3-8B on 8x H20
-# Faster iteration for testing
+# Fixed: Added mb_spec to actor, added max_length filter, aligned sequence limits
 
 experiment_name: tttd-qwen3-8b-cp
 trial_name: trial0
@@ -20,8 +20,11 @@ disable_dropout: true
 gradient_checkpointing: true
 dtype: bfloat16
 
+# 顶层 mb_spec（可能被忽略，但保留作为参考）
 mb_spec:
   max_tokens_per_mb: 32768
+  n_mbs: 1
+  granularity: 1
 
 optimizer:
   type: adam
@@ -76,11 +79,16 @@ scheduling_spec:
     cmd: python3 -m areal.infra.rpc.rpc_server
     env_vars: {}
 
+# CRITICAL FIX: actor 必须有自己的 mb_spec，否则使用默认值 10240
 actor:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: ${path}
   dtype: ${dtype}
+  mb_spec:
+    max_tokens_per_mb: 32768  # 关键：必须 >= 最大序列长度
+    n_mbs: 1
+    granularity: 1
   scheduling_spec: ${scheduling_spec}
 
 tokenizer_path: ${path}
@@ -114,15 +122,16 @@ rollout:
   use_lora: ${use_lora}
 
 gconfig:
-  # NOTE: Set to 8 for quick testing. Change back to 64 for full training.
   n_samples: 8
   min_new_tokens: 0
-  max_new_tokens: 16384
+  max_new_tokens: 16384      # 生成长度限制
+  max_tokens: 32768          # 总长度限制（prompt + response）
   greedy: false
   temperature: 1.0
   top_p: 0.95
   lora_name: tttd_lora_adapter
 
+# CRITICAL FIX: ref 也需要 mb_spec（如果与 actor 不同步会出错）
 ref:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
@@ -131,7 +140,8 @@ ref:
   disable_dropout: true
   dtype: ${dtype}
   mb_spec:
-    max_tokens_per_mb: 10240
+    max_tokens_per_mb: 32768  # 必须与 actor 一致
+    n_mbs: 1
   optimizer: null
   scheduling_strategy:
     type: colocation
@@ -143,9 +153,9 @@ vllm:
   seed: ${seed}
   skip_tokenizer_init: false
   dtype: ${dtype}
-  max_model_len: 32768
-  gpu_memory_utilization: 0.9
-  enforce_eager: true
+  max_model_len: 32768       # 必须与 mb_spec 一致
+  gpu_memory_utilization: 0.85  # H20 96GB，留点余量更安全
+  enforce_eager: true        # 如果需要性能可设为 false，但 true 更稳定
   enable_lora: ${use_lora}
   max_lora_rank: 32
   lora_modules: '{"name": "${gconfig.lora_name}", "path": "./lora_init_qwen3_8b", "base_model_name": "${path}"}'
@@ -164,16 +174,19 @@ sampler:
   initial_exp_type: best_available
   env_type: cp
   n_item: 26
-  gpu_type: H100
+  gpu_type: H100           # 你用的是 H20，但代码里可能用这个字段做其他判断，保持原样
   eval_timeout: 60
   n: 100
   budget_s: 1000
 
+# CRITICAL FIX: 添加 max_length 过滤超长样本
 train_dataset:
   batch_size: 4
+  max_length: 32768        # 超过此长度的样本会被过滤，防止进入训练
 
 valid_dataset:
   batch_size: 8
+  max_length: 32768        # 同样限制验证集
 
 saver:
   experiment_name: ${experiment_name}

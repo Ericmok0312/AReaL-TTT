@@ -71,7 +71,7 @@ def gather_states_across_ranks(actor, local_children, local_parents):
     dist.all_gather_object(all_parents_dicts, parents_dicts, group=actor.data_parallel_group)
     
     # On rank 0, deserialize and combine all states
-    if actor.is_data_parallel_head():
+    if int(os.getenv("RANK", 0)) == 0:
         from areal.experimental.ttt_discover.state import state_from_dict
         
         all_children = []
@@ -267,11 +267,11 @@ def main(args):
         
         # Log rewards
         step_rewards = batch["rewards"].cpu().numpy()
-        step_max_reward = float(step_rewards.max())
-        step_mean_reward = float(step_rewards.mean())
+        step_max_reward = -float(step_rewards.min())
+        step_mean_reward = -float(step_rewards.mean())
         best_reward = max(best_reward, step_max_reward)
         
-        if actor.is_data_parallel_head():
+        if actor.is_data_parallel_head(): # intentionally kept to check communication
             print(f"[Step {global_step}] "
                   f"Max Reward: {step_max_reward:.4f} | "
                   f"Mean Reward: {step_mean_reward:.4f} | "
@@ -294,7 +294,7 @@ def main(args):
         # Print advantage statistics
         if "advantages" in batch:
             adv = batch["advantages"].cpu().numpy()
-            if actor.is_data_parallel_head():
+            if int(os.getenv("RANK", 0)) == 0:
                 print(f"[Step {global_step}] Advantage: mean={adv.mean():.4f}, std={adv.std():.4f}, "
                       f"min={adv.min():.4f}, max={adv.max():.4f}")
         
@@ -304,7 +304,7 @@ def main(args):
         
         # Print training stats (includes entropy)
         stats = actor.export_stats()
-        if actor.is_data_parallel_head():
+        if int(os.getenv("RANK", 0)) == 0:
             entropy = stats.get('entropy', 0.0)
             actor_loss = stats.get('actor_loss', 0.0)
             approx_kl = stats.get('approx_kl', 0.0)
