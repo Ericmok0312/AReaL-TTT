@@ -124,6 +124,7 @@ rollout:
   fileroot: ${cluster.fileroot}
   tokenizer_path: ${tokenizer_path}
   dump_to_file: true
+  use_lora: ${use_lora}
 
 # ============================================================================
 # Generation Configuration
