@@ -1,0 +1,217 @@
+# TTT-Discover FSDP + LoRA + vLLM Configuration for Qwen3-8B on 8x H20
+# Faster iteration for testing
+
+experiment_name: tttd-qwen3-8b-cp
+trial_name: trial0
+
+is_tttd_config: true
+
+seed: 1
+enable_offload: false
+
+max_steps: 50
+total_train_epochs: 10
+
+path: Qwen/Qwen3-8B
+enable_thinking: true
+
+init_from_scratch: false
+disable_dropout: true
+gradient_checkpointing: true
+dtype: bfloat16
+
+mb_spec:
+  max_tokens_per_mb: 10240
+
+optimizer:
+  type: adam
+  lr: 3e-5
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1e-8
+  lr_scheduler_type: constant
+  gradient_clipping: 1.0
+  warmup_steps_proportion: 0.001
+
+eps_clip: 0.4
+temperature: ${gconfig.temperature}
+reward_scaling: 10.0
+reward_bias: -0.5
+kl_ctl: 0.01
+ppo_n_minibatches: 1
+recompute_logprob: true
+use_decoupled_loss: true
+behav_imp_weight_cap: 5.0
+
+reward_norm:
+  mean_level: group
+  std_level: group
+  group_size: ${gconfig.n_samples}
+
+adv_norm:
+  mean_level: batch
+  std_level: batch
+
+max_new_tokens: ${gconfig.max_new_tokens}
+
+use_lora: true
+peft_type: lora
+lora_rank: 32
+lora_alpha: 16
+target_modules: [all-linear]
+weight_update_mode: xccl
+
+adv_estimator: entropic
+adv_estimator_beta: 1.0
+adv_estimator_target_kl: 0.693
+adv_estimator_beta_max: 1000000.0
+adv_estimator_beta_iters: 60
+
+scheduling_spec:
+  - task_type: worker
+    port_count: 2
+    gpu: 1
+    mem: 32
+    cmd: python3 -m areal.infra.rpc.rpc_server
+    env_vars: {}
+
+actor:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${path}
+  dtype: ${dtype}
+  scheduling_spec: ${scheduling_spec}
+
+tokenizer_path: ${path}
+
+cluster:
+  n_nodes: 1
+  n_gpus_per_node: 8
+  fileroot: ./outputs
+  name_resolve:
+    type: nfs
+    nfs_record_root: /tmp/areal/name_resolve
+
+allocation_mode: vllm[rollout]:d4p1t1+fsdp[actor]:d4p1t1
+
+scheduler:
+  type: null
+
+rollout:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  max_concurrent_rollouts: 256
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 4
+  enable_rollout_tracing: false
+  pause_grace_period: 1.0
+  scheduling_spec: ${scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+  use_lora: ${use_lora}
+
+gconfig:
+  n_samples: 64
+  min_new_tokens: 0
+  max_new_tokens: 16384
+  greedy: false
+  temperature: 1.0
+  top_p: 0.95
+  lora_name: tttd_lora_adapter
+
+ref:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${path}
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${dtype}
+  mb_spec:
+    max_tokens_per_mb: 10240
+  optimizer: null
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  scheduling_spec: ${scheduling_spec}
+
+vllm:
+  model: ${path}
+  seed: ${seed}
+  skip_tokenizer_init: false
+  dtype: ${dtype}
+  max_model_len: 32768
+  gpu_memory_utilization: 0.9
+  enforce_eager: true
+  enable_lora: ${use_lora}
+  max_lora_rank: 32
+  lora_modules: '{"name": "${gconfig.lora_name}", "path": "./lora_init_qwen3_8b", "base_model_name": "${path}"}'
+
+sampler:
+  type: puct
+  batch_size: 8
+  c_puct: 1.5
+  gamma: 0.95
+  max_children: 100
+  max_states: 10000
+  top_k: 1000
+  temperature: 1.0
+  save_freq: 100
+  checkpoint_dir: ${cluster.fileroot}/${experiment_name}/${trial_name}/sampler
+  initial_exp_type: best_available
+  env_type: cp
+  n_item: 26
+  gpu_type: H100
+  eval_timeout: 60
+  n: 100
+  budget_s: 1000
+
+train_dataset:
+  batch_size: 8
+
+valid_dataset:
+  batch_size: 8
+
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: 3600
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+    project: tttd-qwen3-8b-cp
+    entity: null
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false
