@@ -160,6 +160,26 @@ class TTTDiscoverWorkflow(RolloutWorkflow):
             "attention_mask": torch.ones(len(seq), dtype=torch.bool).unsqueeze(0),
             "rewards": torch.tensor([reward], dtype=torch.float32),
         }
+    
+    def _create_failed_trajectory(self, input_ids: list[int]) -> dict[str, torch.Tensor]:
+        """Create a placeholder trajectory for failed rollouts.
+        
+        This ensures alignment between batch and metadata when GroupedRolloutWorkflow
+        concatenates results. The trajectory has loss_mask=0 so it doesn't affect training.
+        """
+        seq = input_ids + [self.tokenizer.eos_token_id or 0]  # Minimal sequence
+        logprobs = [0.0] * len(seq)
+        loss_mask = [0] * len(seq)  # No training on failed rollouts
+        versions = [-1] * len(seq)
+        
+        return {
+            "input_ids": torch.tensor(seq, dtype=torch.int32).unsqueeze(0),
+            "loss_mask": torch.tensor(loss_mask, dtype=torch.int32).unsqueeze(0),
+            "logprobs": torch.tensor(logprobs, dtype=torch.float32).unsqueeze(0),
+            "versions": torch.tensor(versions, dtype=torch.int32).unsqueeze(0),
+            "attention_mask": torch.ones(len(seq), dtype=torch.bool).unsqueeze(0),
+            "rewards": torch.tensor([-1.0], dtype=torch.float32),
+        }
 
     @trace_session("reward")
     async def _compute_reward(
@@ -278,7 +298,35 @@ class TTTDiscoverWorkflow(RolloutWorkflow):
             
         except Exception as e:
             logger.error(f"arun_episode failed: {e}", exc_info=True)
-            return None
+            # Create a placeholder trajectory and metadata for failed rollout
+            # This ensures alignment with GroupedRolloutWorkflow (which filters None)
+            state = data.get("_state_obj")
+            
+            # Get input_ids from the original prompt for minimal trajectory
+            prompt = self.env.get_prompt(state) if state else ""
+            messages = [{"role": "user", "content": prompt}]
+            try:
+                input_ids = list(self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    enable_thinking=self.enable_thinking,
+                ))
+            except Exception:
+                input_ids = [self.tokenizer.bos_token_id or 0]
+            
+            # Record metadata
+            self._batch_metadata.append({
+                "parent_state": state,
+                "reward": -1.0,
+                "is_valid": False,
+                "code": "",
+                "observation": f"Error: {e}",
+                "metadata": {"error": str(e)},
+            })
+            
+            # Return placeholder trajectory (loss_mask=0, won't affect training)
+            return self._create_failed_trajectory(input_ids)
 
     async def rollout_group(
         self,

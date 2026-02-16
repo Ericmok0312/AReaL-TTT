@@ -169,7 +169,12 @@ def process_batch_and_update_sampler(
     batch_size = batch["rewards"].shape[0]
     num_parents = batch_size // group_size
     
-    # Create child states for ALL rollouts
+    # Metadata and batch should now be aligned (both include failed rollouts)
+    if len(metadata) != batch_size:
+        print(f"[WARNING] Metadata length mismatch: metadata={len(metadata)}, "
+              f"batch_size={batch_size}. This should not happen with proper alignment.")
+    
+    # Create child states for valid rollouts only
     children = []
     parents = []
     
