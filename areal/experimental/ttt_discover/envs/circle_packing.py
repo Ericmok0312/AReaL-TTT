@@ -153,6 +153,9 @@ class CirclePackingEnv(BaseEnv):
             # Run verification
             out = task.compute_score(code, step=0, state=state)
             
+            # DEBUG: Log the full output
+            logger.info(f"CirclePacking execute: score={out.get('score')}, correctness={out.get('correctness')}, msg={out.get('msg')!r}")
+            
             # Convert result_construction to circles format
             circles = None
             raw_constr = out.get("result_construction")
