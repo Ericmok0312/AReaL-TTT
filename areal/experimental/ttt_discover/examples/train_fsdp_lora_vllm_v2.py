@@ -5,7 +5,7 @@ TTT-Discover Training V2 - 使用 Workflow 内部 Sampler 更新
 Key differences from V1:
 - Workflow holds sampler reference, updates internally
 - No metadata list, no indexing issues
-- Simplified training loop
+- Simplified training loop with distributed state gathering
 
 Usage:
     torchrun --nproc_per_node=8 train_fsdp_lora_vllm_v2.py \
@@ -44,10 +44,10 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 def gather_states_across_ranks(actor, local_children, local_parents):
     """
-    Gather states from all data parallel ranks using all_gather.
+    Gather states from all data parallel ranks using all_gather_object.
     
-    Since State objects contain complex data, we serialize them to dicts
-    for communication, then deserialize on rank 0.
+    This uses PyTorch's all_gather_object which is designed for Python objects
+    and handles device placement automatically (works with both NCCL and Gloo).
     
     Args:
         actor: TTTDActor with data parallel info
@@ -57,84 +57,32 @@ def gather_states_across_ranks(actor, local_children, local_parents):
     Returns:
         (all_children, all_parents) on rank 0, (None, None) on other ranks
     """
-    import pickle
-    import io
-    
     if not dist.is_initialized() or actor.data_parallel_world_size <= 1:
         return local_children, local_parents
     
-    # Serialize states to bytes
-    def serialize_states(states):
-        buffer = io.BytesIO()
-        pickle.dump([s.to_dict() if hasattr(s, 'to_dict') else s for s in states], buffer)
-        return buffer.getvalue()
+    # Serialize states to dicts for communication
+    children_dicts = [s.to_dict() for s in local_children]
+    parents_dicts = [s.to_dict() for s in local_parents]
     
-    def deserialize_states(data):
-        from areal.experimental.ttt_discover.state import state_from_dict
-        buffer = io.BytesIO(data)
-        dicts = pickle.load(buffer)
-        return [state_from_dict(d) for d in dicts]
+    # Gather from all ranks using all_gather_object (handles NCCL automatically)
+    all_children_dicts = [None] * actor.data_parallel_world_size
+    all_parents_dicts = [None] * actor.data_parallel_world_size
     
-    # Serialize local states
-    local_children_bytes = serialize_states(local_children)
-    local_parents_bytes = serialize_states(local_parents)
-    
-    # Get sizes for all_gather
-    local_children_size = torch.tensor(len(local_children_bytes), dtype=torch.long, device='cpu')
-    local_parents_size = torch.tensor(len(local_parents_bytes), dtype=torch.long, device='cpu')
-    
-    # All gather sizes
-    world_size = actor.data_parallel_world_size
-    all_children_sizes = [torch.zeros(1, dtype=torch.long, device='cpu') for _ in range(world_size)]
-    all_parents_sizes = [torch.zeros(1, dtype=torch.long, device='cpu') for _ in range(world_size)]
-    
-    dist.all_gather(all_children_sizes, local_children_size, group=actor.data_parallel_group)
-    dist.all_gather(all_parents_sizes, local_parents_size, group=actor.data_parallel_group)
-    
-    # Convert bytes to tensors for all_gather
-    def bytes_to_tensor(byte_data):
-        return torch.from_numpy(np.frombuffer(byte_data, dtype=np.uint8).copy())
-    
-    def tensor_to_bytes(tensor):
-        return tensor.numpy().tobytes()
-    
-    import numpy as np
-    
-    # Pad to max size for all_gather
-    max_children_size = max(s.item() for s in all_children_sizes)
-    max_parents_size = max(s.item() for s in all_parents_sizes)
-    
-    local_children_padded = np.frombuffer(local_children_bytes, dtype=np.uint8).copy()
-    local_children_padded = np.pad(local_children_padded, (0, max_children_size - len(local_children_padded)))
-    
-    local_parents_padded = np.frombuffer(local_parents_bytes, dtype=np.uint8).copy()
-    local_parents_padded = np.pad(local_parents_padded, (0, max_parents_size - len(local_parents_padded)))
-    
-    # All gather actual data
-    children_tensor = torch.from_numpy(local_children_padded)
-    parents_tensor = torch.from_numpy(local_parents_padded)
-    
-    all_children_tensors = [torch.zeros(max_children_size, dtype=torch.uint8) for _ in range(world_size)]
-    all_parents_tensors = [torch.zeros(max_parents_size, dtype=torch.uint8) for _ in range(world_size)]
-    
-    dist.all_gather(all_children_tensors, children_tensor, group=actor.data_parallel_group)
-    dist.all_gather(all_parents_tensors, parents_tensor, group=actor.data_parallel_group)
+    dist.all_gather_object(all_children_dicts, children_dicts, group=actor.data_parallel_group)
+    dist.all_gather_object(all_parents_dicts, parents_dicts, group=actor.data_parallel_group)
     
     # On rank 0, deserialize and combine all states
     if actor.is_data_parallel_head():
+        from areal.experimental.ttt_discover.state import state_from_dict
+        
         all_children = []
         all_parents = []
         
-        for i in range(world_size):
-            # Extract actual data (remove padding)
-            children_data = all_children_tensors[i][:all_children_sizes[i].item()].numpy().tobytes()
-            parents_data = all_parents_tensors[i][:all_parents_sizes[i].item()].numpy().tobytes()
-            
-            if children_data:
-                children = deserialize_states(children_data)
-                parents = deserialize_states(parents_data)
-                all_children.extend(children)
-                all_parents.extend(parents)
+        for rank_children, rank_parents in zip(all_children_dicts, all_parents_dicts):
+            if rank_children:  # Skip empty lists
+                all_children.extend([state_from_dict(d) for d in rank_children])
+            if rank_parents:
+                all_parents.extend([state_from_dict(d) for d in rank_parents])
         
         return all_children, all_parents
     else:
@@ -304,8 +252,7 @@ async def main(args):
             # Get local updates from this rank
             local_children, local_parents = await workflow.get_pending_updates(clear=True)
             
-            # Aggregate updates from all ranks using all_gather
-            # Note: State objects need to be serialized for communication
+            # Aggregate updates from all ranks using all_gather_object
             all_children, all_parents = gather_states_across_ranks(
                 actor, local_children, local_parents
             )
