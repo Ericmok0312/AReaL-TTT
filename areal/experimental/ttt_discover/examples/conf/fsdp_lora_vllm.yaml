@@ -4,6 +4,9 @@
 experiment_name: tttd-lora-vllm
 trial_name: trial0
 
+# Required for TTT-Discover entropic advantages
+is_tttd_config: true
+
 seed: 1
 enable_offload: false
 
