@@ -46,7 +46,7 @@ Usage with Group Rollout:
     ...     sampler.update_states([best_result.state], [batch["_state_obj"]])
 """
 
-import contextvars
+import threading
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -73,12 +73,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("TTTDiscoverWorkflow")
 
-# Context variable for storing batch metadata across async calls.
-# This allows metadata to be collected even when the workflow is wrapped
-# by GroupedRolloutWorkflow, which creates multiple nested arun_episode calls.
-_BATCH_METADATA_CTX: contextvars.ContextVar[list[dict] | None] = contextvars.ContextVar(
-    "tttd_batch_metadata", default=None
-)
+# Thread-safe global storage for batch metadata, keyed by a batch identifier.
+# This is needed because AReaL's AsyncTaskRunner executes workflows in a
+# background thread, so contextvars and instance attributes don't work.
+_BATCH_METADATA_STORE: dict[str, list[dict]] = {}
+_BATCH_METADATA_LOCK = threading.Lock()
 
 
 @dataclass
@@ -145,32 +144,34 @@ class TTTDiscoverWorkflow(RolloutWorkflow):
             
         self.gconfig = gconfig.new_with_stop_and_pad_token_ids(self.tokenizer)
         self.enable_thinking = enable_thinking
+        
+        # Unique identifier for this workflow instance, used to key into
+        # the global metadata storage. Each training step generates a new key.
+        self._batch_key: str | None = None
 
     @property
     def _batch_metadata(self) -> list[dict]:
-        """Get the batch metadata list from context.
+        """Get the batch metadata list from global storage.
         
-        This property uses contextvars to store metadata, which allows it to work
-        correctly even when the workflow is wrapped by GroupedRolloutWorkflow.
-        The context is shared across all async calls in the same execution context.
+        This property uses a thread-safe global dict to store metadata,
+        which works correctly even when the workflow is wrapped by
+        GroupedRolloutWorkflow and executed in AReaL's background thread.
         
         Returns:
-            The current batch metadata list from context, or an empty list if
-            no context has been set (for backward compatibility).
+            The current batch metadata list, or an empty list if
+            no batch has been initialized.
         """
-        metadata = _BATCH_METADATA_CTX.get()
-        if metadata is None:
-            # Return empty list if context not initialized
-            # This maintains backward compatibility for direct workflow usage
+        if self._batch_key is None:
             return []
-        return metadata
+        with _BATCH_METADATA_LOCK:
+            return _BATCH_METADATA_STORE.get(self._batch_key, [])
 
     def init_batch_metadata(self) -> list[dict]:
-        """Initialize a new batch metadata context.
+        """Initialize a new batch metadata storage for this training step.
         
         This should be called at the start of each training step before
-        prepare_batch. It creates a new context token that must be reset
-        after the batch is processed.
+        prepare_batch. It generates a unique key and creates empty storage
+        that will be populated during rollout.
         
         Returns:
             A new empty metadata list that will be populated during rollout.
@@ -183,17 +184,23 @@ class TTTDiscoverWorkflow(RolloutWorkflow):
             finally:
                 workflow.reset_batch_metadata()
         """
+        # Generate a unique key for this batch
+        self._batch_key = f"tttd_{id(self)}_{uuid.uuid4().hex[:8]}"
         metadata: list[dict] = []
-        _BATCH_METADATA_CTX.set(metadata)
+        with _BATCH_METADATA_LOCK:
+            _BATCH_METADATA_STORE[self._batch_key] = metadata
         return metadata
 
     def reset_batch_metadata(self) -> None:
-        """Reset the batch metadata context.
+        """Reset the batch metadata storage.
         
         This should be called in a finally block after each training step
-        to clean up the context.
+        to clean up the storage and prevent memory leaks.
         """
-        _BATCH_METADATA_CTX.set(None)
+        if self._batch_key is not None:
+            with _BATCH_METADATA_LOCK:
+                _BATCH_METADATA_STORE.pop(self._batch_key, None)
+            self._batch_key = None
 
     def _create_trajectory(
         self,
@@ -337,19 +344,21 @@ class TTTDiscoverWorkflow(RolloutWorkflow):
             # Create trajectory
             trajectory = self._create_trajectory(resp, reward)
             
-            # Store metadata in context for retrieval after batch completes.
-            # Using contextvars allows metadata to be collected even when this
-            # workflow is wrapped by GroupedRolloutWorkflow.
-            metadata_list = _BATCH_METADATA_CTX.get()
-            if metadata_list is not None:
-                metadata_list.append({
-                    "parent_state": state,
-                    "reward": reward,
-                    "is_valid": result.is_valid,
-                    "code": code,
-                    "observation": result.observation,
-                    "metadata": result.metadata,
-                })
+            # Store metadata in global storage for retrieval after batch completes.
+            # Using a thread-safe global dict with batch_key allows metadata to be
+            # collected even when this workflow is wrapped by GroupedRolloutWorkflow
+            # and executed in AReaL's background thread.
+            if self._batch_key is not None:
+                with _BATCH_METADATA_LOCK:
+                    if self._batch_key in _BATCH_METADATA_STORE:
+                        _BATCH_METADATA_STORE[self._batch_key].append({
+                            "parent_state": state,
+                            "reward": reward,
+                            "is_valid": result.is_valid,
+                            "code": code,
+                            "observation": result.observation,
+                            "metadata": result.metadata,
+                        })
             
             return trajectory
             
@@ -372,17 +381,18 @@ class TTTDiscoverWorkflow(RolloutWorkflow):
             except Exception:
                 input_ids = [self.tokenizer.bos_token_id or 0]
             
-            # Record metadata in context (if context is initialized)
-            metadata_list = _BATCH_METADATA_CTX.get()
-            if metadata_list is not None:
-                metadata_list.append({
-                    "parent_state": state,
-                    "reward": -1.0,
-                    "is_valid": False,
-                    "code": "",
-                    "observation": f"Error: {e}",
-                    "metadata": {"error": str(e)},
-                })
+            # Record metadata in global storage (if initialized)
+            if self._batch_key is not None:
+                with _BATCH_METADATA_LOCK:
+                    if self._batch_key in _BATCH_METADATA_STORE:
+                        _BATCH_METADATA_STORE[self._batch_key].append({
+                            "parent_state": state,
+                            "reward": -1.0,
+                            "is_valid": False,
+                            "code": "",
+                            "observation": f"Error: {e}",
+                            "metadata": {"error": str(e)},
+                        })
             
             # Return placeholder trajectory (loss_mask=0, won't affect training)
             return self._create_failed_trajectory(input_ids)
@@ -427,10 +437,14 @@ class TTTDiscoverWorkflow(RolloutWorkflow):
                 ))
                 continue
             
-            # Get metadata from context storage
+            # Get metadata from global storage
             # Note: In rollout_group, metadata was stored during arun_episode
-            metadata_list = _BATCH_METADATA_CTX.get()
-            metadata = metadata_list[len(results)] if metadata_list and len(results) < len(metadata_list) else {}
+            metadata = {}
+            if self._batch_key is not None:
+                with _BATCH_METADATA_LOCK:
+                    metadata_list = _BATCH_METADATA_STORE.get(self._batch_key, [])
+                    if len(results) < len(metadata_list):
+                        metadata = metadata_list[len(results)]
             
             # Create child state if valid
             child_state = None

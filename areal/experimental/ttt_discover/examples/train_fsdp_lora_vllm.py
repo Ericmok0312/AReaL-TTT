@@ -427,7 +427,7 @@ def main(args):
             steps_per_epoch=max_steps,
         )
         
-        # Initialize metadata context for this batch.
+        # Initialize metadata storage for this batch.
         # This must be done before prepare_batch so that metadata can be collected
         # even when workflow is wrapped by GroupedRolloutWorkflow.
         batch_metadata = workflow.init_batch_metadata()
@@ -443,7 +443,7 @@ def main(args):
                 )
             
             with stats_tracker.record_timing("group_processing"):
-                # Metadata was collected via contextvars during rollout,
+                # Metadata was collected in global storage during rollout,
                 # so it's available here even with GroupedRolloutWorkflow.
                 training_batch = process_batch_and_update_sampler(
                     batch=batch,
@@ -469,7 +469,7 @@ def main(args):
                       f"Best Overall: {best_reward:.4f}")
         
         finally:
-            # Clean up metadata context after batch processing
+            # Clean up metadata storage after batch processing
             workflow.reset_batch_metadata()
         
         dist.barrier(group=actor.cpu_group)
