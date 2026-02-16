@@ -138,7 +138,7 @@ gconfig:
   # Group rollout: 64 samples per parent state
   n_samples: 64
   min_new_tokens: 0
-  max_new_tokens: 1024
+  max_new_tokens: 16384  # Increased from 1024 to handle longer code generation
   greedy: false
   temperature: 1.0
   top_p: 0.95

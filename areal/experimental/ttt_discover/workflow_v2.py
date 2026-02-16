@@ -201,6 +201,10 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             async with atrace_session_phase("generate"):
                 resp = await engine.agenerate(req)
             
+            # Check if generation was truncated
+            if resp.stop_reason == "length":
+                logger.warning(f"Generation truncated due to length limit (max_tokens={self.gconfig.max_new_tokens}). Output may be incomplete.")
+            
             # Compute reward
             reward, result, code = await self._compute_reward(resp, data)
             
