@@ -78,6 +78,9 @@ def ensure_initial_lora_adapter(
     from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
     
+    # Ensure absolute path
+    lora_output_path = os.path.abspath(lora_output_path)
+    
     # Check if LoRA already exists
     adapter_config_path = os.path.join(lora_output_path, "adapter_config.json")
     if os.path.exists(adapter_config_path):
@@ -89,17 +92,30 @@ def ensure_initial_lora_adapter(
     print(f"  LoRA rank: {lora_rank}, alpha: {lora_alpha}")
     print(f"  Target modules: {target_modules}")
     
+    # Create parent directory if needed
+    parent_dir = os.path.dirname(lora_output_path)
+    if parent_dir and not os.path.exists(parent_dir):
+        os.makedirs(parent_dir, exist_ok=True)
+        print(f"  Created parent directory: {parent_dir}")
+    
     # Load base model
     print("Loading base model...")
-    model = AutoModelForCausalLM.from_pretrained(
-        base_model_path,
-        torch_dtype="auto",
-        device_map="cpu",
-    )
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model_path,
+            torch_dtype="auto",
+            device_map="cpu",
+        )
+    except Exception as e:
+        raise RuntimeError(f"Failed to load base model from {base_model_path}: {e}")
     
     # Load tokenizer
     tok_path = tokenizer_path or base_model_path
-    tokenizer = AutoTokenizer.from_pretrained(tok_path)
+    print(f"Loading tokenizer from {tok_path}...")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tok_path)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load tokenizer from {tok_path}: {e}")
     
     # Configure LoRA
     target_mods = "all-linear" if target_modules == ["all-linear"] else target_modules
@@ -116,12 +132,17 @@ def ensure_initial_lora_adapter(
     model = get_peft_model(model, lora_config)
     
     # Save LoRA adapter
-    print(f"Saving LoRA adapter...")
+    print(f"Saving LoRA adapter to {lora_output_path}...")
     os.makedirs(lora_output_path, exist_ok=True)
     model.save_pretrained(lora_output_path)
     tokenizer.save_pretrained(lora_output_path)
     
+    # Verify files were created
+    if not os.path.exists(adapter_config_path):
+        raise RuntimeError(f"Failed to create adapter_config.json at {lora_output_path}")
+    
     print(f"Initial LoRA adapter created successfully at {lora_output_path}")
+    print(f"  Contents: {os.listdir(lora_output_path)}")
     return lora_output_path
 
 
@@ -231,13 +252,12 @@ def main(args):
     # Initialize FSDP actor first
     actor.initialize(None, ft_spec)
     
-    # Ensure initial LoRA adapter exists for vLLM (required for LoRA mode)
-    # This must be done before vLLM engine initialization
-    if config.use_lora and actor.is_data_parallel_head():
-        # Extract lora_modules path from vllm config or use default
+    # Check that initial LoRA adapter exists (vLLM requires it at startup)
+    if config.use_lora:
+        import json
         lora_output_path = "./lora_init"
+        
         if hasattr(config, 'vllm') and isinstance(config.vllm, dict):
-            import json
             lora_modules_str = config.vllm.get('lora_modules', '')
             if lora_modules_str:
                 try:
@@ -247,17 +267,26 @@ def main(args):
                 except json.JSONDecodeError:
                     pass
         
-        ensure_initial_lora_adapter(
-            base_model_path=config.path,
-            lora_output_path=lora_output_path,
-            lora_rank=config.lora_rank,
-            lora_alpha=config.lora_alpha,
-            target_modules=config.target_modules if config.target_modules else ["all-linear"],
-            tokenizer_path=config.tokenizer_path,
-        )
-    
-    # Synchronize to ensure all ranks wait for LoRA creation
-    dist.barrier(group=actor.cpu_group)
+        lora_output_path = os.path.abspath(lora_output_path)
+        adapter_config_path = os.path.join(lora_output_path, "adapter_config.json")
+        
+        if not os.path.exists(adapter_config_path):
+            raise RuntimeError(
+                f"\n"
+                f"Initial LoRA adapter not found at {lora_output_path}\n"
+                f"\n"
+                f"For LoRA training with vLLM, you must first create the initial LoRA adapter\n"
+                f"BEFORE starting training, because vLLM loads it at startup.\n"
+                f"\n"
+                f"Please run the preparation script first:\n"
+                f"  python prepare_lora_init.py --config-path conf/fsdp_lora_vllm.yaml\n"
+                f"\n"
+                f"Then start training:\n"
+                f"  torchrun --nproc_per_node=8 train_fsdp_lora_vllm.py --config-path conf/fsdp_lora_vllm.yaml"
+            )
+        
+        if actor.is_data_parallel_head():
+            print(f"[Rank {rank}] LoRA adapter verified at {lora_output_path}")
     
     # Setup weight update meta for LoRA
     if config.weight_update_mode == "disk":

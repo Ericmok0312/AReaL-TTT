@@ -161,6 +161,13 @@ ref:
 # ============================================================================
 # vLLM Configuration
 # ============================================================================
+# IMPORTANT: For LoRA training, you must first run the preparation script
+# to create the initial LoRA adapter before starting training:
+#   python prepare_lora_init.py --config-path conf/fsdp_lora_vllm.yaml
+#
+# This is required because vLLM loads the LoRA adapter at startup,
+# before the training script can create it.
+# ============================================================================
 vllm:
   model: ${path}
   seed: ${seed}
@@ -169,10 +176,10 @@ vllm:
   max_model_len: 32768
   gpu_memory_utilization: 0.9
   enforce_eager: true
-  # LoRA support - dynamically loaded after FSDP initializes
+  # LoRA support
   enable_lora: ${use_lora}
-  # LoRA module - path will be auto-created if it doesn't exist
-  # Training script will create initial LoRA adapter from base model if needed
+  # Initial LoRA module - MUST exist before training starts
+  # Run prepare_lora_init.py first to create it
   lora_modules: '{"name": "${gconfig.lora_name}", "path": "./lora_init", "base_model_name": "${path}"}'
 
 # ============================================================================
