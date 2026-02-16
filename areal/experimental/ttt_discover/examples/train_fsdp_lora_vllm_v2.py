@@ -208,7 +208,7 @@ def main(args):
         sampler=sampler,  # 直接注入
         gconfig=config.gconfig,
         tokenizer=tokenizer,
-        enable_thinking=False,
+        enable_thinking=config.enable_thinking,
     )
     
     saver = Saver(config.saver, ft_spec)

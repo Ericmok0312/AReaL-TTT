@@ -260,6 +260,12 @@ class TTTDPPOActorConfig(PPOActorConfig):
         metadata={"help": "Actor configuration (for local launcher compatibility)"}
     )
     
+    # Enable thinking mode for Qwen3 models
+    enable_thinking: bool = field(
+        default=False,
+        metadata={"help": "Enable thinking mode for Qwen3 models (adds enable_thinking=True to chat_template)"}
+    )
+    
     def __post_init__(self):
         """Validate configuration consistency and convert nested dicts to objects"""
         # Convert mb_spec from dict to MicroBatchSpec if needed
