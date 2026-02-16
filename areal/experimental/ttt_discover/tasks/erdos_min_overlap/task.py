@@ -15,6 +15,7 @@ class ErdosMinOverlapTask(BaseRewardTask):
 
     def preprocess_generation(self, generation, *, step, state=None, **kwargs) -> str:
         numpy_import = "import numpy as np"
+        scipy_import = "from scipy.optimize import minimize"
         
         verifier_src = inspect.getsource(evaluate_erdos_solution)
         
@@ -22,7 +23,8 @@ class ErdosMinOverlapTask(BaseRewardTask):
         verify_src = inspect.getsource(verify_c5_solution)
         
         base = (
-            numpy_import + "\n\n" + 
+            numpy_import + "\n" +
+            scipy_import + "\n\n" +
             verify_src + "\n\n" +
             verifier_src + "\n\n"
         )

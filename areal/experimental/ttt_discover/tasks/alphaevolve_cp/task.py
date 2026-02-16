@@ -35,10 +35,11 @@ class CirclePackingTask(BaseRewardTask):
         return None
 
     def preprocess_generation(self, generation, *args, **kwargs) -> str:
-        """Inject validate_packing into the code so it's available if needed."""
+        """Inject validate_packing and common imports into the code so it's available if needed."""
         verifier_src = inspect.getsource(validate_packing)
         numpy_import = "import numpy as np"
-        return numpy_import + "\n\n" + verifier_src + "\n\n" + generation
+        scipy_import = "from scipy.optimize import minimize"
+        return numpy_import + "\n" + scipy_import + "\n\n" + verifier_src + "\n\n" + generation
 
     def get_reward(self, result) -> float:
         centers, radii, _ = result

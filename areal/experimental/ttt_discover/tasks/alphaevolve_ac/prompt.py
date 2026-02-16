@@ -245,6 +245,7 @@ Unless you make a meaningful improvement, you will not be rewarded.
 Rules:
 - You must define the `propose_candidate` function as this is what will be invoked.
 - You can use scientific libraries like scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,GUROBI,MOSEK,PDLP,SCIP,XPRESS,ECOS], math.
+- IMPORTANT: You must explicitly import any functions you use, e.g., `from scipy.optimize import minimize`.
 - You can use up to <<<CPUS>>> CPUs.
 - Make all helper functions top level and have no closures from function nesting. Don't use any lambda functions.
 - No filesystem or network IO.

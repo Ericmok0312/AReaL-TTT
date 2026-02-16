@@ -29,6 +29,7 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
 ## Rules
 - Define `run(seed=42, budget_s=<<<BUDGET_S>>>, **kwargs)` that returns `(h_values, c5_bound, n_points)`
 - Use scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,GUROBI,MOSEK,PDLP,SCIP,XPRESS,ECOS], math
+- IMPORTANT: You must explicitly import any functions you use, e.g., `from scipy.optimize import minimize`
 - Make all helper functions top level, no closures or lambdas
 - No filesystem or network IO
 - `evaluate_erdos_solution()` and `initial_h_values` (an initial construction, if available) are pre-imported

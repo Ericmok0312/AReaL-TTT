@@ -14,8 +14,9 @@ class ACInequalitiesTaskAE(BaseRewardTask):
         """Preprocess generation by adding verifier and injecting construction from state."""
         verifier_src = inspect.getsource(evaluate_sequence)
         numpy_import = "import numpy as np"
+        scipy_import = "from scipy.optimize import minimize"
         
-        base = numpy_import + "\n\n" + verifier_src + "\n\n"
+        base = numpy_import + "\n" + scipy_import + "\n\n" + verifier_src + "\n\n"
         
         # State with construction is required - no silent fallback
         if state is None:

@@ -22,6 +22,7 @@ Rules:
 - You must define the run_packing function: def run_packing() -> tuple[np.ndarray, np.ndarray, float]
 - Returns (centers, radii, sum_radii) where centers has shape (<<<N>>>, 2) and radii has shape (<<<N>>>,).
 - You can use scientific libraries like scipy, numpy, cvxpy, math.
+- IMPORTANT: You must explicitly import any functions you use, e.g., `from scipy.optimize import minimize`.
 - Centers must lie within [0,1]^2 and radii must be nonnegative.
 - The pair (centers, radii) must satisfy non-overlap and boundary constraints.
 - Make all helper functions top level and have no closures from function nesting. Don't use any lambda functions.
