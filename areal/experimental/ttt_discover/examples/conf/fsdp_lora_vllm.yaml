@@ -63,7 +63,7 @@ max_new_tokens: ${gconfig.max_new_tokens}
 # LoRA configuration
 use_lora: true
 peft_type: lora
-lora_rank: 32
+lora_rank: 16
 lora_alpha: 16
 target_modules: [all-linear]
 weight_update_mode: xccl
@@ -178,7 +178,6 @@ vllm:
   enforce_eager: true
   # LoRA support
   enable_lora: ${use_lora}
-  max_lora_rank: 32  # Must be >= lora_rank
   # Initial LoRA module - MUST exist before training starts
   # Run prepare_lora_init.py first to create it
   lora_modules: '{"name": "${gconfig.lora_name}", "path": "./lora_init", "base_model_name": "${path}"}'
