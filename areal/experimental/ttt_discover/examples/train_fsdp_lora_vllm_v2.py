@@ -279,17 +279,12 @@ def main(args):
         step_mean_reward = float(step_rewards.mean())
         best_reward = max(best_reward, step_max_reward)
         
-        # Compute total rollouts across all ranks
-        total_rollouts_tensor = torch.tensor(local_rollouts, dtype=torch.int64, device='cuda')
-        dist.all_reduce(total_rollouts_tensor, op=dist.ReduceOp.SUM, group=actor.data_parallel_group)
-        total_rollouts = int(total_rollouts_tensor.item())
-        
-        if actor.dp_rank == 0:
-            logger.info(f"[Step {global_step}] Total rollouts: {total_rollouts} (local: {local_rollouts}, expected: {batch_size * group_size})")
+        # Each rank logs its own count (no all_reduce to avoid hang)
+        logger.info(f"[Step {global_step}] Rank {actor.dp_rank} rollouts: {local_rollouts}")
         
         # Collect metrics for stats_logger
         metrics = {
-            "rollout/total": total_rollouts,
+            "rollout/count": local_rollouts,
             "reward/max": step_max_reward,
             "reward/mean": step_mean_reward,
             "reward/best_overall": best_reward,
