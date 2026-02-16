@@ -76,9 +76,9 @@ class TTTDActor(FSDPEngine):
                 max_response_length=self.config.max_new_tokens,
             )
 
-        # Reward Scaling (keep as 1D sequence-level rewards)
+        # Reward Scaling
         reward_score = data["rewards"]
-        # Ensure reward_score is 1D [bs]
+        # Ensure reward_score is 1D [bs] for sequence-level reward processing
         if reward_score.dim() > 1:
             reward_score = reward_score.squeeze(-1)
         reward_score = (reward_score + self.actor.reward_bias) * self.actor.reward_scaling
@@ -87,9 +87,6 @@ class TTTDActor(FSDPEngine):
         )
         if self.actor.reward_norm:
             reward_score = self.actor.reward_norm(reward_score)
-        # Ensure it stays 1D after normalization
-        if reward_score.dim() > 1:
-            reward_score = reward_score.squeeze(-1)
 
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
@@ -124,26 +121,23 @@ class TTTDActor(FSDPEngine):
         kl_rewards = -kl_penalty
         kl_rewards[batch_indices, seqlens - 1] = 0
         
-        # Store kl_rewards for logging compatibility
-        data["kl_rewards"] = kl_rewards * loss_mask
-
         # Compute Entropic Advantages.
         # TTT-Discover uses sequence-level external reward only (no KL aggregation)
         # to compute w_{beta(s)}(a), then subtracts token-level KL penalty.
         group_ids = self._extract_group_ids(data, bs)
-        
+
         # Compute sequence-level entropic advantages: w_beta - 1
         entropic_adv_seq = self._compute_entropic_advantages(
             reward_score, group_ids, self.config.adv_estimator
         )  # [bs]
-        
+
         # Broadcast to token level: [bs] -> [bs, seqlen]
         entropic_adv_token = entropic_adv_seq.unsqueeze(-1).expand(-1, max_seqlen)
-        
+
         # Apply TTT-Discover formula: A = (w_beta - 1) - lambda * KL
         advantages = entropic_adv_token - kl_penalty
         advantages = advantages * loss_mask
-        
+
         # Returns equal advantages since TTT-Discover has no value function baseline
         data["returns"] = advantages
 
@@ -151,10 +145,16 @@ class TTTDActor(FSDPEngine):
         if self.actor.adv_norm is not None:
             advantages = self.actor.adv_norm(advantages, loss_mask)
 
+        # Compute token-level total rewards (KL-regularized) for logging
+        # TTT-Discover: external reward at EOS position, KL elsewhere
+        tot_rewards = kl_rewards.clone()
+        indices = torch.clip(seqlens - 2, min=0)
+        tot_rewards[batch_indices, indices] += reward_score
+
         # Store data in the dict.
         data["advantages"] = advantages
         data["kl_rewards"] = kl_rewards * loss_mask
-        data["tot_rewards"] = reward_score
+        data["tot_rewards"] = tot_rewards
         data["loss_mask"] = loss_mask
         data["logprobs"] = old_logp
 
