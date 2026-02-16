@@ -291,9 +291,24 @@ def main(args):
         with stats_tracker.record_timing("compute_advantage"):
             actor.compute_advantages(batch)
         
+        # Print advantage statistics
+        if "advantages" in batch:
+            adv = batch["advantages"].cpu().numpy()
+            if actor.is_data_parallel_head():
+                print(f"[Step {global_step}] Advantage: mean={adv.mean():.4f}, std={adv.std():.4f}, "
+                      f"min={adv.min():.4f}, max={adv.max():.4f}")
+        
         with stats_tracker.record_timing("train_step"):
             actor.ppo_update(batch)
             actor.step_lr_scheduler()
+        
+        # Print training stats (includes entropy)
+        stats = actor.export_stats()
+        if actor.is_data_parallel_head():
+            entropy = stats.get('entropy', 0.0)
+            actor_loss = stats.get('actor_loss', 0.0)
+            approx_kl = stats.get('approx_kl', 0.0)
+            print(f"[Step {global_step}] Entropy: {entropy:.4f}, Actor Loss: {actor_loss:.4f}, Approx KL: {approx_kl:.4f}")
         
         rollout.pause()
         

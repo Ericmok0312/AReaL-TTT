@@ -131,13 +131,22 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
     ) -> tuple[float, EnvResult, str]:
         """Compute reward by executing code in environment."""
         completion_str = self.tokenizer.decode(resp.output_tokens)
+        
+        # DEBUG: Log completion preview
+        logger.info(f"Raw completion (first 200 chars): {completion_str[:200]!r}")
+        
         code = self.env.extract_code(completion_str)
         if code is None:
+            logger.warning(f"Code extraction failed. Completion preview: {completion_str[:200]!r}")
             return -1.0, EnvResult(reward=-1.0, observation="Code extraction failed", is_valid=False), ""
+        
+        # DEBUG: Log extracted code
+        logger.info(f"Extracted code (first 200 chars): {code[:200]!r}")
         
         state = task_data.get("_state_obj")
         try:
             result = self.env.execute(code, state)
+            logger.info(f"Execution result: reward={result.reward}, is_valid={result.is_valid}")
         except Exception as e:
             logger.warning(f"Environment execution failed: {e}")
             result = EnvResult(reward=-1.0, observation=str(e), is_valid=False)
