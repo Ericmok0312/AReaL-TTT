@@ -103,7 +103,7 @@ cluster:
     nfs_record_root: /tmp/areal/name_resolve
 
 # FSDP + vLLM for LoRA (4 GPUs for vLLM inference, 4 GPUs for FSDP training)
-allocation_mode: fsdp:d8p1t1+d8p1t1
+allocation_mode: vllm:d4p1t1+d4p1t1
 
 scheduler:
   type: null
