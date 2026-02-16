@@ -41,6 +41,90 @@ from areal.experimental.ttt_discover.workflow import TTTDiscoverWorkflow
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
+def ensure_initial_lora_adapter(
+    base_model_path: str,
+    lora_output_path: str,
+    lora_rank: int,
+    lora_alpha: int,
+    target_modules: list[str],
+    tokenizer_path: str | None = None,
+) -> str:
+    """Ensure initial LoRA adapter exists for vLLM to load at startup.
+    
+    If the LoRA adapter does not exist, create one from the base model.
+    This is required for vLLM LoRA mode - vLLM needs a valid LoRA at startup.
+    
+    Parameters
+    ----------
+    base_model_path : str
+        Path to the base model (HuggingFace format)
+    lora_output_path : str
+        Path to save the LoRA adapter
+    lora_rank : int
+        LoRA rank
+    lora_alpha : int
+        LoRA alpha
+    target_modules : list[str]
+        Target modules for LoRA (e.g., ["all-linear"])
+    tokenizer_path : str | None
+        Path to tokenizer (defaults to base_model_path)
+    
+    Returns
+    -------
+    str
+        Path to the LoRA adapter
+    """
+    import os
+    from peft import LoraConfig, get_peft_model
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    
+    # Check if LoRA already exists
+    adapter_config_path = os.path.join(lora_output_path, "adapter_config.json")
+    if os.path.exists(adapter_config_path):
+        print(f"Initial LoRA adapter already exists at {lora_output_path}")
+        return lora_output_path
+    
+    print(f"Creating initial LoRA adapter at {lora_output_path}...")
+    print(f"  Base model: {base_model_path}")
+    print(f"  LoRA rank: {lora_rank}, alpha: {lora_alpha}")
+    print(f"  Target modules: {target_modules}")
+    
+    # Load base model
+    print("Loading base model...")
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model_path,
+        torch_dtype="auto",
+        device_map="cpu",
+    )
+    
+    # Load tokenizer
+    tok_path = tokenizer_path or base_model_path
+    tokenizer = AutoTokenizer.from_pretrained(tok_path)
+    
+    # Configure LoRA
+    target_mods = "all-linear" if target_modules == ["all-linear"] else target_modules
+    lora_config = LoraConfig(
+        r=lora_rank,
+        lora_alpha=lora_alpha,
+        target_modules=target_mods,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    
+    # Apply LoRA
+    print("Applying LoRA...")
+    model = get_peft_model(model, lora_config)
+    
+    # Save LoRA adapter
+    print(f"Saving LoRA adapter...")
+    os.makedirs(lora_output_path, exist_ok=True)
+    model.save_pretrained(lora_output_path)
+    tokenizer.save_pretrained(lora_output_path)
+    
+    print(f"Initial LoRA adapter created successfully at {lora_output_path}")
+    return lora_output_path
+
+
 def process_batch_and_update_sampler(
     batch: dict,
     metadata: list[dict],
@@ -147,7 +231,35 @@ def main(args):
     # Initialize FSDP actor first
     actor.initialize(None, ft_spec)
     
-    # Setup weight update meta for LoRA (handles initial weight saving)
+    # Ensure initial LoRA adapter exists for vLLM (required for LoRA mode)
+    # This must be done before vLLM engine initialization
+    if config.use_lora and actor.is_data_parallel_head():
+        # Extract lora_modules path from vllm config or use default
+        lora_output_path = "./lora_init"
+        if hasattr(config, 'vllm') and isinstance(config.vllm, dict):
+            import json
+            lora_modules_str = config.vllm.get('lora_modules', '')
+            if lora_modules_str:
+                try:
+                    lora_modules = json.loads(lora_modules_str)
+                    if isinstance(lora_modules, dict):
+                        lora_output_path = lora_modules.get('path', lora_output_path)
+                except json.JSONDecodeError:
+                    pass
+        
+        ensure_initial_lora_adapter(
+            base_model_path=config.path,
+            lora_output_path=lora_output_path,
+            lora_rank=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            target_modules=config.target_modules if config.target_modules else ["all-linear"],
+            tokenizer_path=config.tokenizer_path,
+        )
+    
+    # Synchronize to ensure all ranks wait for LoRA creation
+    dist.barrier(group=actor.cpu_group)
+    
+    # Setup weight update meta for LoRA
     if config.weight_update_mode == "disk":
         weight_update_meta = WeightUpdateMeta.from_disk(
             config.saver.experiment_name,
@@ -158,10 +270,18 @@ def main(args):
             lora_int_id=1,
             base_model_name=config.path,
         )
+    elif config.weight_update_mode == "xccl":
+        weight_update_meta = WeightUpdateMeta.from_fsdp_xccl(
+            allocation_mode,
+            use_lora=config.use_lora,
+            lora_name=config.gconfig.lora_name,
+            lora_int_id=1,
+            base_model_name=config.path,
+        )
     else:
         raise ValueError(
             f"Invalid weight_update_mode: {config.weight_update_mode}. "
-            "Expected 'disk'."
+            "Expected 'disk' or 'xccl'."
         )
     
     # vLLM: distributed rollout (initialized after LoRA weights are saved)

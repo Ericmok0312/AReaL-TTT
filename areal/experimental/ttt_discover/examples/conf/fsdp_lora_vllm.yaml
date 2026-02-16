@@ -66,7 +66,7 @@ peft_type: lora
 lora_rank: 32
 lora_alpha: 16
 target_modules: [all-linear]
-weight_update_mode: disk
+weight_update_mode: xccl
 
 # TTT-Discover specific: Entropic Advantage
 adv_estimator: entropic
@@ -171,9 +171,9 @@ vllm:
   enforce_eager: true
   # LoRA support - dynamically loaded after FSDP initializes
   enable_lora: ${use_lora}
-  # Initial LoRA module - empty for training from scratch
-  # LoRA will be loaded dynamically after first FSDP checkpoint save
-  lora_modules: ''
+  # LoRA module - path will be auto-created if it doesn't exist
+  # Training script will create initial LoRA adapter from base model if needed
+  lora_modules: '{"name": "${gconfig.lora_name}", "path": "./lora_init", "base_model_name": "${path}"}'
 
 # ============================================================================
 # PUCT Sampler Configuration
