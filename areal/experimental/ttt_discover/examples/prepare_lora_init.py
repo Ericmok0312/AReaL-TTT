@@ -107,8 +107,10 @@ def main():
     parser = argparse.ArgumentParser(description="Prepare initial LoRA adapter for vLLM")
     parser.add_argument(
         "--config-path",
+        "--config",
         type=str,
         required=True,
+        dest="config_path",
         help="Path to the configuration file (e.g., conf/fsdp_lora_vllm.yaml)",
     )
     args = parser.parse_args()
