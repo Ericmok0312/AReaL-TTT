@@ -25,7 +25,9 @@ from areal.api.alloc_mode import AllocationMode
 from areal.api.cli_args import load_expr_config
 from areal.api.io_struct import FinetuneSpec, StepInfo, WeightUpdateMeta
 from areal.engine.vllm_remote import RemotevLLMEngine
-from areal.utils import seeding, stats_tracker
+from areal.utils import logging, seeding, stats_tracker
+
+logger = logging.getLogger("train_fsdp_lora_vllm_v2")
 from areal.utils.evaluator import Evaluator
 from areal.utils.hf_utils import load_hf_tokenizer
 from areal.utils.recover import RecoverHandler
@@ -270,14 +272,24 @@ def main(args):
                                 f"from {actor.data_parallel_world_size} ranks, "
                                 f"{len(set(p.id for p in all_parents))} unique parents")
         
-        # Log rewards
+        # Log rewards and actual rollout count
+        local_rollouts = batch["rewards"].shape[0]  # Rollouts on this rank
         step_rewards = batch["rewards"].cpu().numpy()
         step_max_reward = float(step_rewards.max())
         step_mean_reward = float(step_rewards.mean())
         best_reward = max(best_reward, step_max_reward)
         
+        # Compute total rollouts across all ranks
+        total_rollouts_tensor = torch.tensor(local_rollouts, dtype=torch.int64, device='cuda')
+        dist.all_reduce(total_rollouts_tensor, op=dist.ReduceOp.SUM, group=actor.data_parallel_group)
+        total_rollouts = int(total_rollouts_tensor.item())
+        
+        if actor.dp_rank == 0:
+            logger.info(f"[Step {global_step}] Total rollouts: {total_rollouts} (local: {local_rollouts}, expected: {batch_size * group_size})")
+        
         # Collect metrics for stats_logger
         metrics = {
+            "rollout/total": total_rollouts,
             "reward/max": step_max_reward,
             "reward/mean": step_mean_reward,
             "reward/best_overall": best_reward,
