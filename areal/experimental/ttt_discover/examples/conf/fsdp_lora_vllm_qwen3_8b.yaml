@@ -9,7 +9,7 @@ is_tttd_config: true
 seed: 1
 enable_offload: false
 
-max_steps: 50
+max_steps: 1
 total_train_epochs: 10
 
 path: Qwen/Qwen3-8B
