@@ -342,7 +342,7 @@ def main(args):
         best_reward = max(best_reward, step_max_reward)
         
         # Log rollout distribution info
-        logger.info(f"[Step {global_step}] Rank {actor.dp_rank} rollouts: {local_rollouts}, "
+        logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] Rank {actor.dp_rank} rollouts: {local_rollouts}, "
                    f"batch parents: {batch_size}, group_size: {group_size}, "
                    f"expected total: {batch_size * group_size}")
         
@@ -397,14 +397,14 @@ def main(args):
                 data=metrics,
             )
             # Also print concise summary
-            logger.info(f"[Step {global_step}] "
+            logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] "
                        f"Reward: max={step_max_reward:.4f}, mean={step_mean_reward:.4f}, best={best_reward:.4f} | "
                        f"Loss: {metrics['train/actor_loss']:.4f}, KL: {metrics['train/approx_kl']:.4f}")
                 
         rollout.pause()
         
         with stats_tracker.record_timing("update_weights"):
-            logger.info(f"[Step {global_step}] Updating weights with meta: {weight_update_meta}")
+            logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] Updating weights with meta: {weight_update_meta}")
             actor.update_weights(weight_update_meta)
             actor.set_version(global_step + 1)
             rollout.set_version(global_step + 1)
