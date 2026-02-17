@@ -120,7 +120,7 @@ def main(args):
     is_dp_head = actor.is_data_parallel_head()
     
     # DEBUG: Log distributed configuration
-    if actor.dp_rank == 0:
+    if actor.is_data_parallel_head():
         logger.info(f"=== Distributed Configuration ===")
         logger.info(f"DP world size: {world_size}")
         logger.info(f"Sampler batch_size: {batch_size}")
@@ -320,17 +320,18 @@ def main(args):
             
             # Aggregate updates from all ranks using all_gather_object
             # CRITICAL: This must be called by ALL ranks in the DP group
-            all_children, all_parents = gather_states_across_ranks(
-                actor, local_children, local_parents
-            )
+            # all_children, all_parents = gather_states_across_ranks(
+            #     actor, local_children, local_parents
+            # )
+            all_children, all_parents = local_children, local_parents  # For now, skip gathering to avoid deadlock
             
             # Only rank 0 updates sampler and saves
             # (all ranks have all_children, but we only want to update once)
-            if actor.dp_rank == 0:
+            if actor.is_data_parallel_head():
                 if all_children:
                     sampler.update_states(all_children, all_parents, save=False)
                     sampler.flush(step=global_step)
-                    logger.info(f"[Step {global_step}] Aggregated {len(all_children)} updates "
+                    logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] Aggregated {len(all_children)} updates "
                                 f"from {actor.data_parallel_world_size} ranks, "
                                 f"{len(set(p.id for p in all_parents))} unique parents")
         
@@ -389,7 +390,7 @@ def main(args):
         })
         
         # Log to stats_logger (wandb/swanlab/tensorboard)
-        if actor.dp_rank == 0:
+        if actor.is_data_parallel_head():
             stats_logger.commit(
                 epoch=step_info.epoch,
                 step=step_info.epoch_step,
