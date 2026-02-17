@@ -34,8 +34,8 @@ def gather_states_across_ranks(actor, local_children, local_parents):
     """
     Gather states from all data parallel ranks using all_gather_object.
     
-    This uses PyTorch's all_gather_object which is designed for Python objects
-    and handles device placement automatically (works with both NCCL and Gloo).
+    IMPORTANT: This is a collective operation that MUST be called by ALL ranks
+    in the data_parallel_group. If any rank skips this call, it will cause deadlock.
     
     Args:
         actor: TTTDActor with data parallel info
@@ -43,7 +43,7 @@ def gather_states_across_ranks(actor, local_children, local_parents):
         local_parents: List of parent states from this rank
         
     Returns:
-        (all_children, all_parents) on rank 0, (None, None) on other ranks
+        (all_children, all_parents) on ALL ranks (not just rank 0)
     """
     if not dist.is_initialized() or actor.data_parallel_world_size <= 1:
         return local_children, local_parents
@@ -56,25 +56,37 @@ def gather_states_across_ranks(actor, local_children, local_parents):
     all_children_dicts = [None] * actor.data_parallel_world_size
     all_parents_dicts = [None] * actor.data_parallel_world_size
     
+    # CRITICAL: all_gather_object is collective - ALL ranks must call this
     dist.all_gather_object(all_children_dicts, children_dicts, group=actor.data_parallel_group)
     dist.all_gather_object(all_parents_dicts, parents_dicts, group=actor.data_parallel_group)
     
-    # On rank 0, deserialize and combine all states
-    if int(os.getenv("RANK", 0)) == 0:
-        from areal.experimental.ttt_discover.state import state_from_dict
-        
-        all_children = []
-        all_parents = []
-        
-        for rank_children, rank_parents in zip(all_children_dicts, all_parents_dicts):
-            if rank_children:  # Skip empty lists
-                all_children.extend([state_from_dict(d) for d in rank_children])
-            if rank_parents:
-                all_parents.extend([state_from_dict(d) for d in rank_parents])
-        
-        return all_children, all_parents
-    else:
-        return None, None
+    # Deserialize and combine all states on ALL ranks
+    # (Previously this only happened on rank 0, causing inconsistency)
+    from areal.experimental.ttt_discover.state import state_from_dict
+    
+    all_children = []
+    all_parents = []
+    
+    for rank_children, rank_parents in zip(all_children_dicts, all_parents_dicts):
+        if rank_children:  # Skip empty lists
+            all_children.extend([state_from_dict(d) for d in rank_children])
+        if rank_parents:
+            all_parents.extend([state_from_dict(d) for d in rank_parents])
+    
+    return all_children, all_parents
+
+
+def _concat_trajectories(trajectories: list[dict]) -> dict:
+    """
+    Concatenate a list of trajectory dicts into a single batch dict.
+    This is a simpler alternative to redistribute_trajectories that doesn't
+    require all_gather from all DP ranks (avoiding the deadlock issue).
+    """
+    if not trajectories:
+        return {}
+    
+    from areal.utils.data import concat_padded_tensors
+    return concat_padded_tensors(trajectories)
 
 
 def main(args):
@@ -103,15 +115,29 @@ def main(args):
     batch_size = config.sampler.batch_size  # Total parents per step (e.g., 8)
     group_size = config.gconfig.n_samples   # Rollouts per parent (e.g., 64)
     
-    # Use only_dp_head=True because AReaL's prepare_batch only runs rollout on DP head
-    # and broadcasts results to all ranks. This ensures correct total rollout count.
-    # world_size=1: Treat as single-process dataset (rank 0 produces all data)
+    # Get distributed info
+    world_size = actor.data_parallel_world_size
+    is_dp_head = actor.is_data_parallel_head()
+    
+    # DEBUG: Log distributed configuration
+    if actor.dp_rank == 0:
+        logger.info(f"=== Distributed Configuration ===")
+        logger.info(f"DP world size: {world_size}")
+        logger.info(f"Sampler batch_size: {batch_size}")
+        logger.info(f"Group size: {group_size}")
+        logger.info(f"Total rollouts: {batch_size * group_size}")
+        logger.info(f"Is DP head: {is_dp_head}")
+        logger.info(f"================================")
+    
+    # Scheme A: Only DP head produces data, then broadcast to all ranks
+    # This requires allocation_mode like 'fsdp:d1p1t8' (dp=1, tp=8)
+    # where only rank 0 is the DP head
     train_dataloader = create_tttd_dataloader(
         state_sampler=sampler,
-        rank=0 if actor.dp_rank == 0 else -1,
-        world_size=1,
-        batch_size=batch_size,  # Total batch size (8 parents total, not per rank)
-        only_dp_head=True,      # Only DP head produces data
+        rank=actor.dp_rank,           # 0 for DP head
+        world_size=world_size,        # 1 if dp=1
+        batch_size=batch_size,        # Total parents (not divided)
+        only_dp_head=True,            # Only DP head produces data
     )
     
     ft_spec = FinetuneSpec(
@@ -121,6 +147,43 @@ def main(args):
     )
     
     actor.initialize(None, ft_spec)
+    
+    # ============================================================
+    # CONFIGURATION VERIFICATION for Scheme A (DP Head Only)
+    # ============================================================
+    if actor.dp_rank == 0:
+        logger.info("=== Scheme A Configuration Verification ===")
+        logger.info(f"Allocation mode: {config.allocation_mode}")
+        logger.info(f"Parallel Strategy: {parallel_strategy}")
+        logger.info(f"  - DP size: {parallel_strategy.dp_size}")
+        logger.info(f"  - TP size: {parallel_strategy.tp_size}")
+        logger.info(f"  - PP size: {parallel_strategy.pp_size}")
+        logger.info(f"Actor DP rank: {actor.dp_rank}")
+        logger.info(f"Actor DP world size: {actor.data_parallel_world_size}")
+        logger.info(f"Is DP head: {actor.is_data_parallel_head()}")
+        
+        # Verify Scheme A requirements
+        if parallel_strategy.dp_size != 1:
+            logger.warning(
+                f"WARNING: For Scheme A (DP head only), dp_size should be 1, "
+                f"got {parallel_strategy.dp_size}. This means multiple ranks "
+                f"will act as DP heads and generate data independently!"
+            )
+        if parallel_strategy.tp_size <= 1:
+            logger.warning(
+                f"WARNING: tp_size={parallel_strategy.tp_size}. With dp=1, tp>1 "
+                f"is expected to distribute work across GPUs."
+            )
+        if not actor.is_data_parallel_head():
+            logger.error(
+                f"ERROR: Rank {actor.dp_rank} is not DP head but only_dp_head=True. "
+                f"This rank will not produce any data!"
+            )
+        logger.info("==========================================")
+    
+    # Barrier to ensure all ranks see the verification
+    if dist.is_initialized():
+        dist.barrier()
     
     # Check LoRA adapter exists (same as V1)
     if config.use_lora:
@@ -240,17 +303,19 @@ def main(args):
             )
         
         # Flush sampler updates (commits all buffered updates from this batch)
-        # Should we wait for all codes executed?
+        # NOTE: gather_states_across_ranks is a collective operation - ALL ranks must call it
         with stats_tracker.record_timing("sampler_update"):
             # Get local updates from this rank
             local_children, local_parents = workflow.get_pending_updates_sync(clear=True)
             
             # Aggregate updates from all ranks using all_gather_object
+            # CRITICAL: This must be called by ALL ranks in the DP group
             all_children, all_parents = gather_states_across_ranks(
                 actor, local_children, local_parents
             )
             
             # Only rank 0 updates sampler and saves
+            # (all ranks have all_children, but we only want to update once)
             if actor.dp_rank == 0:
                 if all_children:
                     sampler.update_states(all_children, all_parents, save=False)
@@ -266,8 +331,10 @@ def main(args):
         step_mean_reward = float(step_rewards.mean())
         best_reward = max(best_reward, step_max_reward)
         
-        # Each rank logs its own count (no all_reduce to avoid hang)
-        logger.info(f"[Step {global_step}] Rank {actor.dp_rank} rollouts: {local_rollouts}")
+        # Log rollout distribution info
+        logger.info(f"[Step {global_step}] Rank {actor.dp_rank} rollouts: {local_rollouts}, "
+                   f"batch parents: {batch_size}, group_size: {group_size}, "
+                   f"expected total: {batch_size * group_size}")
         
         # Collect metrics for stats_logger
         metrics = {
