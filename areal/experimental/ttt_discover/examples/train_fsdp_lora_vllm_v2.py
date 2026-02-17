@@ -138,7 +138,7 @@ def main(args):
         rank=rank,                    # Use dp_rank (0 for DP head)
         world_size=world_size,        # 1 if dp=1
         batch_size=batch_size,        # Total parents (not divided)
-        only_dp_head=False,           # dp=1: standard mode, rank 0 handles all
+        only_dp_head=False,           
     )
     
     ft_spec = FinetuneSpec(
@@ -388,11 +388,34 @@ def main(args):
         
         # Add training stats
         stats = actor.export_stats()
+        
+        # DEBUG: Print all available stats keys to diagnose issue
+        if rank == 0:
+            logger.info(f"[DEBUG] Available stats keys: {sorted(stats.keys())}")
+        
+        # Try different possible key patterns for loss and entropy
+        # AReaL uses scope prefixes like 'update/actor_loss/avg'
+        entropy_keys = ['entropy/avg', 'update/entropy/avg', 'update/new_logp/avg']
+        actor_loss_keys = ['actor_loss/avg', 'update/actor_loss/avg', 'loss/avg', 'update/loss/avg']
+        approx_kl_keys = ['approx_kl/avg', 'update/approx_kl/avg']
+        
+        def get_first_matching(stats_dict, key_list, default=0.0):
+            for key in key_list:
+                if key in stats_dict:
+                    return stats_dict[key]
+            return default
+        
         metrics.update({
-            "train/entropy": stats.get('entropy/avg', 0.0),
-            "train/actor_loss": stats.get('actor_loss/avg', 0.0),
-            "train/approx_kl": stats.get('approx_kl/avg', 0.0),
+            "train/entropy": get_first_matching(stats, entropy_keys),
+            "train/actor_loss": get_first_matching(stats, actor_loss_keys),
+            "train/approx_kl": get_first_matching(stats, approx_kl_keys),
         })
+        
+        # Also add raw stats for debugging
+        if rank == 0:
+            for key in ['update/loss', 'update/loss__count', 'update/grad_norm', 'update/lr']:
+                if key in stats:
+                    metrics[f"train/{key}"] = stats[key]
         
         # Log to stats_logger (wandb/swanlab/tensorboard)
         if rank == 0:
@@ -402,10 +425,17 @@ def main(args):
                 global_step=global_step,
                 data=metrics,
             )
-            # Also print concise summary
+            # Also print concise summary with more details
             logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] "
                        f"Reward: max={step_max_reward:.4f}, mean={step_mean_reward:.4f}, best={best_reward:.4f} | "
-                       f"Loss: {metrics['train/actor_loss']:.4f}, KL: {metrics['train/approx_kl']:.4f}")
+                       f"Loss: {metrics['train/actor_loss']:.4f}, KL: {metrics['train/approx_kl']:.4f}, "
+                       f"Entropy: {metrics['train/entropy']:.4f}")
+            
+            # Print additional training stats if available
+            if 'update/grad_norm' in stats:
+                logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] Training details: "
+                           f"grad_norm={stats.get('update/grad_norm', 'N/A'):.4f}, "
+                           f"lr={stats.get('update/lr', 'N/A'):.6f}")
                 
         rollout.pause()
         
