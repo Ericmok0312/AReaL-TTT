@@ -235,8 +235,8 @@ def main(args):
     
     ref = None
     if config.kl_ctl > 0 and config.ref is not None:
-        # Reference model uses DP-only strategy (no TP) to avoid sharding issues
-        # Actor: d1p1t4 (1 DP rank with 4 TP shards) -> Ref: d4p1t1 (4 DP ranks, no TP)
+        # Reference model uses DP-only strategy to avoid TP + torch.compile issues
+        # This is necessary because TP with torch.compile causes sharding errors
         from areal.api.alloc_mode import ParallelStrategy
         ref_parallel_strategy = ParallelStrategy(
             tensor_parallel_size=1,      # No TP for ref
@@ -247,8 +247,7 @@ def main(args):
         ref = TTTDActor(config=config.ref)
         ref.create_process_group(parallel_strategy=ref_parallel_strategy)
         ref.initialize(None, ft_spec)
-        logger.info(f"Reference model using DP-only strategy: {ref_parallel_strategy} "
-                   f"(vs Actor: {parallel_strategy})")
+        logger.info(f"Reference model using DP-only strategy: {ref_parallel_strategy}")
     
     # Environment setup (same as V1)
     env_type = getattr(config.sampler, 'env_type', 'cp')
@@ -292,7 +291,7 @@ def main(args):
     
     max_steps = getattr(config, 'max_steps', 50)
     best_reward = float('-inf')
-    
+    logger.info(f"Starting training from step {start_step}/{max_steps}")
     for global_step in range(start_step, max_steps):
         step_info = StepInfo(
             global_step=global_step,
@@ -419,7 +418,10 @@ def main(args):
                 train_dataloader, tokenizer=tokenizer,
             )
         
+        # DEBUG: Log before barrier
+        logger.info(f"[Step {global_step}] Rank {actor.dp_rank} (global rank {dist.get_rank() if dist.is_initialized() else 'N/A'}) reaching barrier")
         dist.barrier(group=actor.cpu_group)
+        logger.info(f"[Step {global_step}] Rank {actor.dp_rank} passed barrier")
         current_platform.synchronize()
         rollout.resume()
     
