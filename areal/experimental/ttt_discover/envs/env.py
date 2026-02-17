@@ -9,6 +9,9 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
+import torch
+from transformers import PreTrainedTokenizerFast
+
 from ..state import State
 
 
@@ -22,11 +25,13 @@ class EnvResult:
         observation: Optional logs/stdout from execution
         is_valid: Whether the execution was successful and result is valid
         metadata: Additional environment-specific data
+        fail_type: Type of failure (timeout, code_extraction_failed, execution_error, etc.)
     """
     reward: float
     observation: str = ""
     is_valid: bool = True
     metadata: dict[str, Any] | None = None
+    fail_type: str | None = None
 
 
 class BaseEnv(ABC):
@@ -150,3 +155,95 @@ class BaseEnv(ABC):
         
         # No code block found, return the whole completion
         return completion.strip()
+
+    def get_failure_result(
+        self,
+        state: State | None,
+        fail_type: str,
+        error_msg: str = "",
+    ) -> EnvResult:
+        """
+        Create failure result for a rollout.
+        
+        Subclasses can override this to customize failure rewards and observations.
+        
+        Args:
+            state: The state object (may be None if state is missing)
+            fail_type: Type of failure (timeout, code_extraction_failed, execution_error, missing_state)
+            error_msg: Additional error message
+            
+        Returns:
+            EnvResult with appropriate reward and observation for the failure type
+        """
+        if fail_type == "timeout":
+            return EnvResult(
+                reward=0.0,
+                observation=f"Execution timeout: {error_msg}" if error_msg else "Execution timeout",
+                is_valid=False,
+                fail_type=fail_type,
+            )
+        elif fail_type == "code_extraction_failed":
+            return EnvResult(
+                reward=0.0,
+                observation=f"Failed to extract code: {error_msg}" if error_msg else "Failed to extract code from response",
+                is_valid=False,
+                fail_type=fail_type,
+            )
+        elif fail_type == "missing_state":
+            return EnvResult(
+                reward=-1.0,
+                observation=f"Missing state: {error_msg}" if error_msg else "Missing state object",
+                is_valid=False,
+                fail_type=fail_type,
+            )
+        else:  # execution_error or other
+            return EnvResult(
+                reward=0.0,
+                observation=f"Execution error: {error_msg}" if error_msg else "Execution failed",
+                is_valid=False,
+                fail_type=fail_type,
+            )
+
+    def create_failed_trajectory(
+        self,
+        state: State | None,
+        input_ids: list[int],
+        tokenizer: PreTrainedTokenizerFast,
+        fail_type: str,
+        error_msg: str = "",
+    ) -> dict[str, torch.Tensor]:
+        """
+        Create trajectory for a failed rollout.
+        
+        This method allows the environment to control:
+        - The reward for different failure types
+        - Whether the failure should contribute to training (loss_mask)
+        - The observation/error message
+        
+        Args:
+            state: The state object (may be None)
+            input_ids: Input token IDs
+            tokenizer: Tokenizer for encoding
+            fail_type: Type of failure
+            error_msg: Additional error message
+            
+        Returns:
+            Dictionary with trajectory tensors
+        """
+        # Get environment-specific failure result
+        result = self.get_failure_result(state, fail_type, error_msg)
+        
+        seq = input_ids + [tokenizer.eos_token_id or 0]
+        
+        # Following ttt-discover logic: all failed rollouts participate in training
+        # with reward=0. Only successful rollouts (correctness > 0) create new states.
+        # This allows the model to learn from failures (what not to do).
+        
+        return {
+            "input_ids": torch.tensor(seq, dtype=torch.int32).unsqueeze(0),
+            "loss_mask": torch.ones(len(seq), dtype=torch.int32).unsqueeze(0),  # Train on all
+            "logprobs": torch.zeros(len(seq), dtype=torch.float32).unsqueeze(0),
+            "versions": torch.full((len(seq),), -1, dtype=torch.int32).unsqueeze(0),
+            "attention_mask": torch.ones(len(seq), dtype=torch.bool).unsqueeze(0),
+            "rewards": torch.tensor([result.reward], dtype=torch.float32),
+        }

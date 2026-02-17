@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""
-TTT-Discover Training V2 - 使用 Workflow 内部 Sampler 更新
-
-Key differences from V1:
-- Workflow holds sampler reference, updates internally
-- No metadata list, no indexing issues
-- Simplified training loop with distributed state gathering
-
-Usage:
-    torchrun --nproc_per_node=8 train_fsdp_lora_vllm_v2.py \
-        --config-path conf/fsdp_lora_vllm.yaml
-"""
-
 import os
 import sys
 import warnings

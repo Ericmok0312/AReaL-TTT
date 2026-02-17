@@ -107,21 +107,37 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             "rewards": torch.tensor([reward], dtype=torch.float32),
         }
     
-    def _create_failed_trajectory(self, input_ids: list[int]) -> dict[str, torch.Tensor]:
-        """Create a placeholder trajectory for failed rollouts."""
-        seq = input_ids + [self.tokenizer.eos_token_id or 0]
-        logprobs = [0.0] * len(seq)
-        loss_mask = [0] * len(seq)
-        versions = [-1] * len(seq)
+    def _create_failed_trajectory(
+        self,
+        state: "State | None",
+        input_ids: list[int],
+        fail_type: str,
+        error_msg: str = "",
+    ) -> dict[str, torch.Tensor]:
+        """
+        Create a trajectory for failed rollouts.
         
-        return {
-            "input_ids": torch.tensor(seq, dtype=torch.int32).unsqueeze(0),
-            "loss_mask": torch.tensor(loss_mask, dtype=torch.int32).unsqueeze(0),
-            "logprobs": torch.tensor(logprobs, dtype=torch.float32).unsqueeze(0),
-            "versions": torch.tensor(versions, dtype=torch.int32).unsqueeze(0),
-            "attention_mask": torch.ones(len(seq), dtype=torch.bool).unsqueeze(0),
-            "rewards": torch.tensor([-1.0], dtype=torch.float32),
-        }
+        Delegates to the environment to control:
+        - Reward value for different failure types
+        - Whether the failure contributes to training (loss_mask)
+        - Failure-specific observations
+        
+        Args:
+            state: The state object (may be None)
+            input_ids: Input token IDs
+            fail_type: Type of failure (timeout, code_extraction_failed, execution_error, missing_state)
+            error_msg: Additional error message
+            
+        Returns:
+            Dictionary with trajectory tensors
+        """
+        return self.env.create_failed_trajectory(
+            state=state,
+            input_ids=input_ids,
+            tokenizer=self.tokenizer,
+            fail_type=fail_type,
+            error_msg=error_msg,
+        )
 
     @trace_session("reward")
     async def _compute_reward(
@@ -133,19 +149,31 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         completion_str = self.tokenizer.decode(resp.output_tokens)
         
         code = self.env.extract_code(completion_str)
+        state = task_data.get("_state_obj")
+        
         if code is None:
             logger.warning(f"Code extraction failed")
-            return -1.0, EnvResult(reward=-1.0, observation="Code extraction failed", is_valid=False), ""
+            # Use env's failure result for consistent handling
+            result = self.env.get_failure_result(
+                state=state,
+                fail_type="code_extraction_failed",
+            )
+            return result.reward, result, ""
         
-        state = task_data.get("_state_obj")
         try:
             result = self.env.execute(code, state)
-            # Only log essential execution result (no prompt/output details)
-            metadata = result.metadata if result.metadata else {}
-            logger.info(f"reward={result.reward:.4f}, valid={result.is_valid}")
+            # Log result details including fail_type if present
+            fail_type_info = f", fail_type={result.fail_type}" if result.fail_type else ""
+            logger.info(f"reward={result.reward:.4f}, valid={result.is_valid}{fail_type_info}")
         except Exception as e:
+            # Execution errors (TimeoutError is typically caught by env and returned as result with fail_type)
             logger.warning(f"Execution failed: {e}")
-            result = EnvResult(reward=-1.0, observation=str(e), is_valid=False)
+            # Use env's failure result for consistent handling
+            result = self.env.get_failure_result(
+                state=state,
+                fail_type="execution_error",
+                error_msg=str(e),
+            )
         
         stats_tracker.get("rollout").scalar(
             reward=result.reward,
@@ -174,7 +202,11 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         state = data.get("_state_obj")
         if state is None:
             logger.error("Missing '_state_obj' in data")
-            return self._create_failed_trajectory([0])
+            return self._create_failed_trajectory(
+                state=None,
+                input_ids=[0],
+                fail_type="missing_state",
+            )
         
         try:
             # Generate
@@ -206,13 +238,24 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             
             # Log validation failure (concise)
             if not result.is_valid:
-                logger.warning(f"Validation failed: reward={reward:.4f}")
+                logger.warning(f"Validation failed: reward={reward:.4f}, fail_type={result.fail_type}")
             
-            # Create trajectory
-            trajectory = self._create_trajectory(resp, reward)
+            # Create trajectory - use failed trajectory for invalid results
+            if result.is_valid:
+                trajectory = self._create_trajectory(resp, reward)
+            else:
+                # Use fail_type from result if available, otherwise default to execution_error
+                fail_type = result.fail_type or "execution_error"
+                trajectory = self._create_failed_trajectory(
+                    state=state,
+                    input_ids=input_ids,
+                    fail_type=fail_type,
+                    error_msg=result.observation,
+                )
             
             # Create child state and buffer sampler update (thread-safe)
             if result.is_valid and self.sampler is not None:
+                # Success: save child state for future sampling
                 try:
                     child = self.env.create_state(
                         parent_state=state,
@@ -233,12 +276,20 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                         
                 except Exception as e:
                     logger.warning(f"Failed to create child state: {e}")
+            elif not result.is_valid and self.sampler is not None:
+                # Failure: record failed rollout (increases visit count but doesn't save state)
+                try:
+                    if hasattr(self.sampler, 'record_failed_rollout'):
+                        self.sampler.record_failed_rollout(state)
+                        logger.debug(f"Recorded failed rollout for parent {state.id}")
+                except Exception as e:
+                    logger.warning(f"Failed to record failed rollout: {e}")
             
             return trajectory
             
         except Exception as e:
             logger.error(f"arun_episode failed: {e}", exc_info=True)
-            # Return failed trajectory
+            # Return failed trajectory - let env decide reward and loss_mask
             if state:
                 prompt = self.env.get_prompt(state)
                 messages = [{"role": "user", "content": prompt}]
@@ -254,7 +305,12 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             else:
                 input_ids = [0]
             
-            return self._create_failed_trajectory(input_ids)
+            return self._create_failed_trajectory(
+                state=state,
+                input_ids=input_ids,
+                fail_type="execution_error",
+                error_msg=str(e),
+            )
 
     async def get_pending_updates(self, clear: bool = True) -> tuple[list, list]:
         """

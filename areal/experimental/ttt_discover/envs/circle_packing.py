@@ -21,8 +21,11 @@ if DISCOVER_DIR not in sys.path:
     sys.path.insert(0, DISCOVER_DIR)
 
 from areal.experimental.ttt_discover.envs.env import BaseEnv, EnvResult
-from areal.experimental.ttt_discover.state import CirclePackingState
+from areal.experimental.ttt_discover.state import CirclePackingState, State
 from areal.utils import logging
+
+import torch
+from transformers import PreTrainedTokenizerFast
 
 logger = logging.getLogger("CirclePackingEnv")
 
@@ -156,6 +159,24 @@ class CirclePackingEnv(BaseEnv):
             # DEBUG: Log the full output
             logger.info(f"CirclePacking execute: score={out.get('score')}, correctness={out.get('correctness')}, msg={out.get('msg')!r}")
             
+            # Check for timeout in message (BaseRewardTask catches TimeoutError and returns dict)
+            msg = out.get("msg", "")
+            is_timeout = "timed out" in msg.lower() or "timeout" in msg.lower()
+            
+            if is_timeout:
+                # Return timeout-specific result for proper handling in workflow
+                return EnvResult(
+                    reward=0.0,
+                    observation=msg,
+                    is_valid=False,
+                    fail_type="timeout",
+                    metadata={
+                        "timeout": True,
+                        "msg": msg,
+                        "stdout": out.get("stdout", ""),
+                    },
+                )
+            
             # Convert result_construction to circles format
             circles = None
             raw_constr = out.get("result_construction")
@@ -176,7 +197,7 @@ class CirclePackingEnv(BaseEnv):
                 metadata={
                     "circles": circles,
                     "sum_radii": out.get("score", 0.0),
-                    "msg": out.get("msg", ""),
+                    "msg": msg,
                     "construction": raw_constr,
                 },
             )
@@ -229,6 +250,80 @@ class CirclePackingEnv(BaseEnv):
             parents=parents,
             observation=result.observation,
         )
+
+    def get_failure_result(
+        self,
+        state: State | None,
+        fail_type: str,
+        error_msg: str = "",
+    ) -> EnvResult:
+        """
+        Custom failure handling for Circle Packing.
+        
+        Following the reference design from discover's BaseTTTEnv:
+        - Timeout: reward=0.0 (partial credit for valid format)
+        - Code extraction failed: reward=0.0 (format issue, not code quality)
+        - Execution error: reward=0.0 (runtime issue)
+        """
+        if fail_type == "timeout":
+            return EnvResult(
+                reward=0.0,
+                observation=f"Execution timeout after {self.eval_timeout}s",
+                is_valid=False,
+                fail_type=fail_type,
+                metadata={"timeout": True},
+            )
+        elif fail_type == "code_extraction_failed":
+            return EnvResult(
+                reward=0.0,
+                observation="No valid Python code block found in response",
+                is_valid=False,
+                fail_type=fail_type,
+            )
+        elif fail_type == "execution_error":
+            return EnvResult(
+                reward=0.0,
+                observation=f"Execution failed: {error_msg}" if error_msg else "Execution failed",
+                is_valid=False,
+                fail_type=fail_type,
+            )
+        else:
+            # Use default for missing_state and other types
+            return super().get_failure_result(state, fail_type, error_msg)
+
+    def create_failed_trajectory(
+        self,
+        state: State | None,
+        input_ids: list[int],
+        tokenizer: PreTrainedTokenizerFast,
+        fail_type: str,
+        error_msg: str = "",
+    ) -> dict[str, torch.Tensor]:
+        """
+        Create failed trajectory for Circle Packing.
+        
+        Following ttt-discover logic: all failed rollouts participate in training
+        with reward=0, but only successful ones create new states for sampling.
+        
+        For Circle Packing:
+        - All failure types (timeout, code_extraction_failed, execution_error): 
+          train with reward=0 -> loss_mask=1
+        - Only correctness > 0 creates new state for future sampling
+        """
+        result = self.get_failure_result(state, fail_type, error_msg)
+        
+        seq = input_ids + [tokenizer.eos_token_id or 0]
+        
+        # All failed rollouts participate in training (reward=0)
+        # This follows the ttt-discover paper logic
+        return {
+            "input_ids": torch.tensor(seq, dtype=torch.int32).unsqueeze(0),
+            "loss_mask": torch.ones(len(seq), dtype=torch.int32).unsqueeze(0),  # Train on all failures
+            "logprobs": torch.zeros(len(seq), dtype=torch.float32).unsqueeze(0),
+            "versions": torch.full((len(seq),), -1, dtype=torch.int32).unsqueeze(0),
+            "attention_mask": torch.ones(len(seq), dtype=torch.bool).unsqueeze(0),
+            "rewards": torch.tensor([result.reward], dtype=torch.float32),  # reward=0 for failures
+        }
 
 
 def create_initial_state_cp(
