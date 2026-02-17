@@ -235,9 +235,20 @@ def main(args):
     
     ref = None
     if config.kl_ctl > 0 and config.ref is not None:
+        # Reference model uses DP-only strategy (no TP) to avoid sharding issues
+        # Actor: d1p1t4 (1 DP rank with 4 TP shards) -> Ref: d4p1t1 (4 DP ranks, no TP)
+        from areal.api.alloc_mode import ParallelStrategy
+        ref_parallel_strategy = ParallelStrategy(
+            tensor_parallel_size=1,      # No TP for ref
+            pipeline_parallel_size=1,
+            data_parallel_size=parallel_strategy.world_size,  # Use all GPUs as DP
+            context_parallel_size=1,
+        )
         ref = TTTDActor(config=config.ref)
-        ref.create_process_group(parallel_strategy=parallel_strategy)
+        ref.create_process_group(parallel_strategy=ref_parallel_strategy)
         ref.initialize(None, ft_spec)
+        logger.info(f"Reference model using DP-only strategy: {ref_parallel_strategy} "
+                   f"(vs Actor: {parallel_strategy})")
     
     # Environment setup (same as V1)
     env_type = getattr(config.sampler, 'env_type', 'cp')
