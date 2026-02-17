@@ -404,11 +404,13 @@ def main(args):
         rollout.pause()
         
         with stats_tracker.record_timing("update_weights"):
+            logger.info(f"[Step {global_step}] Updating weights with meta: {weight_update_meta}")
             actor.update_weights(weight_update_meta)
             actor.set_version(global_step + 1)
             rollout.set_version(global_step + 1)
             eval_rollout.set_version(global_step + 1)
         
+        logger.info(f"[Step {global_step}] Weights updated, now saving checkpoint")
         with stats_tracker.record_timing("save"):
             saver.save(actor, step_info.epoch, step_info.epoch_step, global_step, tokenizer=tokenizer)
         
