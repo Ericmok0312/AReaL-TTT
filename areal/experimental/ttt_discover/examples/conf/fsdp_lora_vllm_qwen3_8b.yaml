@@ -132,15 +132,14 @@ gconfig:
   lora_name: tttd_lora_adapter
 
 # CRITICAL FIX: ref 也需要 mb_spec（如果与 actor 不同步会出错）
-# NOTE: ref 禁用 torch.compile 以避免 TP + compile 的兼容性问题
 ref:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: ${path}
   init_from_scratch: false
   disable_dropout: true
+  gradient_checkpointing: false
   dtype: ${dtype}
-  enable_compile: false  # 关键：禁用 torch.compile，允许使用 TP
   mb_spec:
     max_tokens_per_mb: 32768  # 必须与 actor 一致
     n_mbs: 1
