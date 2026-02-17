@@ -12,7 +12,7 @@ enable_offload: false
 
 # TTT-Discover uses fixed number of steps (not epochs)
 # Paper: 50 steps with 512 rollouts per step (8 parents × 64 group_size)
-max_steps: 50
+max_steps: 2
 total_train_epochs: 10  # Ignored for TTT-Discover, use max_steps instead
 
 # ============================================================================
@@ -44,7 +44,7 @@ eps_clip: 0.4
 temperature: ${gconfig.temperature}
 reward_scaling: 10.0
 reward_bias: -0.5
-kl_ctl: 0.01
+kl_ctl: 0.0
 ppo_n_minibatches: 1
 recompute_logprob: true
 use_decoupled_loss: true
@@ -122,7 +122,7 @@ rollout:
   max_concurrent_rollouts: 256
   queue_size: null
   consumer_batch_size: ${train_dataset.batch_size}
-  max_head_offpolicyness: 4
+  max_head_offpolicyness: 0
   enable_rollout_tracing: false
   pause_grace_period: 1.0
   scheduling_spec: ${scheduling_spec}
@@ -136,7 +136,7 @@ rollout:
 # ============================================================================
 gconfig:
   # Group rollout: 64 samples per parent state
-  n_samples: 64
+  n_samples: 1
   min_new_tokens: 0
   max_new_tokens: 16384  # Increased from 1024 to handle longer code generation
   greedy: false
@@ -193,7 +193,7 @@ vllm:
 # ============================================================================
 sampler:
   type: puct
-  batch_size: 8  # Parents per DP rank (total = 8 × dp_size)
+  batch_size: 1  # Parents per DP rank (total = 8 × dp_size)
 
   # PUCT parameters
   c_puct: 1.5
