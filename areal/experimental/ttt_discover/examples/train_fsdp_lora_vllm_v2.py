@@ -389,33 +389,24 @@ def main(args):
         # Add training stats
         stats = actor.export_stats()
         
-        # DEBUG: Print all available stats keys to diagnose issue
-        if rank == 0:
-            logger.info(f"[DEBUG] Available stats keys: {sorted(stats.keys())}")
-        
-        # Try different possible key patterns for loss and entropy
-        # AReaL uses scope prefixes like 'update/actor_loss/avg'
-        entropy_keys = ['entropy/avg', 'update/entropy/avg', 'update/new_logp/avg']
-        actor_loss_keys = ['actor_loss/avg', 'update/actor_loss/avg', 'loss/avg', 'update/loss/avg']
-        approx_kl_keys = ['approx_kl/avg', 'update/approx_kl/avg']
-        
-        def get_first_matching(stats_dict, key_list, default=0.0):
-            for key in key_list:
-                if key in stats_dict:
-                    return stats_dict[key]
-            return default
-        
+        # AReaL stats use 'ppo_actor/' prefix with scope paths
+        # Correct keys: 'ppo_actor/update/actor_loss/avg', 'ppo_actor/update/entropy/avg', etc.
         metrics.update({
-            "train/entropy": get_first_matching(stats, entropy_keys),
-            "train/actor_loss": get_first_matching(stats, actor_loss_keys),
-            "train/approx_kl": get_first_matching(stats, approx_kl_keys),
+            "train/entropy": stats.get('ppo_actor/update/entropy/avg', 0.0),
+            "train/actor_loss": stats.get('ppo_actor/update/actor_loss/avg', 0.0),
+            "train/approx_kl": stats.get('ppo_actor/update/approx_kl/avg', 0.0),
+            "train/grad_norm": stats.get('ppo_actor/update/grad_norm', 0.0),
+            "train/lr": stats.get('ppo_actor/update/lr', 0.0),
+            "train/importance_weight": stats.get('ppo_actor/update/importance_weight/avg', 0.0),
+            "train/clip_ratio": stats.get('ppo_actor/update/clip_ratio/avg', 0.0),
         })
         
-        # Also add raw stats for debugging
-        if rank == 0:
-            for key in ['update/loss', 'update/loss__count', 'update/grad_norm', 'update/lr']:
-                if key in stats:
-                    metrics[f"train/{key}"] = stats[key]
+        # Also add advantage stats from ppo_actor scope
+        metrics.update({
+            "train/advantages/avg": stats.get('ppo_actor/advantages/avg', 0.0),
+            "train/advantages/max": stats.get('ppo_actor/advantages/max', 0.0),
+            "train/advantages/min": stats.get('ppo_actor/advantages/min', 0.0),
+        })
         
         # Log to stats_logger (wandb/swanlab/tensorboard)
         if rank == 0:
@@ -425,17 +416,12 @@ def main(args):
                 global_step=global_step,
                 data=metrics,
             )
-            # Also print concise summary with more details
-            logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] "
-                       f"Reward: max={step_max_reward:.4f}, mean={step_mean_reward:.4f}, best={best_reward:.4f} | "
-                       f"Loss: {metrics['train/actor_loss']:.4f}, KL: {metrics['train/approx_kl']:.4f}, "
-                       f"Entropy: {metrics['train/entropy']:.4f}")
-            
-            # Print additional training stats if available
-            if 'update/grad_norm' in stats:
-                logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] Training details: "
-                           f"grad_norm={stats.get('update/grad_norm', 'N/A'):.4f}, "
-                           f"lr={stats.get('update/lr', 'N/A'):.6f}")
+            # Print comprehensive training summary
+            logger.info(
+                f"[Step {global_step}] Reward: max={step_max_reward:.4f}, mean={step_mean_reward:.4f}, best={best_reward:.4f} | "
+                f"Loss: {metrics['train/actor_loss']:.4f}, KL: {metrics['train/approx_kl']:.4f}, "
+                f"Entropy: {metrics['train/entropy']:.4f}, GradNorm: {metrics['train/grad_norm']:.4f}, LR: {metrics['train/lr']:.6f}"
+            )
                 
         rollout.pause()
         
