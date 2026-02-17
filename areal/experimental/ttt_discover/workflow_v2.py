@@ -33,6 +33,7 @@ from areal.api.engine_api import InferenceEngine
 from areal.api.io_struct import ModelRequest, ModelResponse
 from areal.api.workflow_api import RolloutWorkflow
 from areal.utils import logging, stats_tracker
+from areal.utils.concurrent import get_executor
 from areal.utils.perf_tracer import atrace_session_phase, trace_session
 
 from .envs.env import BaseEnv, EnvResult
@@ -145,7 +146,12 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         resp: ModelResponse,
         task_data: dict[str, Any],
     ) -> tuple[float, EnvResult, str]:
-        """Compute reward by executing code in environment."""
+        """Compute reward by executing code in environment.
+        
+        This method uses run_in_executor to run sync env.execute in a thread pool,
+        preventing blocking of the async event loop. This allows multiple rollouts
+        to execute code concurrently without stalling AReaL's AsyncTaskRunner.
+        """
         completion_str = self.tokenizer.decode(resp.output_tokens)
         
         code = self.env.extract_code(completion_str)
@@ -161,7 +167,16 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             return result.reward, result, ""
         
         try:
-            result = self.env.execute(code, state)
+            # Run sync env.execute in AReaL's shared thread pool to avoid blocking event loop.
+            # This is critical for concurrent rollouts - without this, each code execution
+            # blocks the AsyncTaskRunner, serializing all rollouts and causing GPU idle time.
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                get_executor(),  # Use AReaL's shared ThreadPoolExecutor
+                self.env.execute,
+                code,
+                state
+            )
             # Log result details including fail_type if present
             fail_type_info = f", fail_type={result.fail_type}" if result.fail_type else ""
             logger.info(f"reward={result.reward:.4f}, valid={result.is_valid}{fail_type_info}")
