@@ -117,10 +117,10 @@ def main(args):
     
     # Get distributed info
     world_size = actor.data_parallel_world_size
-    is_dp_head = actor.is_data_parallel_head()
+    is_dp_head = rank == 0
     
     # DEBUG: Log distributed configuration
-    if actor.is_data_parallel_head():
+    if rank==0:
         logger.info(f"=== Distributed Configuration ===")
         logger.info(f"DP world size: {world_size}")
         logger.info(f"Sampler batch_size: {batch_size}")
@@ -151,7 +151,7 @@ def main(args):
     # ============================================================
     # CONFIGURATION VERIFICATION for Scheme A (DP Head Only)
     # ============================================================
-    if actor.dp_rank == 0:
+    if rank == 0:
         logger.info("=== Scheme A Configuration Verification ===")
         logger.info(f"Allocation mode: {config.allocation_mode}")
         logger.info(f"Parallel Strategy: {parallel_strategy}")
@@ -160,7 +160,7 @@ def main(args):
         logger.info(f"  - PP size: {parallel_strategy.pp_size}")
         logger.info(f"Actor DP rank: {actor.dp_rank}")
         logger.info(f"Actor DP world size: {actor.data_parallel_world_size}")
-        logger.info(f"Is DP head: {actor.is_data_parallel_head()}")
+        logger.info(f"Is DP head: {rank == 0}")
         
         # Verify Scheme A requirements
         if parallel_strategy.dp_size != 1:
@@ -174,7 +174,7 @@ def main(args):
                 f"WARNING: tp_size={parallel_strategy.tp_size}. With dp=1, tp>1 "
                 f"is expected to distribute work across GPUs."
             )
-        if not actor.is_data_parallel_head():
+        if not rank == 0:
             logger.error(
                 f"ERROR: Rank {actor.dp_rank} is not DP head but only_dp_head=True. "
                 f"This rank will not produce any data!"
@@ -327,7 +327,7 @@ def main(args):
             
             # Only rank 0 updates sampler and saves
             # (all ranks have all_children, but we only want to update once)
-            if actor.is_data_parallel_head():
+            if rank == 0:
                 if all_children:
                     sampler.update_states(all_children, all_parents, save=False)
                     sampler.flush(step=global_step)
@@ -390,7 +390,7 @@ def main(args):
         })
         
         # Log to stats_logger (wandb/swanlab/tensorboard)
-        if actor.is_data_parallel_head():
+        if rank == 0:
             stats_logger.commit(
                 epoch=step_info.epoch,
                 step=step_info.epoch_step,
