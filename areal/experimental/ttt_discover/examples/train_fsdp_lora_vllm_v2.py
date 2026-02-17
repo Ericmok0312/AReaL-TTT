@@ -93,17 +93,20 @@ def main(args):
     config, _ = load_expr_config(args, TTTDPPOActorConfig)
     config: TTTDPPOActorConfig
     
-    rank = int(os.getenv("RANK", 0))
-    
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
-    seeding.set_random_seed(config.seed, key=f"trainer{rank}")
     
+    # Create actor first to get correct dp_rank
+    actor = TTTDActor(config=config)
     allocation_mode = AllocationMode.from_str(config.allocation_mode)
     parallel_strategy = allocation_mode["actor"].parallel
     assert parallel_strategy is not None
-    
-    actor = TTTDActor(config=config)
     actor.create_process_group(parallel_strategy=parallel_strategy)
+    
+    # Use AReaL's dp_rank instead of environment variable RANK
+    rank = actor.dp_rank
+    world_size = actor.data_parallel_world_size
+    
+    seeding.set_random_seed(config.seed, key=f"trainer{rank}")
     
     # Create sampler first (before workflow)
     sampler = create_sampler_from_config(
@@ -115,12 +118,11 @@ def main(args):
     batch_size = config.sampler.batch_size  # Total parents per step (e.g., 8)
     group_size = config.gconfig.n_samples   # Rollouts per parent (e.g., 64)
     
-    # Get distributed info
-    world_size = actor.data_parallel_world_size
+    # dp_rank == 0 is the DP head
     is_dp_head = rank == 0
     
     # DEBUG: Log distributed configuration
-    if rank==0:
+    if rank == 0:
         logger.info(f"=== Distributed Configuration ===")
         logger.info(f"DP world size: {world_size}")
         logger.info(f"Sampler batch_size: {batch_size}")
@@ -130,14 +132,13 @@ def main(args):
         logger.info(f"================================")
     
     # Scheme A: Only DP head produces data, then broadcast to all ranks
-    # This requires allocation_mode like 'fsdp:d1p1t8' (dp=1, tp=8)
-    # where only rank 0 is the DP head
+    # With dp=1, all ranks participate in TP, only rank 0 produces data
     train_dataloader = create_tttd_dataloader(
         state_sampler=sampler,
-        rank=actor.dp_rank,           # 0 for DP head
+        rank=rank,                    # Use dp_rank (0 for DP head)
         world_size=world_size,        # 1 if dp=1
         batch_size=batch_size,        # Total parents (not divided)
-        only_dp_head=True,            # Only DP head produces data
+        only_dp_head=False,           # dp=1: standard mode, rank 0 handles all
     )
     
     ft_spec = FinetuneSpec(
@@ -186,6 +187,10 @@ def main(args):
         dist.barrier()
     
     # Check LoRA adapter exists (same as V1)
+    # Use absolute path based on current working directory
+    import os as _os
+    _original_cwd = _os.getcwd()
+    
     if config.use_lora:
         import json
         lora_output_path = "./lora_init"

@@ -180,7 +180,7 @@ vllm:
   dtype: ${dtype}
   max_model_len: 32768
   gpu_memory_utilization: 0.9
-  enforce_eager: true
+  enforce_eager: false
   # LoRA support
   enable_lora: ${use_lora}
   max_lora_rank: 32  # Must be >= lora_rank
