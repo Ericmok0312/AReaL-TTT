@@ -147,7 +147,7 @@ def main(args):
         rank=rank,                    # DP rank
         world_size=world_size,        # DP world size
         batch_size=batch_size,        # Global batch size
-        only_dp_head=False,           # Use distributed sharding (each rank samples its own shard)
+        only_dp_head=True,           # Use distributed sharding (each rank samples its own shard)
     )
     
     ft_spec = FinetuneSpec(
