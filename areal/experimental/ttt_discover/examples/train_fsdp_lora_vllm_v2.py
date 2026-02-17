@@ -455,6 +455,8 @@ def main(args):
         current_platform.synchronize()
         rollout.resume()
     
+    # Cleanup
+    workflow.shutdown()  # Shutdown code execution thread pool
     stats_logger.close()
     eval_rollout.destroy()
     rollout.destroy()
