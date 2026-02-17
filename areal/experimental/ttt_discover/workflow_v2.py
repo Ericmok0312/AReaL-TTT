@@ -80,15 +80,19 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         self.enable_thinking = enable_thinking
         
         # Thread pool for running sync env.execute in background.
-        # Using a dedicated pool instead of AReaL's shared executor to avoid
-        # resource contention when batch size is large.
+        # CRITICAL: max_code_workers should be SMALL (e.g., 4) to prevent deadlock
+        # when GroupedRolloutWorkflow launches group_size (e.g., 16) parallel rollouts.
+        # If max_code_workers >= group_size, all workers can be occupied by slow
+        # code executions, causing deadlock.
+        actual_workers = min(max_code_workers, 4)  # Cap at 4 to ensure availability
         self._code_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=max_code_workers,
+            max_workers=actual_workers,
             thread_name_prefix="tttd_code_exec"
         )
         
-        # Semaphore to limit concurrent code execution (prevents overwhelming CPU)
-        self._code_semaphore = asyncio.Semaphore(max_code_workers)
+        # Semaphore limits concurrent code execution to prevent ThreadPool exhaustion.
+        # Must be <= max_code_workers to ensure we never overwhelm the pool.
+        self._code_semaphore = asyncio.Semaphore(actual_workers)
         
         # Async-safe buffer for pending updates (GroupedRolloutWorkflow uses asyncio.gather)
         # Stores (child_state, parent_state) tuples
