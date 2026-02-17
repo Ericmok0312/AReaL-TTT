@@ -45,7 +45,7 @@ class CirclePackingEnv(BaseEnv):
     def __init__(
         self,
         n_item: int = 26,
-        eval_timeout: int = 60,
+        eval_timeout: int = 300,
         log_dir: str = "/tmp/ttt_logs",
     ):
         """
