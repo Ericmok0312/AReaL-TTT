@@ -1,3 +1,4 @@
+TODO Update this doc
 # TTT-Discover with FSDP + LoRA + Group Rollout
 
 这个目录包含了 TTT-Discover 的优化训练实现，结合了：
@@ -6,6 +7,7 @@
 2. **LoRA**: 低秩适应，高效微调
 3. **Group Rollout**: 8 parents × 64 rollouts = 512 总 rollout
 4. **External PUCTSampler**: 外部状态管理，避免重复更新
+
 
 ## 文件结构
 
