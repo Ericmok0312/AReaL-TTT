@@ -131,14 +131,23 @@ def main(args):
         logger.info(f"Is DP head: {is_dp_head}")
         logger.info(f"================================")
     
-    # Scheme A: Only DP head produces data, then broadcast to all ranks
-    # With dp=1, all ranks participate in TP, only rank 0 produces data
+    # Distributed Sampler Mode: Each rank samples its own shard
+    # States are synchronized across ranks after each step via gather_states_across_ranks
+    use_dp_shard = world_size > 1
+    if rank == 0:
+        logger.info(f"=== DataLoader Configuration ===")
+        logger.info(f"use_dp_head_only: {not use_dp_shard}")
+        logger.info(f"world_size: {world_size}")
+        logger.info(f"batch_size (global): {batch_size}")
+        logger.info(f"local_batch_size: {batch_size // world_size if use_dp_shard else batch_size}")
+        logger.info(f"================================")
+    
     train_dataloader = create_tttd_dataloader(
         state_sampler=sampler,
-        rank=rank,                    # Use dp_rank (0 for DP head)
-        world_size=world_size,        # 1 if dp=1
-        batch_size=batch_size,        # Total parents (not divided)
-        only_dp_head=False,           
+        rank=rank,                    # DP rank
+        world_size=world_size,        # DP world size
+        batch_size=batch_size,        # Global batch size
+        only_dp_head=False,           # Use distributed sharding (each rank samples its own shard)
     )
     
     ft_spec = FinetuneSpec(
@@ -325,20 +334,17 @@ def main(args):
             
             # Aggregate updates from all ranks using all_gather_object
             # CRITICAL: This must be called by ALL ranks in the DP group
-            # all_children, all_parents = gather_states_across_ranks(
-            #     actor, local_children, local_parents
-            # )
-            all_children, all_parents = local_children, local_parents  # For now, skip gathering to avoid deadlock
+            all_children, all_parents = gather_states_across_ranks(
+                actor, local_children, local_parents
+            )
             
-            # Only rank 0 updates sampler and saves
-            # (all ranks have all_children, but we only want to update once)
-            if rank == 0:
-                if all_children:
-                    sampler.update_states(all_children, all_parents, save=False)
+            # ALL ranks update their local sampler to keep state trees synchronized
+            if all_children:
+                sampler.update_states(all_children, all_parents, save=False)
+                if rank == 0:
                     sampler.flush(step=global_step)
-                    logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] Aggregated {len(all_children)} updates "
-                                f"from {actor.data_parallel_world_size} ranks, "
-                                f"{len(set(p.id for p in all_parents))} unique parents")
+                logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] Updated sampler with {len(all_children)} children "
+                            f"from {len(set(p.id for p in all_parents))} unique parents")
         
         # Log rewards and actual rollout count
         local_rollouts = batch["rewards"].shape[0]  # Rollouts on this rank
