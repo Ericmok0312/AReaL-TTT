@@ -181,18 +181,35 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         try:
             # Run sync env.execute in dedicated thread pool with semaphore control.
             # The semaphore limits concurrent executions to prevent CPU overload.
-            # This prevents blocking AReaL's AsyncTaskRunner event loop.
+            # Add asyncio.timeout to prevent indefinite hanging.
+            import time
+            start_time = time.time()
+            
             async with self._code_semaphore:
                 loop = asyncio.get_running_loop()
-                result = await loop.run_in_executor(
-                    self._code_executor,  # Use dedicated ThreadPoolExecutor
-                    self.env.execute,
-                    code,
-                    state
-                )
-            # Log result details including fail_type if present
+                # Use asyncio.wait_for to add timeout protection at asyncio level
+                # This is in addition to env.execute's internal timeout
+                try:
+                    result = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            self._code_executor,
+                            self.env.execute,
+                            code,
+                            state
+                        ),
+                        timeout=65.0  # Slightly longer than env's 60s timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"Code execution timed out at asyncio level after 65s")
+                    result = self.env.get_failure_result(
+                        state=state,
+                        fail_type="async_timeout",
+                        error_msg="Code execution timed out (asyncio level)",
+                    )
+            
+            elapsed = time.time() - start_time
             fail_type_info = f", fail_type={result.fail_type}" if result.fail_type else ""
-            logger.info(f"reward={result.reward:.4f}, valid={result.is_valid}{fail_type_info}")
+            logger.info(f"reward={result.reward:.4f}, valid={result.is_valid}, elapsed={elapsed:.1f}s{fail_type_info}")
         except Exception as e:
             # Execution errors (TimeoutError is typically caught by env and returned as result with fail_type)
             logger.warning(f"Execution failed: {e}")
