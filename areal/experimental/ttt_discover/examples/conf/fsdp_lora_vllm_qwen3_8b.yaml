@@ -122,7 +122,7 @@ rollout:
   use_lora: ${use_lora}
 
 gconfig:
-  n_samples: 1
+  n_samples: 16
   min_new_tokens: 0
   max_new_tokens: 16384      # 生成长度限制
   max_tokens: 32768          # 总长度限制（prompt + response）
@@ -163,7 +163,7 @@ vllm:
 
 sampler:
   type: puct
-  batch_size: 4
+  batch_size: 8
   c_puct: 1.5
   gamma: 0.95
   max_children: 100
