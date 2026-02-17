@@ -193,7 +193,7 @@ vllm:
 # ============================================================================
 sampler:
   type: puct
-  batch_size: 1  # Parents per DP rank (total = 8 × dp_size)
+  batch_size: 4  # Parents per DP rank (total = 8 × dp_size)
 
   # PUCT parameters
   c_puct: 1.5
