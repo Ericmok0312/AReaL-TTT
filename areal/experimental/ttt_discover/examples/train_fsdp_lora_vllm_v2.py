@@ -30,6 +30,70 @@ from areal.experimental.ttt_discover.workflow_v2 import TTTDiscoverWorkflowV2
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
+def _format_state_table(states: list, title: str = "States") -> str:
+    """Format a list of states as a readable table."""
+    if not states:
+        return f"{title}: <empty>"
+    
+    lines = [f"\n{'='*80}", f"{title} (count={len(states)})", f"{'='*80}"]
+    lines.append(f"{'Index':<6} {'ID':<36} {'Timestep':<10} {'Value':<12} {'Parent ID':<36}")
+    lines.append("-" * 100)
+    
+    for i, state in enumerate(states):
+        parent_id = state.parents[0].get("id", "N/A") if state.parents else "root"
+        value_str = f"{state.value:.4f}" if state.value is not None else "N/A"
+        lines.append(
+            f"{i:<6} {state.id:<36} {state.timestep:<10} {value_str:<12} {parent_id:<36}"
+        )
+    lines.append(f"{'='*80}\n")
+    return "\n".join(lines)
+
+
+def _format_sampler_summary(sampler, title: str = "Sampler State") -> str:
+    """Format sampler internal state as a readable table."""
+    lines = [f"\n{'#'*80}", f"{title}", f"{'#'*80}"]
+    
+    # Basic sampler info
+    if hasattr(sampler, '_states'):
+        all_states = sampler._states
+        lines.append(f"Total states in buffer: {len(all_states)}")
+        lines.append(f"Current step: {getattr(sampler, '_current_step', 'N/A')}")
+        
+        if hasattr(sampler, '_T'):
+            lines.append(f"PUCT T (total expansions): {sampler._T}")
+        if hasattr(sampler, '_n'):
+            lines.append(f"PUCT n (visit counts): {len(sampler._n)} entries")
+        if hasattr(sampler, '_m'):
+            lines.append(f"PUCT m (max rewards): {len(sampler._m)} entries")
+        
+        # States table
+        if all_states:
+            lines.append(f"\n{'-'*100}")
+            lines.append(f"{'Idx':<5} {'State ID':<36} {'TS':<5} {'Value':<10} {'Parent':<36} {'n':<6} {'m':<10}")
+            lines.append(f"{'-'*100}")
+            
+            for idx, state in enumerate(all_states):
+                parent_id = state.parents[0].get("id", "root") if state.parents else "root"
+                value_str = f"{state.value:.4f}" if state.value is not None else "N/A"
+                
+                # Get PUCT stats if available
+                n_val = sampler._n.get(state.id, 0) if hasattr(sampler, '_n') else 0
+                m_val = sampler._m.get(state.id, 0.0) if hasattr(sampler, '_m') else 0.0
+                m_str = f"{m_val:.4f}" if m_val != 0.0 else "N/A"
+                
+                lines.append(
+                    f"{idx:<5} {state.id:<36} {state.timestep:<5} {value_str:<10} "
+                    f"{parent_id:<36} {n_val:<6} {m_str:<10}"
+                )
+        else:
+            lines.append("No states in buffer")
+    else:
+        lines.append("Sampler has no _states attribute")
+    
+    lines.append(f"{'#'*80}\n")
+    return "\n".join(lines)
+
+
 def gather_states_across_ranks(actor, local_children, local_parents):
     """
     Gather states from all data parallel ranks using all_gather_object.
@@ -332,11 +396,55 @@ def main(args):
             # Get local updates from this rank
             local_children, local_parents = workflow.get_pending_updates_sync(clear=True)
             
+            # === PRE-SYNC LOGGING (All Ranks) ===
+            # Log local pending updates before aggregation
+            logger.info(f"\n{'='*80}")
+            logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] PRE-SYNC: Local Pending Updates")
+            logger.info(f"{'='*80}")
+            logger.info(f"Local children count: {len(local_children)}")
+            logger.info(f"Local parents count: {len(local_parents)}")
+            if local_children:
+                logger.info(_format_state_table(local_children, "Local Children States"))
+            if local_parents:
+                logger.info(_format_state_table(local_parents, "Local Parent States"))
+            
+            # Log current sampler state BEFORE sync
+            logger.info(_format_sampler_summary(sampler, f"[Rank {actor.dp_rank}][Step {global_step}] PRE-SYNC Sampler State"))
+            
             # Aggregate updates from all ranks using all_gather_object
             # CRITICAL: This must be called by ALL ranks in the DP group
             all_children, all_parents = gather_states_across_ranks(
                 actor, local_children, local_parents
             )
+            
+            # Log aggregated updates from all ranks
+            logger.info(f"\n{'='*80}")
+            logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] AGGREGATED Updates (All Ranks)")
+            logger.info(f"{'='*80}")
+            logger.info(f"Total children from all ranks: {len(all_children)}")
+            logger.info(f"Total parents from all ranks: {len(all_parents)}")
+            
+            # Group by source rank for clarity
+            if all_children:
+                from areal.experimental.ttt_discover.state import state_from_dict
+                # Since we gathered from all ranks, show summary by parent
+                parent_counts = {}
+                for child, parent in zip(all_children, all_parents):
+                    pid = parent.id
+                    if pid not in parent_counts:
+                        parent_counts[pid] = {"count": 0, "values": [], "timestep": parent.timestep}
+                    parent_counts[pid]["count"] += 1
+                    parent_counts[pid]["values"].append(child.value if child.value is not None else float('-inf'))
+                
+                logger.info(f"\nAggregated updates by parent:")
+                logger.info(f"{'Parent ID':<36} {'Children':<10} {'Timestep':<10} {'Min Value':<12} {'Max Value':<12}")
+                logger.info("-" * 90)
+                for pid, info in sorted(parent_counts.items()):
+                    min_val = min(info["values"]) if info["values"] else "N/A"
+                    max_val = max(info["values"]) if info["values"] else "N/A"
+                    min_str = f"{min_val:.4f}" if isinstance(min_val, float) else str(min_val)
+                    max_str = f"{max_val:.4f}" if isinstance(max_val, float) else str(max_val)
+                    logger.info(f"{pid:<36} {info['count']:<10} {info['timestep']:<10} {min_str:<12} {max_str:<12}")
             
             # ALL ranks update their local sampler to keep state trees synchronized
             if all_children:
@@ -345,6 +453,36 @@ def main(args):
                     sampler.flush(step=global_step)
                 logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] Updated sampler with {len(all_children)} children "
                             f"from {len(set(p.id for p in all_parents))} unique parents")
+            
+            # === POST-SYNC LOGGING (All Ranks) ===
+            logger.info(_format_sampler_summary(sampler, f"[Rank {actor.dp_rank}][Step {global_step}] POST-SYNC Sampler State"))
+            
+            # Cross-rank consistency check
+            if dist.is_initialized() and actor.data_parallel_world_size > 1:
+                # Get sampler state hash for comparison across ranks
+                if hasattr(sampler, '_states'):
+                    state_ids = tuple(sorted([s.id for s in sampler._states]))
+                    # Use a simple checksum for comparison
+                    state_checksum = hash(state_ids) & 0xFFFFFFFF
+                else:
+                    state_checksum = 0
+                
+                # Gather checksums from all ranks
+                all_checksums = [0] * actor.data_parallel_world_size
+                dist.all_gather_object(all_checksums, state_checksum, group=actor.data_parallel_group)
+                
+                logger.info(f"\n{'='*80}")
+                logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] Cross-Rank Consistency Check")
+                logger.info(f"{'='*80}")
+                logger.info(f"Sampler state checksums across ranks: {all_checksums}")
+                if len(set(all_checksums)) == 1:
+                    logger.info("✓ All ranks have CONSISTENT sampler state")
+                else:
+                    logger.warning("✗ Ranks have INCONSISTENT sampler state! Checksums differ!")
+                    for r, cs in enumerate(all_checksums):
+                        status = "OK" if cs == all_checksums[0] else "DIFF"
+                        logger.warning(f"  Rank {r}: checksum={cs} [{status}]")
+                logger.info(f"{'='*80}\n")
         
         # Log rewards and actual rollout count
         local_rollouts = batch["rewards"].shape[0]  # Rollouts on this rank
