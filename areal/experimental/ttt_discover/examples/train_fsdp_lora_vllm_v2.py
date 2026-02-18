@@ -585,9 +585,13 @@ def main(args):
             # Cross-rank consistency check
             if dist.is_initialized() and actor.data_parallel_world_size > 1:
                 # Get sampler state hash for comparison across ranks
+                # Use deterministic hash (hash() is randomized in Python)
+                import hashlib
                 if hasattr(sampler, '_states'):
-                    state_ids = tuple(sorted([s.id for s in sampler._states]))
-                    state_checksum = hash(state_ids) & 0xFFFFFFFF
+                    state_ids = sorted([s.id for s in sampler._states])
+                    # Use MD5 for deterministic hash
+                    hash_input = ','.join(state_ids).encode('utf-8')
+                    state_checksum = int(hashlib.md5(hash_input).hexdigest(), 16) & 0xFFFFFFFF
                 else:
                     state_checksum = 0
                 
