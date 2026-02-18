@@ -174,11 +174,16 @@ def sync_sampler_state_from_rank0(actor, sampler):
             'last_puct_stats': sampler._last_puct_stats,
             'last_scale': sampler._last_scale,
         }
+        objects_to_broadcast = [state_data]
     else:
-        state_data = None
+        objects_to_broadcast = [None]
     
     # Broadcast from rank 0 to all ranks
-    dist.broadcast_object_list([state_data], src=0, group=actor.data_parallel_group)
+    # Note: broadcast_object_list modifies the list in-place on all ranks
+    dist.broadcast_object_list(objects_to_broadcast, src=0, group=actor.data_parallel_group)
+    
+    # Extract the received data
+    state_data = objects_to_broadcast[0]
     
     # Non-rank-0 ranks update their sampler state
     if actor.dp_rank != 0:
