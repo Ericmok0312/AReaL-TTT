@@ -103,6 +103,9 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         # Track which parents have been processed this batch
         # Key: parent_state.id, Value: list of child rewards
         self._parent_stats: dict[str, list[float]] = {}
+        
+        # Cache failed rollouts for delayed update (synced across ranks in distributed training)
+        self._failed_parents: list[Any] = []
 
     def _create_trajectory(
         self,
@@ -326,13 +329,13 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 except Exception as e:
                     logger.warning(f"Failed to create child state: {e}")
             elif not result.is_valid and self.sampler is not None:
-                # Failure: record failed rollout (increases visit count but doesn't save state)
+                # Failure: cache failed parent for delayed update (will be synced across ranks)
                 try:
-                    if hasattr(self.sampler, 'record_failed_rollout'):
-                        self.sampler.record_failed_rollout(state)
-                        logger.debug(f"Recorded failed rollout for parent {state.id}")
+                    async with self._pending_lock:
+                        self._failed_parents.append(state)
+                        logger.debug(f"Cached failed rollout for parent {state.id}")
                 except Exception as e:
-                    logger.warning(f"Failed to record failed rollout: {e}")
+                    logger.warning(f"Failed to cache failed rollout: {e}")
             
             return trajectory
             
@@ -361,7 +364,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 error_msg=str(e),
             )
 
-    async def get_pending_updates(self, clear: bool = True) -> tuple[list, list]:
+    async def get_pending_updates(self, clear: bool = True) -> tuple[list, list, list]:
         """
         Get pending sampler updates without applying them.
         
@@ -372,18 +375,20 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             clear: If True, clear the pending buffers after copying
             
         Returns:
-            Tuple of (children_states, parent_states)
+            Tuple of (children_states, parent_states, failed_parents)
         """
         async with self._pending_lock:
             children = self._pending_children.copy()
             parents = self._pending_parents.copy()
+            failed = self._failed_parents.copy()
             
             if clear:
                 self._pending_children.clear()
                 self._pending_parents.clear()
+                self._failed_parents.clear()
                 self._parent_stats.clear()
         
-        return children, parents
+        return children, parents, failed
 
     async def flush(self, save: bool = False, step: int | None = None) -> dict[str, Any]:
         """
@@ -423,26 +428,41 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         async with self._pending_lock:
             self._pending_children.clear()
             self._pending_parents.clear()
+            self._failed_parents.clear()
             self._parent_stats.clear()
 
     def reset_sync(self):
         """Synchronous version of reset()."""
         self._pending_children.clear()
         self._pending_parents.clear()
+        self._failed_parents.clear()
         self._parent_stats.clear()
 
-    def get_pending_updates_sync(self, clear: bool = True) -> tuple[list, list]:
+    def get_pending_updates_sync(self, clear: bool = True) -> tuple[list, list, list]:
         """Synchronous version of get_pending_updates()."""
         children = self._pending_children.copy()
         parents = self._pending_parents.copy()
+        failed = self._failed_parents.copy()
         
         if clear:
             self._pending_children.clear()
             self._pending_parents.clear()
+            self._failed_parents.clear()
             self._parent_stats.clear()
         
-        return children, parents
+        return children, parents, failed
 
+    def record_failed_rollout_sync(self, parent: "State"):
+        """
+        Synchronously record a failed rollout for a parent.
+        This should be called by rank 0 after gathering failed parents from all ranks.
+        
+        Args:
+            parent: The parent state that produced a failed rollout
+        """
+        if self.sampler is not None and hasattr(self.sampler, 'record_failed_rollout'):
+            self.sampler.record_failed_rollout(parent)
+    
     # Backward compatibility - these are no-ops in V2
     def init_batch_metadata(self):
         """No-op in V2. Use reset_sync() instead."""
