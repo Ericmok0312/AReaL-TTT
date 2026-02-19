@@ -180,7 +180,8 @@ sampler:
   initial_exp_type: best_available
   env_type: cp
   n_item: 26
-  gpu_type: H100           # 你用的是 H20，但代码里可能用这个字段做其他判断，保持原样
+  eval_timeout: 300        # CP code execution timeout: 300s (5 minutes)
+  gpu_type: H100
   eval_timeout: 60
   n: 100
   budget_s: 1000

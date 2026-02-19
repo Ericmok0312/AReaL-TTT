@@ -191,6 +191,9 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 loop = asyncio.get_running_loop()
                 # Use asyncio.wait_for to add timeout protection at asyncio level
                 # This is in addition to env.execute's internal timeout
+                # Get timeout from env, default to 60s, add 5s buffer for asyncio
+                env_timeout = getattr(self.env, 'eval_timeout', 60)
+                asyncio_timeout = env_timeout + 5.0
                 try:
                     result = await asyncio.wait_for(
                         loop.run_in_executor(
@@ -199,14 +202,14 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                             code,
                             state
                         ),
-                        timeout=65.0  # Slightly longer than env's 60s timeout
+                        timeout=asyncio_timeout  # Dynamic based on env.eval_timeout
                     )
                 except asyncio.TimeoutError:
-                    logger.warning(f"Code execution timed out at asyncio level after 65s")
+                    logger.warning(f"Code execution timed out at asyncio level after {asyncio_timeout}s")
                     result = self.env.get_failure_result(
                         state=state,
                         fail_type="async_timeout",
-                        error_msg="Code execution timed out (asyncio level)",
+                        error_msg=f"Code execution timed out (asyncio level, timeout={asyncio_timeout}s)",
                     )
             
             elapsed = time.time() - start_time
