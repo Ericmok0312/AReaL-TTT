@@ -266,6 +266,19 @@ class TTTDPPOActorConfig(PPOActorConfig):
         metadata={"help": "Enable thinking mode for Qwen3 models (adds enable_thinking=True to chat_template)"}
     )
     
+    # Training history recording
+    save_steps: list[int] = field(
+        default_factory=lambda: [0, 9, 24, 49],
+        metadata={"help": "Steps to save training history snapshots for visualization"}
+    )
+    
+    # LoRA initialization control
+    skip_lora_init: bool = field(
+        default=False,
+        metadata={"help": "Skip LoRA initialization. Use when resuming training or when adapter already exists. "
+                         "LoRA adapter should be initialized only ONCE per experiment."}
+    )
+    
     def __post_init__(self):
         """Validate configuration consistency and convert nested dicts to objects"""
         # Convert mb_spec from dict to MicroBatchSpec if needed

@@ -26,6 +26,111 @@ from areal.experimental.ttt_discover.actor import TTTDActor
 from areal.experimental.ttt_discover.dataloader import create_tttd_dataloader
 from areal.experimental.ttt_discover.sampler import create_sampler_from_config
 from areal.experimental.ttt_discover.workflow_v2 import TTTDiscoverWorkflowV2
+from areal.experimental.ttt_discover.ttt_logger import TTTTrainingLogger
+
+
+def _ensure_lora_initialized(config: TTTDPPOActorConfig, rank: int = 0) -> str:
+    """
+    Ensure initial LoRA adapter exists for vLLM to load at startup.
+    
+    This function should be called BEFORE AReaL framework initialization.
+    Only rank 0 performs the actual initialization, other ranks wait via barrier.
+    
+    Args:
+        config: Training configuration
+        rank: Current process rank (0 = main rank)
+        
+    Returns:
+        Path to LoRA adapter directory
+    """
+    import json
+    
+    # Extract lora_modules path from vllm config
+    lora_output_path = "./lora_init"
+    if hasattr(config, 'vllm') and isinstance(config.vllm, dict):
+        lora_modules_str = config.vllm.get('lora_modules', '')
+        if lora_modules_str:
+            try:
+                lora_modules = json.loads(lora_modules_str)
+                if isinstance(lora_modules, dict):
+                    lora_output_path = lora_modules.get('path', lora_output_path)
+            except json.JSONDecodeError:
+                pass
+    
+    # Convert to absolute path
+    lora_output_path = os.path.abspath(lora_output_path)
+    adapter_config_path = os.path.join(lora_output_path, "adapter_config.json")
+    
+    # Only rank 0 performs initialization
+    if rank == 0:
+        if os.path.exists(adapter_config_path):
+            logger.info(f"[LoRA Init] Adapter already exists at {lora_output_path}, skipping initialization")
+            return lora_output_path
+        
+        if not config.use_lora:
+            logger.info("[LoRA Init] LoRA is not enabled (use_lora=false), skipping initialization")
+            return lora_output_path
+        
+        logger.info("="*80)
+        logger.info("[LoRA Init] Creating initial LoRA adapter for vLLM")
+        logger.info("="*80)
+        logger.info(f"  Base model: {config.path}")
+        logger.info(f"  Output path: {lora_output_path}")
+        logger.info(f"  LoRA rank: {config.lora_rank}, alpha: {config.lora_alpha}")
+        
+        try:
+            from peft import LoraConfig, get_peft_model
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            
+            # Create parent directory
+            parent_dir = os.path.dirname(lora_output_path)
+            if parent_dir and not os.path.exists(parent_dir):
+                os.makedirs(parent_dir, exist_ok=True)
+            
+            # Load base model
+            logger.info("[LoRA Init] Loading base model...")
+            model = AutoModelForCausalLM.from_pretrained(
+                config.path,
+                torch_dtype="auto",
+                device_map="cpu",
+            )
+            
+            # Load tokenizer
+            tok_path = config.tokenizer_path or config.path
+            logger.info(f"[LoRA Init] Loading tokenizer from {tok_path}...")
+            tokenizer = AutoTokenizer.from_pretrained(tok_path)
+            
+            # Configure LoRA
+            target_modules = config.target_modules if config.target_modules else ["all-linear"]
+            target_mods = "all-linear" if target_modules == ["all-linear"] else target_modules
+            
+            lora_config = LoraConfig(
+                r=config.lora_rank,
+                lora_alpha=config.lora_alpha,
+                target_modules=target_mods,
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+            
+            # Apply LoRA
+            logger.info("[LoRA Init] Applying LoRA configuration...")
+            model = get_peft_model(model, lora_config)
+            
+            # Save
+            logger.info(f"[LoRA Init] Saving LoRA adapter to {lora_output_path}...")
+            os.makedirs(lora_output_path, exist_ok=True)
+            model.save_pretrained(lora_output_path)
+            tokenizer.save_pretrained(lora_output_path)
+            
+            logger.info(f"[LoRA Init] ✓ LoRA adapter created successfully")
+            logger.info(f"[LoRA Init] Contents: {os.listdir(lora_output_path)}")
+            logger.info("="*80)
+            
+        except Exception as e:
+            logger.error(f"[LoRA Init] Failed to create LoRA adapter: {e}")
+            raise RuntimeError(f"LoRA initialization failed: {e}") from e
+    
+    return lora_output_path
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -266,6 +371,21 @@ def main(args):
     config, _ = load_expr_config(args, TTTDPPOActorConfig)
     config: TTTDPPOActorConfig
     
+    # ============================================================
+    # Step 0: Initialize LoRA adapter (before AReaL framework)
+    # ============================================================
+    # Note: We do this early before any distributed initialization
+    # Rank 0 creates the adapter, others will wait at the barrier later
+    # 
+    # IMPORTANT: LoRA is initialized ONLY ONCE per experiment. The adapter is
+    # saved to disk and reused across training restarts. To force re-initialization,
+    # delete the existing adapter directory (e.g., ./lora_init/) first.
+    if not config.skip_lora_init and config.use_lora:
+        # At this point, we haven't initialized distributed yet
+        # So we use environment variables to determine rank
+        init_rank = int(os.environ.get('RANK', 0))
+        _ensure_lora_initialized(config, rank=init_rank)
+    
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
     
     # Create actor first to get correct dp_rank
@@ -332,6 +452,15 @@ def main(args):
     actor.initialize(None, ft_spec)
     
     # ============================================================
+    # Synchronize after LoRA initialization
+    # ============================================================
+    # Ensure all ranks wait for rank 0 to complete LoRA adapter creation
+    if dist.is_initialized() and not config.skip_lora_init and config.use_lora:
+        logger.info(f"[Rank {rank}] Waiting for LoRA initialization barrier...")
+        dist.barrier()
+        logger.info(f"[Rank {rank}] LoRA initialization barrier passed")
+    
+    # ============================================================
     # CONFIGURATION VERIFICATION for Scheme A (DP Head Only)
     # ============================================================
     if rank == 0:
@@ -368,7 +497,7 @@ def main(args):
     if dist.is_initialized():
         dist.barrier()
     
-    # Check LoRA adapter exists (same as V1)
+    # Verify LoRA adapter exists (should have been created by _ensure_lora_initialized)
     # Use absolute path based on current working directory
     import os as _os
     _original_cwd = _os.getcwd()
@@ -390,7 +519,22 @@ def main(args):
         adapter_config_path = os.path.join(lora_output_path, "adapter_config.json")
         
         if not os.path.exists(adapter_config_path):
-            raise RuntimeError(f"Initial LoRA adapter not found at {lora_output_path}")
+            error_msg = (
+                f"Initial LoRA adapter not found at {lora_output_path}\n\n"
+                f"This should have been created automatically at the start of training.\n"
+                f"Possible causes:\n"
+                f"  1. LoRA initialization failed on rank 0\n"
+                f"  2. The adapter path was changed after initialization\n"
+                f"  3. You're resuming from a different working directory\n\n"
+                f"Solutions:\n"
+                f"  - Check rank 0 logs for initialization errors\n"
+                f"  - Run prepare_lora_init.py manually before training\n"
+                f"  - Use --skip-lora-init if you have already initialized manually"
+            )
+            raise RuntimeError(error_msg)
+        
+        if rank == 0:
+            logger.info(f"[LoRA Init] Verified LoRA adapter exists at {lora_output_path}")
     
     # Weight update meta
     if config.weight_update_mode == "disk":
@@ -478,6 +622,27 @@ def main(args):
     
     max_steps = getattr(config, 'max_steps', 50)
     best_reward = float('-inf')
+    
+    # ============================================================
+    # Initialize Training History Logger
+    # ============================================================
+    save_steps = getattr(config, 'save_steps', [i for i in range(0, max_steps)])
+    # 过滤只保留在训练范围内的 steps
+    save_steps = [s for s in save_steps if start_step <= s < max_steps]
+    
+    history_logger = TTTTrainingLogger(
+        save_steps=save_steps,
+        output_dir=config.saver.fileroot,
+        is_dp_head=is_dp_head,
+        filename='training_history.pkl',
+        checkpoint_filename='training_history_checkpoint.pkl',
+        aggregate_distributed=True,
+    )
+    
+    if is_dp_head:
+        logger.info(f"[TTTLogger] Initialized with save_steps: {save_steps}")
+        logger.info(f"[TTTLogger] Output directory: {config.saver.fileroot}")
+    
     logger.info(f"Starting training from step {start_step}/{max_steps}")
     for global_step in range(start_step, max_steps):
         step_info = StepInfo(
@@ -619,6 +784,32 @@ def main(args):
         step_mean_reward = float(step_rewards.mean())
         best_reward = max(best_reward, step_max_reward)
         
+        # ============================================================
+        # Record Training History (for visualization)
+        # ============================================================
+        # 收集所有 rollouts 的 rewards（从 batch 中提取）
+        local_step_rewards = step_rewards.tolist()
+        
+        # 找到当前 step 的最佳解（如果 workflow 支持）
+        current_best_solution = None
+        if hasattr(workflow, 'get_best_solution'):
+            try:
+                current_best_solution = workflow.get_best_solution()
+            except:
+                pass
+        
+        # 记录当前 step 数据
+        history_logger.record_step(
+            step=global_step,
+            rewards=local_step_rewards,
+            best_solution=current_best_solution,
+            additional_metrics={
+                'batch_parents': batch_size,
+                'group_size': group_size,
+                'local_rollouts': local_rollouts,
+            }
+        )
+        
         # Log rollout distribution info
         logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] Rank {actor.dp_rank} rollouts: {local_rollouts}, "
                    f"batch parents: {batch_size}, group_size: {group_size}, "
@@ -694,6 +885,15 @@ def main(args):
                 f"Loss: {metrics['train/actor_loss']:.4f}, KL: {metrics['train/approx_kl']:.4f}, "
                 f"Entropy: {metrics['train/entropy']:.4f}, GradNorm: {metrics['train/grad_norm']:.4f}, LR: {metrics['train/lr']:.6f}"
             )
+        
+        # ============================================================
+        # Save Training History Checkpoint
+        # ============================================================
+        # 每个 step 后保存 checkpoint，支持中断恢复
+        if is_dp_head:
+            checkpoint_path = history_logger.save_checkpoint()
+            if checkpoint_path:
+                logger.debug(f"[TTTLogger] Saved checkpoint to {checkpoint_path}")
                 
         rollout.pause()
         
@@ -720,6 +920,32 @@ def main(args):
         logger.info(f"[Step {global_step}] Rank {actor.dp_rank} passed barrier")
         current_platform.synchronize()
         rollout.resume()
+    
+    # ============================================================
+    # Save Final Training History
+    # ============================================================
+    if is_dp_head:
+        history_path = history_logger.save(also_save_json=True)
+        if history_path:
+            logger.info(f"[TTTLogger] Final training history saved to {history_path}")
+            
+            # 打印摘要
+            summary = history_logger.get_summary()
+            logger.info(
+                f"[TTTLogger] Training Summary:\n"
+                f"  - Recorded snapshots: {summary['num_snapshots']}\n"
+                f"  - Recorded steps: {summary['recorded_steps']}\n"
+                f"  - Overall best reward: {summary['overall_best_reward']:.4f} (step {summary['overall_best_step']})\n"
+                f"  - Has Best-of-N baseline: {summary['has_best_of_n']}"
+            )
+            
+            # 提示如何生成可视化
+            logger.info(
+                f"\n[TTTLogger] To generate visualization, run:\n"
+                f"  python areal/experimental/ttt_discover/generate_plot.py \\\n"
+                f"    --history_path {history_path} \\\n"
+                f"    --benchmark_value 2.635983"
+            )
     
     # Cleanup
     workflow.shutdown()  # Shutdown code execution thread pool
