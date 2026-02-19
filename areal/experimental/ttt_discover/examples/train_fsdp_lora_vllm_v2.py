@@ -635,6 +635,11 @@ def main(args):
             # === CRITICAL: Only Rank 0 performs all updates ===
             # This ensures _T, _n, _m are computed correctly without duplication
             if rank == 0:
+                # DEBUG: Log _T before updates
+                _T_before = sampler._T
+                _n_before = len(sampler._n)
+                _m_before = len(sampler._m)
+                
                 # Step 1: Record all failed rollouts (updates _T and _n)
                 if all_failed:
                     for failed_parent in all_failed:
@@ -643,9 +648,10 @@ def main(args):
                 
                 # Step 2: Record all successful updates (updates _T, _n, _m, and adds to _states)
                 if all_children:
+                    unique_parents = len(set(p.id for p in all_parents))
+                    logger.info(f"[Rank 0][Step {global_step}] BEFORE update_states: _T={sampler._T}, unique_parents={unique_parents}, all_parents={len(all_parents)}, all_children={len(all_children)}")
                     sampler.update_states(all_children, all_parents, save=False)
-                    logger.info(f"[Rank 0][Step {global_step}] Updated sampler with {len(all_children)} children "
-                                f"from {len(set(p.id for p in all_parents))} unique parents")
+                    logger.info(f"[Rank 0][Step {global_step}] AFTER update_states: _T={sampler._T} (added {sampler._T - _T_before}), _n={len(sampler._n)} (added {len(sampler._n) - _n_before}), _m={len(sampler._m)} (added {len(sampler._m) - _m_before})")
                 
                 # Step 3: Flush to disk
                 sampler.flush(step=global_step)
