@@ -42,7 +42,7 @@ eps_clip: 0.4
 temperature: ${gconfig.temperature}
 reward_scaling: 10.0
 reward_bias: -0.5
-kl_ctl: 0.0
+kl_ctl: 0.1
 ppo_n_minibatches: 1
 recompute_logprob: true
 use_decoupled_loss: true
@@ -110,7 +110,7 @@ scheduler:
 rollout:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  max_concurrent_rollouts: 256
+  max_concurrent_rollouts: 512
   queue_size: null
   consumer_batch_size: ${sampler.batch_size}  # 与 sampler batch_size 一致
   max_head_offpolicyness: 0
@@ -123,7 +123,7 @@ rollout:
   use_lora: ${use_lora}
 
 gconfig:
-  n_samples: 16
+  n_samples: 8
   min_new_tokens: 0
   max_new_tokens: 16384      # 生成长度限制
   max_tokens: 32768          # 总长度限制（prompt + response）
