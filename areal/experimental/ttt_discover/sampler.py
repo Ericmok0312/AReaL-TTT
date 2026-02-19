@@ -525,27 +525,45 @@ class PUCTSampler(StateSampler):
         return picked
 
     def update_states(self, states: list[State], parent_states: list[State], save: bool = True, step: int | None = None):
+        """
+        Update sampler with new states from rollouts.
+        
+        NOTE: This method handles both individual and batched updates.
+        For each successful rollout:
+        - _T += 1 (total rollout counter)
+        - _n[parent] += 1 and _n[ancestors] += 1 (visit counts)
+        - _m[parent] = max(_m[parent], child_value) (max reward per parent)
+        """
         if not states:
             return
         assert len(states) == len(parent_states)
 
-        # Update PUCT stats for ALL states
+        # Track unique parents for _m update
         parent_max: dict[str, float] = {}
         parent_obj: dict[str, State] = {}
+        
+        # Process each rollout individually (matching paper's implementation)
         for child, parent in zip(states, parent_states):
             if child.value is None:
                 continue
+            
             pid = parent.id
             parent_obj[pid] = parent
+            
+            # Update _m tracking (max per parent)
             parent_max[pid] = max(parent_max.get(pid, float("-inf")), float(child.value))
-
-        for pid, y in parent_max.items():
-            self._m[pid] = max(self._m.get(pid, y), y)
-            parent = parent_obj[pid]
+            
+            # Update _n for parent and ancestors (each rollout counts separately)
             anc_ids = [pid] + [str(p["id"]) for p in (parent.parents or []) if p.get("id")]
             for aid in anc_ids:
                 self._n[aid] = self._n.get(aid, 0) + 1
+            
+            # Update _T (total rollout counter)
             self._T += 1
+        
+        # Update _m with max values for each parent
+        for pid, y in parent_max.items():
+            self._m[pid] = max(self._m.get(pid, y), y)
 
         if not states:
             return
@@ -615,6 +633,15 @@ class PUCTSampler(StateSampler):
             self._finalize_and_save(step)
 
     def record_failed_rollout(self, parent: State):
+        """
+        Record a failed rollout attempt.
+        
+        Each failed rollout counts as one expansion attempt:
+        - _T += 1 (total rollout counter)
+        - _n[parent] += 1 and _n[ancestors] += 1 (visit counts)
+        
+        Note: _m is NOT updated for failed rollouts (no valid reward)
+        """
         anc_ids = [parent.id] + [str(p["id"]) for p in (parent.parents or []) if p.get("id")]
         for aid in anc_ids:
             self._n[aid] = self._n.get(aid, 0) + 1

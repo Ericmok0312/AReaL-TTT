@@ -636,22 +636,26 @@ def main(args):
             # This ensures _T, _n, _m are computed correctly without duplication
             if rank == 0:
                 # DEBUG: Log _T before updates
-                _T_before = sampler._T
-                _n_before = len(sampler._n)
-                _m_before = len(sampler._m)
+                _T_before_total = sampler._T
                 
                 # Step 1: Record all failed rollouts (updates _T and _n)
                 if all_failed:
                     for failed_parent in all_failed:
                         sampler.record_failed_rollout(failed_parent)
-                    logger.info(f"[Rank 0][Step {global_step}] Recorded {len(all_failed)} failed rollouts")
+                    logger.info(f"[Rank 0][Step {global_step}] Recorded {len(all_failed)} failed rollouts, _T: {_T_before_total} -> {sampler._T} (+{len(all_failed)})")
+                    _T_before_total = sampler._T
                 
                 # Step 2: Record all successful updates (updates _T, _n, _m, and adds to _states)
                 if all_children:
                     unique_parents = len(set(p.id for p in all_parents))
-                    logger.info(f"[Rank 0][Step {global_step}] BEFORE update_states: _T={sampler._T}, unique_parents={unique_parents}, all_parents={len(all_parents)}, all_children={len(all_children)}")
+                    logger.info(f"[Rank 0][Step {global_step}] BEFORE update_states: _T={sampler._T}, unique_parents={unique_parents}, all_children={len(all_children)}")
                     sampler.update_states(all_children, all_parents, save=False)
-                    logger.info(f"[Rank 0][Step {global_step}] AFTER update_states: _T={sampler._T} (added {sampler._T - _T_before}), _n={len(sampler._n)} (added {len(sampler._n) - _n_before}), _m={len(sampler._m)} (added {len(sampler._m) - _m_before})")
+                    _T_added = sampler._T - _T_before_total
+                    logger.info(f"[Rank 0][Step {global_step}] AFTER update_states: _T={sampler._T} (+{_T_added} from {len(all_children)} rollouts), _n entries={len(sampler._n)}, _m entries={len(sampler._m)}")
+                    
+                    # Verify: _T should increase by number of successful children
+                    if _T_added != len(all_children):
+                        logger.warning(f"[Rank 0][Step {global_step}] _T mismatch: expected +{len(all_children)}, got +{_T_added}")
                 
                 # Step 3: Flush to disk
                 sampler.flush(step=global_step)
