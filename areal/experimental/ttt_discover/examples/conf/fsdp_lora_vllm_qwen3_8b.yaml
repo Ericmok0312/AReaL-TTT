@@ -10,6 +10,7 @@ seed: 1
 enable_offload: false
 
 max_steps: 5
+save_steps: [0, 1, 2, 3, 4]  # 记录所有 5 个 steps 用于可视化
 total_train_epochs: 10
 
 path: Qwen/Qwen3-8B
