@@ -511,6 +511,25 @@ def main(args):
     )
     start_step = recover_info.last_step_info.next().global_step if recover_info else 0
     
+    # ============================================================
+    # Reset PUCT stats if resuming from checkpoint (prevents _T inflation)
+    # ============================================================
+    if recover_info and getattr(config, 'reset_puct_stats_on_resume', True):
+        if rank == 0 and hasattr(sampler, '_T'):
+            old_T = sampler._T
+            old_n_len = len(sampler._n)
+            old_m_len = len(sampler._m)
+            sampler._T = 0
+            sampler._n = {}
+            sampler._m = {}
+            logger.info("="*80)
+            logger.info(f"[PUCT Reset] Reset PUCT statistics on resume (reset_puct_stats_on_resume=true)")
+            logger.info(f"[PUCT Reset] _T: {old_T} -> 0")
+            logger.info(f"[PUCT Reset] _n entries: {old_n_len} -> 0")
+            logger.info(f"[PUCT Reset] _m entries: {old_m_len} -> 0")
+            logger.info("="*80)
+        # Note: _states are preserved for state reuse, only exploration stats are reset
+    
     max_steps = getattr(config, 'max_steps', 50)
     best_reward = float('-inf')
     

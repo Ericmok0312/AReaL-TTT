@@ -281,6 +281,15 @@ class TTTDPPOActorConfig(PPOActorConfig):
                          "because vLLM loads it at startup before the training script runs."}
     )
     
+    # PUCT stats reset on resume
+    reset_puct_stats_on_resume: bool = field(
+        default=True,
+        metadata={"help": "Reset PUCT statistics (_T, _n, _m) when resuming from checkpoint. "
+                         "If True, exploration stats start from 0 (recommended for new experiments). "
+                         "If False, stats continue from saved values (for continuing same experiment). "
+                         "Default is True to avoid _T inflation across different training runs."}
+    )
+    
     def __post_init__(self):
         """Validate configuration consistency and convert nested dicts to objects"""
         # Convert mb_spec from dict to MicroBatchSpec if needed

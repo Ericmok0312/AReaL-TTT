@@ -5,10 +5,13 @@ TTT-Discover 训练动态可视化脚本
 从保存的 training_history.pkl 文件生成论文风格的 KDE 分布图
 
 Usage:
-    # 基本用法（Circle Packing 任务）
+    # 基本用法（自动检测所有可用的 steps）
     python generate_plot.py --history_path ./outputs/training_history.pkl
     
-    # 指定特定步骤
+    # 限制最多显示的 step 数量（均匀采样）
+    python generate_plot.py --history_path ./outputs/training_history.pkl --max_steps 5
+    
+    # 指定特定 steps（覆盖自动检测）
     python generate_plot.py --history_path ./outputs/training_history.pkl --steps 0 9 24 49
     
     # 指定 benchmark 值（不同任务）
@@ -43,8 +46,11 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Circle Packing (default)
+  # Auto-detect all steps from history (default behavior)
   python generate_plot.py --history_path ./outputs/training_history.pkl
+  
+  # Limit to 5 evenly-spaced steps
+  python generate_plot.py --history_path ./outputs/training_history.pkl --max_steps 5
   
   # TriMul Runtime (smaller is better)
   python generate_plot.py --history_path ./outputs/training_history.pkl \\
@@ -52,7 +58,7 @@ Examples:
       --xlabel "Runtime μs (lower is better ←)" \\
       --higher_is_better False
   
-  # Custom steps and output
+  # Custom steps (overrides auto-detection)
   python generate_plot.py --history_path ./outputs/training_history.pkl \\
       --steps 0 10 20 30 40 \\
       --output_path ./figures/training_progress.png
@@ -70,8 +76,16 @@ Examples:
         '--steps',
         type=int,
         nargs='+',
-        default=[0, 9, 24, 49],
-        help='Steps to visualize (default: 0 9 24 49)'
+        default=None,  # None means auto-detect from history
+        help='Steps to visualize (default: auto-detect all available steps)'
+    )
+    
+    parser.add_argument(
+        '--max_steps',
+        type=int,
+        default=None,
+        help='Maximum number of steps to plot. If history has more steps, '
+             'evenly sample this many steps (default: plot all available steps)'
     )
     
     parser.add_argument(
@@ -153,6 +167,46 @@ def load_history(path: str) -> dict:
     return data
 
 
+def get_available_steps(history_dict: dict) -> list[int]:
+    """
+    从历史数据中提取所有可用的 step 编号
+    
+    Returns:
+        按顺序排列的 step 列表
+    """
+    history = history_dict.get('history', history_dict)
+    available_steps = set()
+    
+    for key in history.keys():
+        if key.startswith('step_'):
+            try:
+                step = int(key.split('_')[1])
+                available_steps.add(step)
+            except (IndexError, ValueError):
+                pass
+    
+    return sorted(available_steps)
+
+
+def select_steps_evenly(all_steps: list[int], max_steps: int) -> list[int]:
+    """
+    从所有 steps 中均匀选择指定数量的 steps
+    
+    Args:
+        all_steps: 所有可用的 steps
+        max_steps: 最多选择多少个
+        
+    Returns:
+        均匀采样的 steps 列表
+    """
+    if len(all_steps) <= max_steps:
+        return all_steps
+    
+    # 均匀采样：包括第一个和最后一个，中间均匀分布
+    indices = [int(i * (len(all_steps) - 1) / (max_steps - 1)) for i in range(max_steps)]
+    return [all_steps[i] for i in indices]
+
+
 def main():
     args = parse_args()
     
@@ -166,42 +220,53 @@ def main():
     print(f"Loading history from {history_path}...")
     history_dict = load_history(str(history_path))
     
+    # 提取所有可用的 steps
+    available_steps = get_available_steps(history_dict)
+    
+    if not available_steps:
+        print("Error: No step data found in history file")
+        print("Available keys:", list(history_dict.get('history', history_dict).keys())[:10])
+        sys.exit(1)
+    
     # 打印摘要信息
     metadata = history_dict.get('metadata', {})
     print("\n" + "="*60)
     print("Training History Summary")
     print("="*60)
-    print(f"Number of snapshots: {metadata.get('num_snapshots', 'N/A')}")
-    print(f"Save steps: {metadata.get('save_steps', 'N/A')}")
+    print(f"Total steps recorded: {len(available_steps)}")
+    print(f"Step range: {min(available_steps)} - {max(available_steps)}")
+    print(f"Available steps: {available_steps}")
     print(f"Overall best reward: {metadata.get('overall_best_reward', 'N/A')}")
     print(f"Overall best step: {metadata.get('overall_best_step', 'N/A')}")
     print(f"Has Best-of-N baseline: {'best_of_n' in history_dict}")
     print("="*60 + "\n")
     
-    # 过滤只存在于历史中的 steps
-    history = history_dict.get('history', history_dict)
-    available_steps = set()
-    for key in history.keys():
-        if key.startswith('step_'):
-            try:
-                step = int(key.split('_')[1])
-                available_steps.add(step)
-            except (IndexError, ValueError):
-                pass
-    
-    requested_steps = set(args.steps)
-    valid_steps = sorted(requested_steps & available_steps)
-    missing_steps = sorted(requested_steps - available_steps)
-    
-    if missing_steps:
-        print(f"Warning: Steps not found in history and will be skipped: {missing_steps}")
-    
-    if not valid_steps:
-        print(f"Error: None of the requested steps {args.steps} found in history")
-        print(f"Available steps: {sorted(available_steps)}")
-        sys.exit(1)
-    
-    print(f"Generating plot for steps: {valid_steps}")
+    # 确定要绘制的 steps
+    if args.steps is not None:
+        # 用户指定了 steps
+        requested_steps = set(args.steps)
+        valid_steps = sorted(requested_steps & set(available_steps))
+        missing_steps = sorted(requested_steps - set(available_steps))
+        
+        if missing_steps:
+            print(f"Warning: Steps not found in history and will be skipped: {missing_steps}")
+        
+        if not valid_steps:
+            print(f"Error: None of the requested steps {args.steps} found in history")
+            print(f"Available steps: {available_steps}")
+            sys.exit(1)
+        
+        print(f"Using user-specified steps: {valid_steps}")
+    else:
+        # 自动检测 steps
+        if args.max_steps is not None and len(available_steps) > args.max_steps:
+            valid_steps = select_steps_evenly(available_steps, args.max_steps)
+            print(f"Auto-selected {len(valid_steps)} steps from {len(available_steps)} available:")
+            print(f"  All available: {available_steps}")
+            print(f"  Selected: {valid_steps}")
+        else:
+            valid_steps = available_steps
+            print(f"Using all {len(valid_steps)} available steps: {valid_steps}")
     
     # 创建可视化器
     visualizer = TTTVisualizer(higher_is_better=args.higher_is_better)
@@ -235,7 +300,7 @@ def main():
             output_path=str(progression_path),
             dpi=args.dpi,
         )
-        print(f"Saved to: {progression_path.absolute()}")
+        print(f"Saved to: {progression_output.absolute()}")
     
     print("\n" + "="*60)
     print("Visualization complete!")

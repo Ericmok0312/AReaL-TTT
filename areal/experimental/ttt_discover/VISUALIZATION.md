@@ -48,11 +48,16 @@ save_steps = [0, 9, 24, 49]  # 第29行附近
 训练完成后，运行以下命令生成图表：
 
 ```bash
-# 基本用法（Circle Packing 任务）
+# 基本用法（自动检测所有可用的 steps）
 python areal/experimental/ttt_discover/generate_plot.py \
     --history_path ./outputs/training_history.pkl
 
-# 指定特定 steps
+# 限制最多显示的 step 数量（均匀采样）
+python areal/experimental/ttt_discover/generate_plot.py \
+    --history_path ./outputs/training_history.pkl \
+    --max_steps 5
+
+# 指定特定 steps（覆盖自动检测）
 python areal/experimental/ttt_discover/generate_plot.py \
     --history_path ./outputs/training_history.pkl \
     --steps 0 9 24 49
@@ -67,6 +72,11 @@ python areal/experimental/ttt_discover/generate_plot.py \
     --history_path ./outputs/training_history.pkl \
     --show_progression
 ```
+
+**Step 选择逻辑**：
+- 默认：自动检测历史数据中所有可用的 steps 并全部绘制
+- `--max_steps N`：如果历史中有超过 N 个 steps，均匀采样 N 个 steps
+- `--steps x y z`：显式指定要绘制的 steps（覆盖自动检测）
 
 ### 3. 不同任务的配置示例
 

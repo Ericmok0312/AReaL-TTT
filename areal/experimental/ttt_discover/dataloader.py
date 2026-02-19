@@ -186,8 +186,14 @@ class TTTDiscoverDataLoader(StatefulDataLoader):
         })
         return state
         
-    def load_state_dict(self, state_dict: dict[str, Any]):
-        """Restore DataLoader iteration and PUCT sampler state."""
+    def load_state_dict(self, state_dict: dict[str, Any], reset_puct_stats: bool = True):
+        """Restore DataLoader iteration and PUCT sampler state.
+        
+        Args:
+            state_dict: State dict to load
+            reset_puct_stats: If True, reset PUCT stats (_T, _n, _m) to 0 after loading.
+                            This prevents _T inflation when starting a new experiment.
+        """
         super().load_state_dict(state_dict)
         
         if 'sampler_step' in state_dict:
@@ -196,6 +202,16 @@ class TTTDiscoverDataLoader(StatefulDataLoader):
                 self.sampler.reload_from_step(step)
             elif hasattr(self.sampler, '_load'):
                 self.sampler._load(step)
+            
+            # Reset PUCT stats if requested (prevents _T inflation across experiments)
+            if reset_puct_stats and hasattr(self.sampler, '_T'):
+                import logging
+                logger = logging.getLogger("TTTDiscoverDataLoader")
+                old_T = self.sampler._T
+                self.sampler._T = 0
+                self.sampler._n = {}
+                self.sampler._m = {}
+                logger.info(f"[PUCT Stats] Reset _T from {old_T} to 0, cleared _n and _m")
                 
     def __len__(self) -> int:
         """Return large number for training loop compatibility."""
