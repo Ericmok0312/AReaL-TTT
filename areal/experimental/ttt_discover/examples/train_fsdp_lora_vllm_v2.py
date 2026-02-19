@@ -586,7 +586,7 @@ def main(args):
         from areal.experimental.ttt_discover.envs import CirclePackingEnv
         env = CirclePackingEnv(
             n_item=getattr(config.sampler, 'n_item', 26),
-            eval_timeout=60,
+            eval_timeout=300,
             log_dir=config.saver.fileroot,
         )
     # ... other env types ...
