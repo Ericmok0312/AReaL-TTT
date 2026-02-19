@@ -159,6 +159,10 @@ vllm:
   enforce_eager: false        # 如果需要性能可设为 false，但 true 更稳定
   enable_lora: ${use_lora}
   max_lora_rank: 32
+  # CRITICAL: This path must exist BEFORE training starts because vLLM loads
+  # the LoRA adapter at startup. Run prepare_lora_init.py first to create it:
+  #   python areal/experimental/ttt_discover/examples/prepare_lora_init.py \
+  #     --config-path conf/fsdp_lora_vllm_qwen3_8b.yaml
   lora_modules: '{"name": "${gconfig.lora_name}", "path": "./lora_init_qwen3_8b", "base_model_name": "${path}"}'
 
 sampler:

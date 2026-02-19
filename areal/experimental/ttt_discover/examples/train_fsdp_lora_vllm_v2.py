@@ -28,110 +28,6 @@ from areal.experimental.ttt_discover.sampler import create_sampler_from_config
 from areal.experimental.ttt_discover.workflow_v2 import TTTDiscoverWorkflowV2
 from areal.experimental.ttt_discover.ttt_logger import TTTTrainingLogger
 
-
-def _ensure_lora_initialized(config: TTTDPPOActorConfig, rank: int = 0) -> str:
-    """
-    Ensure initial LoRA adapter exists for vLLM to load at startup.
-    
-    This function should be called BEFORE AReaL framework initialization.
-    Only rank 0 performs the actual initialization, other ranks wait via barrier.
-    
-    Args:
-        config: Training configuration
-        rank: Current process rank (0 = main rank)
-        
-    Returns:
-        Path to LoRA adapter directory
-    """
-    import json
-    
-    # Extract lora_modules path from vllm config
-    lora_output_path = "./lora_init"
-    if hasattr(config, 'vllm') and isinstance(config.vllm, dict):
-        lora_modules_str = config.vllm.get('lora_modules', '')
-        if lora_modules_str:
-            try:
-                lora_modules = json.loads(lora_modules_str)
-                if isinstance(lora_modules, dict):
-                    lora_output_path = lora_modules.get('path', lora_output_path)
-            except json.JSONDecodeError:
-                pass
-    
-    # Convert to absolute path
-    lora_output_path = os.path.abspath(lora_output_path)
-    adapter_config_path = os.path.join(lora_output_path, "adapter_config.json")
-    
-    # Only rank 0 performs initialization
-    if rank == 0:
-        if os.path.exists(adapter_config_path):
-            logger.info(f"[LoRA Init] Adapter already exists at {lora_output_path}, skipping initialization")
-            return lora_output_path
-        
-        if not config.use_lora:
-            logger.info("[LoRA Init] LoRA is not enabled (use_lora=false), skipping initialization")
-            return lora_output_path
-        
-        logger.info("="*80)
-        logger.info("[LoRA Init] Creating initial LoRA adapter for vLLM")
-        logger.info("="*80)
-        logger.info(f"  Base model: {config.path}")
-        logger.info(f"  Output path: {lora_output_path}")
-        logger.info(f"  LoRA rank: {config.lora_rank}, alpha: {config.lora_alpha}")
-        
-        try:
-            from peft import LoraConfig, get_peft_model
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-            
-            # Create parent directory
-            parent_dir = os.path.dirname(lora_output_path)
-            if parent_dir and not os.path.exists(parent_dir):
-                os.makedirs(parent_dir, exist_ok=True)
-            
-            # Load base model
-            logger.info("[LoRA Init] Loading base model...")
-            model = AutoModelForCausalLM.from_pretrained(
-                config.path,
-                torch_dtype="auto",
-                device_map="cpu",
-            )
-            
-            # Load tokenizer
-            tok_path = config.tokenizer_path or config.path
-            logger.info(f"[LoRA Init] Loading tokenizer from {tok_path}...")
-            tokenizer = AutoTokenizer.from_pretrained(tok_path)
-            
-            # Configure LoRA
-            target_modules = config.target_modules if config.target_modules else ["all-linear"]
-            target_mods = "all-linear" if target_modules == ["all-linear"] else target_modules
-            
-            lora_config = LoraConfig(
-                r=config.lora_rank,
-                lora_alpha=config.lora_alpha,
-                target_modules=target_mods,
-                bias="none",
-                task_type="CAUSAL_LM",
-            )
-            
-            # Apply LoRA
-            logger.info("[LoRA Init] Applying LoRA configuration...")
-            model = get_peft_model(model, lora_config)
-            
-            # Save
-            logger.info(f"[LoRA Init] Saving LoRA adapter to {lora_output_path}...")
-            os.makedirs(lora_output_path, exist_ok=True)
-            model.save_pretrained(lora_output_path)
-            tokenizer.save_pretrained(lora_output_path)
-            
-            logger.info(f"[LoRA Init] ✓ LoRA adapter created successfully")
-            logger.info(f"[LoRA Init] Contents: {os.listdir(lora_output_path)}")
-            logger.info("="*80)
-            
-        except Exception as e:
-            logger.error(f"[LoRA Init] Failed to create LoRA adapter: {e}")
-            raise RuntimeError(f"LoRA initialization failed: {e}") from e
-    
-    return lora_output_path
-
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
@@ -372,19 +268,17 @@ def main(args):
     config: TTTDPPOActorConfig
     
     # ============================================================
-    # Step 0: Initialize LoRA adapter (before AReaL framework)
+    # NOTE: LoRA Initialization
     # ============================================================
-    # Note: We do this early before any distributed initialization
-    # Rank 0 creates the adapter, others will wait at the barrier later
-    # 
-    # IMPORTANT: LoRA is initialized ONLY ONCE per experiment. The adapter is
-    # saved to disk and reused across training restarts. To force re-initialization,
-    # delete the existing adapter directory (e.g., ./lora_init/) first.
-    if not config.skip_lora_init and config.use_lora:
-        # At this point, we haven't initialized distributed yet
-        # So we use environment variables to determine rank
-        init_rank = int(os.environ.get('RANK', 0))
-        _ensure_lora_initialized(config, rank=init_rank)
+    # LoRA adapter must be created BEFORE training starts using:
+    #   python prepare_lora_init.py --config-path <your_config.yaml>
+    #
+    # This is required because vLLM loads the LoRA adapter at startup,
+    # before the training script runs. The training script only verifies
+    # that the adapter exists, it does not create it.
+    #
+    # If you see an error about missing LoRA adapter, run the preparation
+    # script first, or use --skip-lora-check if you have already initialized.
     
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
     
@@ -452,15 +346,6 @@ def main(args):
     actor.initialize(None, ft_spec)
     
     # ============================================================
-    # Synchronize after LoRA initialization
-    # ============================================================
-    # Ensure all ranks wait for rank 0 to complete LoRA adapter creation
-    if dist.is_initialized() and not config.skip_lora_init and config.use_lora:
-        logger.info(f"[Rank {rank}] Waiting for LoRA initialization barrier...")
-        dist.barrier()
-        logger.info(f"[Rank {rank}] LoRA initialization barrier passed")
-    
-    # ============================================================
     # CONFIGURATION VERIFICATION for Scheme A (DP Head Only)
     # ============================================================
     if rank == 0:
@@ -497,12 +382,17 @@ def main(args):
     if dist.is_initialized():
         dist.barrier()
     
-    # Verify LoRA adapter exists (should have been created by _ensure_lora_initialized)
-    # Use absolute path based on current working directory
+    # ============================================================
+    # Verify LoRA adapter exists
+    # ============================================================
+    # IMPORTANT: The LoRA adapter must be created BEFORE training by running:
+    #   python prepare_lora_init.py --config-path <your_config.yaml>
+    #
+    # This is because vLLM loads the adapter at startup, before this script runs.
     import os as _os
     _original_cwd = _os.getcwd()
     
-    if config.use_lora:
+    if config.use_lora and not config.skip_lora_check:
         import json
         lora_output_path = "./lora_init"
         if hasattr(config, 'vllm') and isinstance(config.vllm, dict):
@@ -520,21 +410,22 @@ def main(args):
         
         if not os.path.exists(adapter_config_path):
             error_msg = (
-                f"Initial LoRA adapter not found at {lora_output_path}\n\n"
-                f"This should have been created automatically at the start of training.\n"
-                f"Possible causes:\n"
-                f"  1. LoRA initialization failed on rank 0\n"
-                f"  2. The adapter path was changed after initialization\n"
-                f"  3. You're resuming from a different working directory\n\n"
-                f"Solutions:\n"
-                f"  - Check rank 0 logs for initialization errors\n"
-                f"  - Run prepare_lora_init.py manually before training\n"
-                f"  - Use --skip-lora-init if you have already initialized manually"
+                f"\n{'='*80}\n"
+                f"ERROR: Initial LoRA adapter not found at {lora_output_path}\n"
+                f"{'='*80}\n\n"
+                f"The LoRA adapter must be created BEFORE starting training because\n"
+                f"vLLM loads it at startup (before this training script runs).\n\n"
+                f"To fix this, run the preparation script first:\n"
+                f"  python areal/experimental/ttt_discover/examples/prepare_lora_init.py \\\n"
+                f"    --config-path <your_config.yaml>\n\n"
+                f"If you have already initialized the LoRA adapter elsewhere, you can\n"
+                f"skip this check by adding '+skip_lora_check=true' to your command.\n"
+                f"{'='*80}\n"
             )
             raise RuntimeError(error_msg)
         
         if rank == 0:
-            logger.info(f"[LoRA Init] Verified LoRA adapter exists at {lora_output_path}")
+            logger.info(f"[LoRA Check] ✓ LoRA adapter verified at {lora_output_path}")
     
     # Weight update meta
     if config.weight_update_mode == "disk":

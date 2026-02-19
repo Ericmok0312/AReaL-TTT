@@ -272,11 +272,13 @@ class TTTDPPOActorConfig(PPOActorConfig):
         metadata={"help": "Steps to save training history snapshots for visualization"}
     )
     
-    # LoRA initialization control
-    skip_lora_init: bool = field(
+    # LoRA check control
+    skip_lora_check: bool = field(
         default=False,
-        metadata={"help": "Skip LoRA initialization. Use when resuming training or when adapter already exists. "
-                         "LoRA adapter should be initialized only ONCE per experiment."}
+        metadata={"help": "Skip LoRA adapter existence check at training start. "
+                         "Use only if you are certain the adapter exists at the configured path. "
+                         "Note: The LoRA adapter must be created BEFORE training using prepare_lora_init.py "
+                         "because vLLM loads it at startup before the training script runs."}
     )
     
     def __post_init__(self):
