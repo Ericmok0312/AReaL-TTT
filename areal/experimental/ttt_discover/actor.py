@@ -2,11 +2,12 @@
 from areal.engine.fsdp_engine import FSDPEngine
 from areal.utils.perf_tracer import trace_perf
 from areal.utils.functional import reward_overlong_penalty
-
+from areal.experimental.ttt_discover.sampler import StateSampler
 from typing import TYPE_CHECKING, Any, List
 import torch
 import math
 import numpy as np
+import torch.distributed as dist
 
 if TYPE_CHECKING:
     from areal.api.scheduler_api import Scheduler
@@ -27,7 +28,7 @@ class TTTDActor(FSDPEngine):
         
         super().__init__(config)
         self.actor = PPOActor(config, self)
-        
+
         # Validate configuration type
         if not hasattr(config, 'is_tttd_config'):
             import warnings
@@ -39,6 +40,7 @@ class TTTDActor(FSDPEngine):
             )
         
         self.config = config
+        self.sampler = None
     
     @trace_perf("tttd_ppo_actor.compute_logp", category="compute")
     @torch.no_grad()
@@ -296,3 +298,176 @@ class TTTDActor(FSDPEngine):
     def as_controller(cls, config: "TTTDPPOActorConfig", scheduler: "Scheduler"):
         from areal.trainer.ppo.actor import PPOActorController
         return PPOActorController(train_engine=cls, config=config, scheduler=scheduler)
+
+
+    def connect_sampler(self, sampler: StateSampler):
+        """
+        Connects State Sampler to actor, allows actor to control sampler synchronization.
+        """
+        if self.sampler is not None:
+            self.logger.warning(
+                "Sampler is already connected to actor. Overwriting existing sampler connection." 
+            )
+
+        self.sampler = sampler
+        dist.barrier(group=self.cpu_group)  # Ensure all actors have connected their samplers before proceeding()
+
+
+    def sync_sampler(self, local_children=None, local_parents=None, local_failed=None, step=None):
+        """
+        Synchronize sampler state across all data parallel ranks.
+        
+        Three-phase pipeline: Gather -> Distribute (rank0 compute) -> Synchronize.
+        """
+        if self.sampler is None:
+            raise RuntimeError("No sampler connected. Call connect_sampler() first.")
+        
+        # Short-circuit for single-node
+        if not dist.is_initialized() or self.data_parallel_world_size <= 1:
+            self._apply_updates_locally(local_children, local_parents, local_failed, step)
+            return
+        
+        # Phase 1: Gather updates from all ranks to rank 0
+        gathered = self._gather_updates(local_children, local_parents, local_failed, step)
+        
+        # Phase 2: Rank 0 applies updates and prepares state package
+        state_package = self._apply_updates(gathered, step)
+        
+        # Phase 3: Broadcast and apply synchronized state to all ranks
+        self._synchronize_state(state_package, step)
+
+
+    def _apply_updates_locally(self, children, parents, failed, step):
+        """Apply updates without distributed communication (single-node shortcut)."""
+        with self.sampler._lock:
+            for f in (failed or []):
+                self.sampler.record_failed_rollout(f)
+            if children:
+                self.sampler.update_states(children, parents, save=False)
+            if step is not None:
+                self.sampler._current_step = step
+                self.sampler._save(step)
+
+
+    def _gather_updates(self, local_children, local_parents, local_failed, step):
+        """
+        Phase 1: Gather all local updates to rank 0.
+        
+        Returns:
+            Tuple (all_children, all_parents, all_failed) on rank 0, 
+            or ([], [], []) on other ranks.
+        """
+        from areal.experimental.ttt_discover.state import state_from_dict
+        
+        # Serialize
+        c_dicts = [s.to_dict() for s in (local_children or [])]
+        p_dicts = [s.to_dict() for s in (local_parents or [])]
+        f_dicts = [s.to_dict() for s in (local_failed or [])]
+        
+        # Prepare containers (only rank 0 needs them)
+        world_size = self.data_parallel_world_size
+        is_rank0 = self.dp_rank == 0
+        
+        all_c = [None] * world_size if is_rank0 else None
+        all_p = [None] * world_size if is_rank0 else None
+        all_f = [None] * world_size if is_rank0 else None
+        
+        try:
+            dist.gather_object(c_dicts, all_c, dst=0, group=self.data_parallel_group)
+            dist.gather_object(p_dicts, all_p, dst=0, group=self.data_parallel_group)
+            dist.gather_object(f_dicts, all_f, dst=0, group=self.data_parallel_group)
+        except Exception as e:
+            self.logger.error(f"[Rank {self.dp_rank}] Gather failed at step {step}: {e}")
+            raise
+        
+        if not is_rank0:
+            return [], [], []
+        
+        # Deserialize on rank 0
+        children = [state_from_dict(d) for lst in all_c if lst for d in lst]
+        parents = [state_from_dict(d) for lst in all_p if lst for d in lst]
+        failed = [state_from_dict(d) for lst in all_f if lst for d in lst]
+        
+        if step:
+            self.logger.info(
+                f"[Step {step}] Gathered from {world_size} ranks: "
+                f"children={len(children)}, parents={len(set(p.id for p in parents))}, failed={len(failed)}"
+            )
+        return children, parents, failed
+
+
+    def _apply_updates(self, gathered_data, step):
+        """
+        Phase 2: Rank 0 applies updates and prepares state for broadcast.
+        
+        Returns:
+            State package (dict) if rank 0, else None.
+        """
+        if self.dp_rank != 0:
+            return None
+        
+        children, parents, failed = gathered_data
+        
+        with self.sampler._lock:
+            # Record failures
+            if failed:
+                _T_before = self.sampler._T
+                for f in failed:
+                    self.sampler.record_failed_rollout(f)
+                if step:
+                    self.logger.info(f"[Step {step}] Recorded {len(failed)} failures, _T: {_T_before} -> {self.sampler._T}")
+            
+            # Record successes
+            if children:
+                _T_before = self.sampler._T
+                self.sampler.update_states(children, parents, save=False)
+                if step:
+                    self.logger.info(
+                        f"[Step {step}] Updated states: _T={self.sampler._T} (+{self.sampler._T - _T_before}), "
+                        f"total_states={len(self.sampler._states)}"
+                    )
+            
+            # Save and package
+            if step:
+                self.sampler.flush(step)
+            
+            return {
+                'states': [s.to_dict() for s in self.sampler._states],
+                'initial_states': [s.to_dict() for s in self.sampler._initial_states],
+                'T': self.sampler._T,
+                'n': self.sampler._n,
+                'm': self.sampler._m,
+                'current_step': self.sampler._current_step,
+                'last_sampled_states': [s.to_dict() for s in self.sampler._last_sampled_states],
+                'last_sampled_indices': self.sampler._last_sampled_indices,
+                'last_puct_stats': self.sampler._last_puct_stats,
+                'last_scale': self.sampler._last_scale,
+            }
+
+
+    def _synchronize_state(self, state_package, step):
+        """
+        Phase 3: Broadcast state from rank 0 and apply to all ranks.
+        """
+        from areal.experimental.ttt_discover.state import state_from_dict
+        
+        # Broadcast
+        package = [state_package] if self.dp_rank == 0 else [None]
+        try:
+            dist.broadcast_object_list(package, src=0, group=self.data_parallel_group)
+        except Exception as e:
+            self.logger.error(f"[Rank {self.dp_rank}] Broadcast failed at step {step}: {e}")
+            raise
+        
+        # Apply (non-rank-0 only, rank 0 already has the state)
+        if self.dp_rank != 0:
+            data = package[0]
+            self.sampler.deserialize_full_state(data)
+            
+            if step:
+                self.logger.info(
+                    f"[Rank {self.dp_rank}][Step {step}] Synchronized: "
+                    f"T={self.sampler._T}, states={len(self.sampler._states)}"
+                )
+        
+        

@@ -95,174 +95,6 @@ def _format_sampler_summary(sampler, title: str = "Sampler State") -> str:
     return "\n".join(lines)
 
 
-def gather_states_and_failures_across_ranks(actor, local_children, local_parents, local_failed):
-    """
-    Gather states and failed parents from all data parallel ranks.
-    
-    IMPORTANT: This is a collective operation that MUST be called by ALL ranks.
-    
-    Args:
-        actor: TTTDActor with data parallel info
-        local_children: List of child states from this rank
-        local_parents: List of parent states from this rank
-        local_failed: List of failed parent states from this rank
-        
-    Returns:
-        (all_children, all_parents, all_failed) on ALL ranks
-    """
-    if not dist.is_initialized() or actor.data_parallel_world_size <= 1:
-        return local_children, local_parents, local_failed
-    
-    from areal.experimental.ttt_discover.state import state_from_dict
-    
-    # Serialize states to dicts for communication
-    children_dicts = [s.to_dict() for s in local_children]
-    parents_dicts = [s.to_dict() for s in local_parents]
-    failed_dicts = [s.to_dict() for s in local_failed]
-    
-    # Gather from all ranks
-    all_children_dicts = [None] * actor.data_parallel_world_size
-    all_parents_dicts = [None] * actor.data_parallel_world_size
-    all_failed_dicts = [None] * actor.data_parallel_world_size
-    
-    dist.all_gather_object(all_children_dicts, children_dicts, group=actor.data_parallel_group)
-    dist.all_gather_object(all_parents_dicts, parents_dicts, group=actor.data_parallel_group)
-    dist.all_gather_object(all_failed_dicts, failed_dicts, group=actor.data_parallel_group)
-    
-    # Deserialize and combine all states on ALL ranks
-    all_children = []
-    all_parents = []
-    all_failed = []
-    
-    for rank_children, rank_parents, rank_failed in zip(all_children_dicts, all_parents_dicts, all_failed_dicts):
-        if rank_children:
-            all_children.extend([state_from_dict(d) for d in rank_children])
-        if rank_parents:
-            all_parents.extend([state_from_dict(d) for d in rank_parents])
-        if rank_failed:
-            all_failed.extend([state_from_dict(d) for d in rank_failed])
-    
-    return all_children, all_parents, all_failed
-
-
-def sync_sampler_state_from_rank0(actor, sampler):
-    """
-    Synchronize the complete sampler state from rank 0 to all other ranks.
-    
-    This ensures all ranks have identical sampler state after rank 0 performs
-    all the updates (failed rollouts + successful updates).
-    
-    Args:
-        actor: TTTDActor with data parallel info
-        sampler: PUCTSampler instance
-    """
-    if not dist.is_initialized() or actor.data_parallel_world_size <= 1:
-        return
-    
-    from areal.experimental.ttt_discover.state import state_from_dict
-    
-    # Prepare state data on rank 0
-    if actor.dp_rank == 0:
-        state_data = {
-            'states': [s.to_dict() for s in sampler._states],
-            'initial_states': [s.to_dict() for s in sampler._initial_states],
-            'T': sampler._T,
-            'n': sampler._n,
-            'm': sampler._m,
-            'current_step': sampler._current_step,
-            'last_sampled_states': [s.to_dict() for s in sampler._last_sampled_states],
-            'last_sampled_indices': sampler._last_sampled_indices,
-            'last_puct_stats': sampler._last_puct_stats,
-            'last_scale': sampler._last_scale,
-        }
-        objects_to_broadcast = [state_data]
-    else:
-        objects_to_broadcast = [None]
-    
-    # Broadcast from rank 0 to all ranks
-    # Note: broadcast_object_list modifies the list in-place on all ranks
-    dist.broadcast_object_list(objects_to_broadcast, src=0, group=actor.data_parallel_group)
-    
-    # Extract the received data
-    state_data = objects_to_broadcast[0]
-    
-    # Non-rank-0 ranks update their sampler state
-    if actor.dp_rank != 0:
-        sampler._states = [state_from_dict(d) for d in state_data['states']]
-        sampler._initial_states = [state_from_dict(d) for d in state_data['initial_states']]
-        sampler._T = state_data['T']
-        sampler._n = state_data['n']
-        sampler._m = state_data['m']
-        sampler._current_step = state_data['current_step']
-        sampler._last_sampled_states = [state_from_dict(d) for d in state_data['last_sampled_states']]
-        sampler._last_sampled_indices = state_data['last_sampled_indices']
-        sampler._last_puct_stats = state_data['last_puct_stats']
-        sampler._last_scale = state_data['last_scale']
-        
-        logger.info(f"[Rank {actor.dp_rank}] Received sampler state from rank 0: "
-                    f"T={sampler._T}, n_entries={len(sampler._n)}, m_entries={len(sampler._m)}, "
-                    f"states={len(sampler._states)}")
-
-
-def gather_states_across_ranks(actor, local_children, local_parents):
-    """
-    Gather states from all data parallel ranks using all_gather_object.
-    
-    IMPORTANT: This is a collective operation that MUST be called by ALL ranks
-    in the data_parallel_group. If any rank skips this call, it will cause deadlock.
-    
-    Args:
-        actor: TTTDActor with data parallel info
-        local_children: List of child states from this rank
-        local_parents: List of parent states from this rank
-        
-    Returns:
-        (all_children, all_parents) on ALL ranks (not just rank 0)
-    """
-    if not dist.is_initialized() or actor.data_parallel_world_size <= 1:
-        return local_children, local_parents
-    
-    # Serialize states to dicts for communication
-    children_dicts = [s.to_dict() for s in local_children]
-    parents_dicts = [s.to_dict() for s in local_parents]
-    
-    # Gather from all ranks using all_gather_object (handles NCCL automatically)
-    all_children_dicts = [None] * actor.data_parallel_world_size
-    all_parents_dicts = [None] * actor.data_parallel_world_size
-    
-    # CRITICAL: all_gather_object is collective - ALL ranks must call this
-    dist.all_gather_object(all_children_dicts, children_dicts, group=actor.data_parallel_group)
-    dist.all_gather_object(all_parents_dicts, parents_dicts, group=actor.data_parallel_group)
-    
-    # Deserialize and combine all states on ALL ranks
-    # (Previously this only happened on rank 0, causing inconsistency)
-    from areal.experimental.ttt_discover.state import state_from_dict
-    
-    all_children = []
-    all_parents = []
-    
-    for rank_children, rank_parents in zip(all_children_dicts, all_parents_dicts):
-        if rank_children:  # Skip empty lists
-            all_children.extend([state_from_dict(d) for d in rank_children])
-        if rank_parents:
-            all_parents.extend([state_from_dict(d) for d in rank_parents])
-    
-    return all_children, all_parents
-
-
-def _concat_trajectories(trajectories: list[dict]) -> dict:
-    """
-    Concatenate a list of trajectory dicts into a single batch dict.
-    This is a simpler alternative to redistribute_trajectories that doesn't
-    require all_gather from all DP ranks (avoiding the deadlock issue).
-    """
-    if not trajectories:
-        return {}
-    
-    from areal.utils.data import concat_padded_tensors
-    return concat_padded_tensors(trajectories)
-
-
 def main(args):
     config, _ = load_expr_config(args, TTTDPPOActorConfig)
     config: TTTDPPOActorConfig
@@ -270,16 +102,6 @@ def main(args):
     # ============================================================
     # NOTE: LoRA Initialization
     # ============================================================
-    # LoRA adapter must be created BEFORE training starts using:
-    #   python prepare_lora_init.py --config-path <your_config.yaml>
-    #
-    # This is required because vLLM loads the LoRA adapter at startup,
-    # before the training script runs. The training script only verifies
-    # that the adapter exists, it does not create it.
-    #
-    # If you see an error about missing LoRA adapter, run the preparation
-    # script first, or use --skip-lora-check if you have already initialized.
-    
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
     
     # Create actor first to get correct dp_rank
@@ -302,7 +124,7 @@ def main(args):
         env_type="custom",
     )
     
-    batch_size = config.sampler.batch_size  # Total parents per step (e.g., 8)
+    batch_size = config.sampler.batch_size  # Total group per step (e.g., 8)
     group_size = config.gconfig.n_samples   # Rollouts per parent (e.g., 64)
     
     # dp_rank == 0 is the DP head
@@ -319,7 +141,6 @@ def main(args):
         logger.info(f"================================")
     
     # Distributed Sampler Mode: Each rank samples its own shard
-    # States are synchronized across ranks after each step via gather_states_across_ranks
     use_dp_shard = world_size > 1
     if rank == 0:
         logger.info(f"=== DataLoader Configuration ===")
@@ -371,11 +192,6 @@ def main(args):
                 f"WARNING: tp_size={parallel_strategy.tp_size}. With dp=1, tp>1 "
                 f"is expected to distribute work across GPUs."
             )
-        if not rank == 0:
-            logger.error(
-                f"ERROR: Rank {actor.dp_rank} is not DP head but only_dp_head=True. "
-                f"This rank will not produce any data!"
-            )
         logger.info("==========================================")
     
     # Barrier to ensure all ranks see the verification
@@ -385,13 +201,6 @@ def main(args):
     # ============================================================
     # Verify LoRA adapter exists
     # ============================================================
-    # IMPORTANT: The LoRA adapter must be created BEFORE training by running:
-    #   python prepare_lora_init.py --config-path <your_config.yaml>
-    #
-    # This is because vLLM loads the adapter at startup, before this script runs.
-    import os as _os
-    _original_cwd = _os.getcwd()
-    
     if config.use_lora and not config.skip_lora_check:
         import json
         lora_output_path = "./lora_init"
@@ -448,17 +257,14 @@ def main(args):
         )
     
     rollout = RemotevLLMEngine(config.rollout)
-    eval_rollout = RemotevLLMEngine(deepcopy(config.rollout))
     rollout.initialize(train_data_parallel_size=parallel_strategy.dp_size)
-    eval_rollout.config.max_head_offpolicyness = int(1e12)
-    eval_rollout.initialize()
     
     actor.connect_engine(rollout, weight_update_meta)
-    
+    actor.connect_sampler(sampler)  # Connect sampler to actor for internal use and synchronization
+
     ref = None
     if config.kl_ctl > 0 and config.ref is not None:
         # Reference model uses DP-only strategy to avoid TP + torch.compile issues
-        # This is necessary because TP with torch.compile causes sharding errors
         from areal.api.alloc_mode import ParallelStrategy
         ref_parallel_strategy = ParallelStrategy(
             tensor_parallel_size=1,      # No TP for ref
@@ -480,7 +286,6 @@ def main(args):
             eval_timeout=300,
             log_dir=config.saver.fileroot,
         )
-    # ... other env types ...
     else:
         raise ValueError(f"Unknown env_type: {env_type}")
     
@@ -528,7 +333,6 @@ def main(args):
             logger.info(f"[PUCT Reset] _n entries: {old_n_len} -> 0")
             logger.info(f"[PUCT Reset] _m entries: {old_m_len} -> 0")
             logger.info("="*80)
-        # Note: _states are preserved for state reuse, only exploration stats are reset
     
     max_steps = getattr(config, 'max_steps', 50)
     best_reward = float('-inf')
@@ -574,131 +378,47 @@ def main(args):
                 should_accept_fn=lambda sample: True,
             )
         
-        # Flush sampler updates (commits all buffered updates from this batch)
-        # NOTE: gather_states_and_failures_across_ranks is a collective operation - ALL ranks must call it
+        # ============================================================
+        # Sampler Synchronization (Unified Interface)
+        # ============================================================
+        # NOTE: This is a collective operation that MUST be called by ALL ranks.
+        # It performs: 1) Gather updates -> 2) Rank 0 applies -> 3) Broadcast to all
         with stats_tracker.record_timing("sampler_update"):
             # Get local updates from this rank (children, parents, and failed parents)
             local_children, local_parents, local_failed = workflow.get_pending_updates_sync(clear=True)
             
-            # === PRE-SYNC LOGGING (All Ranks) ===
-            # Log local pending updates before aggregation
-            logger.info(f"\n{'='*80}")
-            logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] PRE-SYNC: Local Pending Updates")
-            logger.info(f"{'='*80}")
-            logger.info(f"Local children count: {len(local_children)}")
-            logger.info(f"Local parents count: {len(local_parents)}")
-            logger.info(f"Local failed count: {len(local_failed)}")
-            if local_children:
-                logger.info(_format_state_table(local_children, "Local Children States"))
-            if local_parents:
-                logger.info(_format_state_table(local_parents, "Local Parent States"))
-            if local_failed:
-                logger.info(_format_state_table(local_failed, "Local Failed Parents"))
+            # Optional: Log local update counts (high-level)
+            logger.info(f"[Step {global_step}][Rank {actor.dp_rank}] Local updates: "
+                       f"children={len(local_children)}, parents={len(local_parents)}, failed={len(local_failed)}")
             
-            # Log current sampler state BEFORE sync
-            logger.info(_format_sampler_summary(sampler, f"[Rank {actor.dp_rank}][Step {global_step}] PRE-SYNC Sampler State"))
-            
-            # Aggregate updates from all ranks using all_gather_object
-            # CRITICAL: This must be called by ALL ranks in the DP group
-            all_children, all_parents, all_failed = gather_states_and_failures_across_ranks(
-                actor, local_children, local_parents, local_failed
+            # Unified synchronization through actor.sync_sampler()
+            # This replaces the old: gather_states_and_failures_across_ranks + manual update + sync_sampler_state_from_rank0
+            actor.sync_sampler(
+                local_children=local_children,
+                local_parents=local_parents,
+                local_failed=local_failed,
+                step=global_step
             )
             
-            # Log aggregated updates from all ranks
-            logger.info(f"\n{'='*80}")
-            logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] AGGREGATED Updates (All Ranks)")
-            logger.info(f"{'='*80}")
-            logger.info(f"Total children from all ranks: {len(all_children)}")
-            logger.info(f"Total parents from all ranks: {len(all_parents)}")
-            logger.info(f"Total failed from all ranks: {len(all_failed)}")
-            
-            # Group by source rank for clarity
-            if all_children:
-                parent_counts = {}
-                for child, parent in zip(all_children, all_parents):
-                    pid = parent.id
-                    if pid not in parent_counts:
-                        parent_counts[pid] = {"count": 0, "values": [], "timestep": parent.timestep}
-                    parent_counts[pid]["count"] += 1
-                    parent_counts[pid]["values"].append(child.value if child.value is not None else float('-inf'))
-                
-                logger.info(f"\nAggregated updates by parent:")
-                logger.info(f"{'Parent ID':<36} {'Children':<10} {'Timestep':<10} {'Min Value':<12} {'Max Value':<12}")
-                logger.info("-" * 90)
-                for pid, info in sorted(parent_counts.items()):
-                    min_val = min(info["values"]) if info["values"] else "N/A"
-                    max_val = max(info["values"]) if info["values"] else "N/A"
-                    min_str = f"{min_val:.4f}" if isinstance(min_val, float) else str(min_val)
-                    max_str = f"{max_val:.4f}" if isinstance(max_val, float) else str(max_val)
-                    logger.info(f"{pid:<36} {info['count']:<10} {info['timestep']:<10} {min_str:<12} {max_str:<12}")
-            
-            # === CRITICAL: Only Rank 0 performs all updates ===
-            # This ensures _T, _n, _m are computed correctly without duplication
-            if rank == 0:
-                # DEBUG: Log _T before updates
-                _T_before_total = sampler._T
-                
-                # Step 1: Record all failed rollouts (updates _T and _n)
-                if all_failed:
-                    for failed_parent in all_failed:
-                        sampler.record_failed_rollout(failed_parent)
-                    logger.info(f"[Rank 0][Step {global_step}] Recorded {len(all_failed)} failed rollouts, _T: {_T_before_total} -> {sampler._T} (+{len(all_failed)})")
-                    _T_before_total = sampler._T
-                
-                # Step 2: Record all successful updates (updates _T, _n, _m, and adds to _states)
-                if all_children:
-                    unique_parents = len(set(p.id for p in all_parents))
-                    logger.info(f"[Rank 0][Step {global_step}] BEFORE update_states: _T={sampler._T}, unique_parents={unique_parents}, all_children={len(all_children)}")
-                    sampler.update_states(all_children, all_parents, save=False)
-                    _T_added = sampler._T - _T_before_total
-                    logger.info(f"[Rank 0][Step {global_step}] AFTER update_states: _T={sampler._T} (+{_T_added} from {len(all_children)} rollouts), _n entries={len(sampler._n)}, _m entries={len(sampler._m)}")
-                    
-                    # Verify: _T should increase by number of successful children
-                    if _T_added != len(all_children):
-                        logger.warning(f"[Rank 0][Step {global_step}] _T mismatch: expected +{len(all_children)}, got +{_T_added}")
-                
-                # Step 3: Flush to disk
-                sampler.flush(step=global_step)
-            
-            # === CRITICAL: Synchronize complete sampler state from rank 0 to all ranks ===
-            # This ensures all ranks have identical sampler state for the next sampling
-            sync_sampler_state_from_rank0(actor, sampler)
-            
-            # === POST-SYNC LOGGING (All Ranks) ===
-            logger.info(_format_sampler_summary(sampler, f"[Rank {actor.dp_rank}][Step {global_step}] POST-SYNC Sampler State"))
-            
-            # Cross-rank consistency check
+            # Optional: Post-sync verification (lightweight checksum)
+            # Note: Detailed logging is now handled inside actor.sync_sampler()
             if dist.is_initialized() and actor.data_parallel_world_size > 1:
-                # Get sampler state hash for comparison across ranks
-                # Use deterministic hash (hash() is randomized in Python)
                 import hashlib
                 if hasattr(sampler, '_states'):
                     state_ids = sorted([s.id for s in sampler._states])
-                    # Use MD5 for deterministic hash
                     hash_input = ','.join(state_ids).encode('utf-8')
                     state_checksum = int(hashlib.md5(hash_input).hexdigest(), 16) & 0xFFFFFFFF
                 else:
                     state_checksum = 0
                 
-                # Gather checksums from all ranks
                 all_checksums = [0] * actor.data_parallel_world_size
                 dist.all_gather_object(all_checksums, state_checksum, group=actor.data_parallel_group)
                 
-                logger.info(f"\n{'='*80}")
-                logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] Cross-Rank Consistency Check")
-                logger.info(f"{'='*80}")
-                logger.info(f"Sampler state checksums across ranks: {all_checksums}")
-                if len(set(all_checksums)) == 1:
-                    logger.info("✓ All ranks have CONSISTENT sampler state")
-                else:
-                    logger.warning("✗ Ranks have INCONSISTENT sampler state! Checksums differ!")
-                    for r, cs in enumerate(all_checksums):
-                        status = "OK" if cs == all_checksums[0] else "DIFF"
-                        logger.warning(f"  Rank {r}: checksum={cs} [{status}]")
-                logger.info(f"{'='*80}\n")
+                if len(set(all_checksums)) != 1:
+                    logger.warning(f"[Step {global_step}] Cross-rank sampler state INCONSISTENT!")
         
         # Log rewards and actual rollout count
-        local_rollouts = batch["rewards"].shape[0]  # Rollouts on this rank
+        local_rollouts = batch["rewards"].shape[0]
         step_rewards = batch["rewards"].cpu().numpy()
         step_max_reward = float(step_rewards.max())
         step_mean_reward = float(step_rewards.mean())
@@ -707,10 +427,8 @@ def main(args):
         # ============================================================
         # Record Training History (for visualization)
         # ============================================================
-        # 收集所有 rollouts 的 rewards（从 batch 中提取）
         local_step_rewards = step_rewards.tolist()
         
-        # 找到当前 step 的最佳解（如果 workflow 支持）
         current_best_solution = None
         if hasattr(workflow, 'get_best_solution'):
             try:
@@ -718,7 +436,6 @@ def main(args):
             except:
                 pass
         
-        # 记录当前 step 数据
         history_logger.record_step(
             step=global_step,
             rewards=local_step_rewards,
@@ -730,10 +447,8 @@ def main(args):
             }
         )
         
-        # Log rollout distribution info
-        logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] Rank {actor.dp_rank} rollouts: {local_rollouts}, "
-                   f"batch parents: {batch_size}, group_size: {group_size}, "
-                   f"expected total: {batch_size * group_size}")
+        logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] Rollouts: {local_rollouts}, "
+                   f"batch parents: {batch_size}, group_size: {group_size}")
         
         # Collect metrics for stats_logger
         metrics = {
@@ -772,8 +487,6 @@ def main(args):
         # Add training stats
         stats = actor.export_stats()
         
-        # AReaL stats use 'ppo_actor/' prefix with scope paths
-        # Correct keys: 'ppo_actor/update/actor_loss/avg', 'ppo_actor/update/entropy/avg', etc.
         metrics.update({
             "train/entropy": stats.get('ppo_actor/update/entropy/avg', 0.0),
             "train/actor_loss": stats.get('ppo_actor/update/actor_loss/avg', 0.0),
@@ -784,7 +497,6 @@ def main(args):
             "train/clip_ratio": stats.get('ppo_actor/update/clip_ratio/avg', 0.0),
         })
         
-        # Also add advantage stats from ppo_actor scope
         metrics.update({
             "train/advantages/avg": stats.get('ppo_actor/advantages/avg', 0.0),
             "train/advantages/max": stats.get('ppo_actor/advantages/max', 0.0),
@@ -799,17 +511,13 @@ def main(args):
                 global_step=global_step,
                 data=metrics,
             )
-            # Print comprehensive training summary
             logger.info(
                 f"[Step {global_step}] Reward: max={step_max_reward:.4f}, mean={step_mean_reward:.4f}, best={best_reward:.4f} | "
                 f"Loss: {metrics['train/actor_loss']:.4f}, KL: {metrics['train/approx_kl']:.4f}, "
                 f"Entropy: {metrics['train/entropy']:.4f}, GradNorm: {metrics['train/grad_norm']:.4f}, LR: {metrics['train/lr']:.6f}"
             )
         
-        # ============================================================
         # Save Training History Checkpoint
-        # ============================================================
-        # 每个 step 后保存 checkpoint，支持中断恢复
         if is_dp_head:
             checkpoint_path = history_logger.save_checkpoint()
             if checkpoint_path:
@@ -818,13 +526,11 @@ def main(args):
         rollout.pause()
         
         with stats_tracker.record_timing("update_weights"):
-            logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] Updating weights with meta: {weight_update_meta}")
+            logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] Updating weights...")
             actor.update_weights(weight_update_meta)
             actor.set_version(global_step + 1)
             rollout.set_version(global_step + 1)
-            eval_rollout.set_version(global_step + 1)
         
-        logger.info(f"[Step {global_step}] Weights updated, now saving checkpoint")
         with stats_tracker.record_timing("save"):
             saver.save(actor, step_info.epoch, step_info.epoch_step, global_step, tokenizer=tokenizer)
         
@@ -834,10 +540,7 @@ def main(args):
                 train_dataloader, tokenizer=tokenizer,
             )
         
-        # DEBUG: Log before barrier
-        logger.info(f"[Step {global_step}] Rank {actor.dp_rank} (global rank {dist.get_rank() if dist.is_initialized() else 'N/A'}) reaching barrier")
         dist.barrier(group=actor.cpu_group)
-        logger.info(f"[Step {global_step}] Rank {actor.dp_rank} passed barrier")
         current_platform.synchronize()
         rollout.resume()
     
@@ -849,7 +552,6 @@ def main(args):
         if history_path:
             logger.info(f"[TTTLogger] Final training history saved to {history_path}")
             
-            # 打印摘要
             summary = history_logger.get_summary()
             logger.info(
                 f"[TTTLogger] Training Summary:\n"
@@ -859,7 +561,6 @@ def main(args):
                 f"  - Has Best-of-N baseline: {summary['has_best_of_n']}"
             )
             
-            # 提示如何生成可视化
             logger.info(
                 f"\n[TTTLogger] To generate visualization, run:\n"
                 f"  python areal/experimental/ttt_discover/generate_plot.py \\\n"
@@ -868,9 +569,8 @@ def main(args):
             )
     
     # Cleanup
-    workflow.shutdown()  # Shutdown code execution thread pool
+    workflow.shutdown()
     stats_logger.close()
-    eval_rollout.destroy()
     rollout.destroy()
     if ref is not None:
         ref.destroy()

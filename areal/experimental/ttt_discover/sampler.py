@@ -704,6 +704,26 @@ class PUCTSampler(StateSampler):
             obs_len = len(state.observation) if state.observation else 0
             rows.append((idx, state.timestep, state.value, 0, parent_val, constr_len, obs_len, n, Q, P, bonus, score))
         return columns, rows
+    
+    def deserialize_full_state(self, state_data: dict) -> None:
+        """
+        Atomically replace entire sampler state from serialized data.
+        Used for distributed synchronization (rank > 0 receiving from rank 0).
+        """
+        with self._lock:
+            from areal.experimental.ttt_discover.state import state_from_dict
+            
+            self._states = [state_from_dict(d) for d in state_data['states']]
+            self._initial_states = [state_from_dict(d) for d in state_data['initial_states']]
+            self._T = state_data['T']
+            self._n = state_data['n']
+            self._m = state_data['m']
+            self._current_step = state_data['current_step']
+            self._last_sampled_states = [state_from_dict(d) for d in state_data['last_sampled_states']]
+            self._last_sampled_indices = state_data['last_sampled_indices']
+            self._last_puct_stats = state_data['last_puct_stats']
+            self._last_scale = state_data['last_scale']
+
 
 
 def create_sampler(
