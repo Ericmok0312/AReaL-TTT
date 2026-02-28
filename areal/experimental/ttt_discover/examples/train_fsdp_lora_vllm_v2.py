@@ -99,9 +99,6 @@ def main(args):
     config, _ = load_expr_config(args, TTTDPPOActorConfig)
     config: TTTDPPOActorConfig
     
-    # ============================================================
-    # NOTE: LoRA Initialization
-    # ============================================================
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
     
     # Create actor first to get correct dp_rank
@@ -111,17 +108,16 @@ def main(args):
     assert parallel_strategy is not None
     actor.create_process_group(parallel_strategy=parallel_strategy)
     
-    # Use AReaL's dp_rank instead of environment variable RANK
     rank = actor.dp_rank
     world_size = actor.data_parallel_world_size
     
     seeding.set_random_seed(config.seed, key=f"trainer{rank}")
     
-    # Create sampler first (before workflow)
+    # Create sampler
     sampler = create_sampler_from_config(
         config=config.sampler,
         log_path=config.saver.fileroot,
-        env_type="custom",
+        env_type=config.sampler.env_type if hasattr(config.sampler, 'env_type') else 'cp',
     )
     
     batch_size = config.sampler.batch_size  # Total group per step (e.g., 8)
@@ -131,7 +127,7 @@ def main(args):
     is_dp_head = rank == 0
     
     # DEBUG: Log distributed configuration
-    if rank == 0:
+    if is_dp_head:
         logger.info(f"=== Distributed Configuration ===")
         logger.info(f"DP world size: {world_size}")
         logger.info(f"Sampler batch_size: {batch_size}")
@@ -142,7 +138,7 @@ def main(args):
     
     # Distributed Sampler Mode: Each rank samples its own shard
     use_dp_shard = world_size > 1
-    if rank == 0:
+    if is_dp_head:
         logger.info(f"=== DataLoader Configuration ===")
         logger.info(f"use_dp_head_only: {not use_dp_shard}")
         logger.info(f"world_size: {world_size}")
@@ -155,7 +151,6 @@ def main(args):
         rank=rank,                    # DP rank
         world_size=world_size,        # DP world size
         batch_size=batch_size,        # Global batch size
-        only_dp_head=False,           # Use distributed sharding (each rank samples its own shard)
     )
     
     ft_spec = FinetuneSpec(
@@ -169,7 +164,7 @@ def main(args):
     # ============================================================
     # CONFIGURATION VERIFICATION for Scheme A (DP Head Only)
     # ============================================================
-    if rank == 0:
+    if is_dp_head:
         logger.info("=== Scheme A Configuration Verification ===")
         logger.info(f"Allocation mode: {config.allocation_mode}")
         logger.info(f"Parallel Strategy: {parallel_strategy}")
@@ -178,7 +173,7 @@ def main(args):
         logger.info(f"  - PP size: {parallel_strategy.pp_size}")
         logger.info(f"Actor DP rank: {actor.dp_rank}")
         logger.info(f"Actor DP world size: {actor.data_parallel_world_size}")
-        logger.info(f"Is DP head: {rank == 0}")
+        logger.info(f"Is DP head: {is_dp_head}")
         
         # Verify Scheme A requirements
         if parallel_strategy.dp_size != 1:
@@ -233,7 +228,7 @@ def main(args):
             )
             raise RuntimeError(error_msg)
         
-        if rank == 0:
+        if is_dp_head:
             logger.info(f"[LoRA Check] ✓ LoRA adapter verified at {lora_output_path}")
     
     # Weight update meta
@@ -298,7 +293,7 @@ def main(args):
     # Create V2 workflow - inject sampler directly!
     workflow = TTTDiscoverWorkflowV2(
         env=env,
-        sampler=sampler,  # 直接注入
+        sampler=sampler,
         gconfig=config.gconfig,
         tokenizer=tokenizer,
         enable_thinking=config.enable_thinking,
@@ -320,7 +315,7 @@ def main(args):
     # Reset PUCT stats if resuming from checkpoint (prevents _T inflation)
     # ============================================================
     if recover_info and getattr(config, 'reset_puct_stats_on_resume', True):
-        if rank == 0 and hasattr(sampler, '_T'):
+        if is_dp_head and hasattr(sampler, '_T'):
             old_T = sampler._T
             old_n_len = len(sampler._n)
             old_m_len = len(sampler._m)
@@ -341,7 +336,6 @@ def main(args):
     # Initialize Training History Logger
     # ============================================================
     save_steps = getattr(config, 'save_steps', [i for i in range(0, max_steps)])
-    # 过滤只保留在训练范围内的 steps
     save_steps = [s for s in save_steps if start_step <= s < max_steps]
     
     history_logger = TTTTrainingLogger(
@@ -367,7 +361,7 @@ def main(args):
         )
         
         # Reset workflow buffers (clears any stale pending updates)
-        workflow.reset_sync()
+        workflow.reset()
         
         # Rollout - workflow updates sampler internally!
         with stats_tracker.record_timing("rollout"):
@@ -385,7 +379,7 @@ def main(args):
         # It performs: 1) Gather updates -> 2) Rank 0 applies -> 3) Broadcast to all
         with stats_tracker.record_timing("sampler_update"):
             # Get local updates from this rank (children, parents, and failed parents)
-            local_children, local_parents, local_failed = workflow.get_pending_updates_sync(clear=True)
+            local_children, local_parents, local_failed = workflow.get_pending_updates(clear=True)
             
             # Optional: Log local update counts (high-level)
             logger.info(f"[Step {global_step}][Rank {actor.dp_rank}] Local updates: "
@@ -432,6 +426,7 @@ def main(args):
         current_best_solution = None
         if hasattr(workflow, 'get_best_solution'):
             try:
+                # TODO: should let sampler to do this job
                 current_best_solution = workflow.get_best_solution()
             except:
                 pass
@@ -504,7 +499,7 @@ def main(args):
         })
         
         # Log to stats_logger (wandb/swanlab/tensorboard)
-        if rank == 0:
+        if is_dp_head:
             stats_logger.commit(
                 epoch=step_info.epoch,
                 step=step_info.epoch_step,

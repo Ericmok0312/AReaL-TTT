@@ -66,7 +66,6 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         max_code_workers: int = 16,  # Max concurrent code executions
     ):
         self.env = env
-        self.sampler = sampler
         self.auto_flush = auto_flush
         
         # Initialize tokenizer
@@ -304,7 +303,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 )
             
             # Create child state and buffer sampler update (thread-safe)
-            if result.is_valid and self.sampler is not None:
+            if result.is_valid:
                 # Success: save child state for future sampling
                 try:
                     child = self.env.create_state(
@@ -326,7 +325,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                         
                 except Exception as e:
                     logger.warning(f"Failed to create child state: {e}")
-            elif not result.is_valid and self.sampler is not None:
+            elif not result.is_valid:
                 # Failure: cache failed parent for delayed update (will be synced across ranks)
                 try:
                     async with self._pending_lock:
@@ -362,82 +361,15 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 error_msg=str(e),
             )
 
-    async def get_pending_updates(self, clear: bool = True) -> tuple[list, list, list]:
-        """
-        Get pending sampler updates without applying them.
-        
-        This is used for distributed training to gather updates from all ranks
-        before applying them centrally on rank 0.
-        
-        Args:
-            clear: If True, clear the pending buffers after copying
-            
-        Returns:
-            Tuple of (children_states, parent_states, failed_parents)
-        """
-        async with self._pending_lock:
-            children = self._pending_children.copy()
-            parents = self._pending_parents.copy()
-            failed = self._failed_parents.copy()
-            
-            if clear:
-                self._pending_children.clear()
-                self._pending_parents.clear()
-                self._failed_parents.clear()
-                self._parent_stats.clear()
-        
-        return children, parents, failed
-
-    async def flush(self, save: bool = False, step: int | None = None) -> dict[str, Any]:
-        """
-        Commit all pending sampler updates.
-        
-        This should be called after prepare_batch completes.
-        
-        Args:
-            save: Whether to save sampler state to disk
-            step: Current training step (for saving)
-            
-        Returns:
-            Stats dict with update counts
-        """
-        if self.sampler is None:
-            return {"updated": 0}
-        
-        children, parents = await self.get_pending_updates(clear=True)
-        
-        if not children:
-            return {"updated": 0}
-        
-        # Update sampler (PUCTSampler handles top-k internally)
-        self.sampler.update_states(children, parents, save=save, step=step)
-        
-        # Log stats
-        num_parents = len(set(p.id for p in parents))
-        logger.info(f"Flushed {len(children)} children from {num_parents} parents to sampler")
-        
-        return {
-            "updated": len(children),
-            "num_parents": num_parents,
-        }
-
-    async def reset(self):
-        """Reset internal buffers (call at start of each step)."""
-        async with self._pending_lock:
-            self._pending_children.clear()
-            self._pending_parents.clear()
-            self._failed_parents.clear()
-            self._parent_stats.clear()
-
-    def reset_sync(self):
-        """Synchronous version of reset()."""
+    def reset(self):
+        """Clear the internal buffers for pending updates. Should be called at the start of each batch."""
         self._pending_children.clear()
         self._pending_parents.clear()
         self._failed_parents.clear()
         self._parent_stats.clear()
 
-    def get_pending_updates_sync(self, clear: bool = True) -> tuple[list, list, list]:
-        """Synchronous version of get_pending_updates()."""
+    def get_pending_updates(self, clear: bool = True) -> tuple[list, list, list]:
+        """Return the buffered pending updates (children, parents, failed_parents) for this batch."""
         children = self._pending_children.copy()
         parents = self._pending_parents.copy()
         failed = self._failed_parents.copy()
@@ -450,31 +382,6 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         
         return children, parents, failed
 
-    def record_failed_rollout_sync(self, parent: "State"):
-        """
-        Synchronously record a failed rollout for a parent.
-        This should be called by rank 0 after gathering failed parents from all ranks.
-        
-        Args:
-            parent: The parent state that produced a failed rollout
-        """
-        if self.sampler is not None and hasattr(self.sampler, 'record_failed_rollout'):
-            self.sampler.record_failed_rollout(parent)
-    
-    # Backward compatibility - these are no-ops in V2
-    def init_batch_metadata(self):
-        """No-op in V2. Use reset_sync() instead."""
-        self.reset_sync()
-        return []
-    
-    def reset_batch_metadata(self):
-        """No-op in V2. Use reset_sync() instead."""
-        pass
-    
-    @property
-    def _batch_metadata(self):
-        """Backward compatibility - returns empty list. V2 uses internal buffering."""
-        return []
     
     def shutdown(self):
         """Shutdown the thread pool executor to release resources."""
