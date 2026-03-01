@@ -9,9 +9,9 @@ is_tttd_config: true
 seed: 1
 enable_offload: false
 
-max_steps: 10
-save_steps: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]  # 记录所有 10 个 steps 用于可视化
-total_train_epochs: 10
+max_steps: 2
+save_steps: [0, 1]  # 记录所有 10 个 steps 用于可视化
+total_train_epochs: 2
 
 path: Qwen/Qwen3-8B
 enable_thinking: true
@@ -97,7 +97,7 @@ tokenizer_path: ${path}
 cluster:
   n_nodes: 1
   n_gpus_per_node: 8
-  fileroot: ./outputs
+  fileroot: ./outputs2
   name_resolve:
     type: nfs
     nfs_record_root: /tmp/areal/name_resolve
@@ -123,7 +123,7 @@ rollout:
   use_lora: ${use_lora}
 
 gconfig:
-  n_samples: 64
+  n_samples: 4
   min_new_tokens: 0
   max_new_tokens: 32768      # 生成长度限制（与 max_tokens 一致，实际可用 = 32768 - prompt_length）
   max_tokens: 32768          # 总长度限制（prompt + response）

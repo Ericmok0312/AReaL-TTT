@@ -82,7 +82,7 @@ class TTTTrainingLogger:
         
         # 当前最佳解（跨所有 steps）
         self.overall_best_reward: float = float('-inf')
-        self.overall_best_solution: Optional[str] = None
+        self.overall_best_solution: Optional[dict] = None
         self.overall_best_step: int = -1
         
         # 尝试从 checkpoint 恢复
@@ -151,7 +151,7 @@ class TTTTrainingLogger:
         self,
         step: int,
         rewards: list[float],
-        best_solution: Optional[str] = None,
+        best_solution: Optional[dict] = None,
         additional_metrics: Optional[dict] = None,
     ) -> bool:
         """
@@ -160,7 +160,7 @@ class TTTTrainingLogger:
         Args:
             step: 当前 step 编号
             rewards: 当前 step 的所有 rollout rewards（当前 rank）
-            best_solution: 当前 step 的最佳解（可选）
+            best_solution: 当前 step 的最佳解（可选字典，包含 code, value, observation, construction 等）
             additional_metrics: 额外指标（可选）
             
         Returns:
@@ -217,7 +217,7 @@ class TTTTrainingLogger:
     def record_best_of_n(
         self,
         rewards: list[float],
-        best_solution: Optional[str] = None,
+        best_solution: Optional[dict] = None,
         metadata: Optional[dict] = None,
     ) -> None:
         """
@@ -225,7 +225,7 @@ class TTTTrainingLogger:
         
         Args:
             rewards: Best-of-N 采样的所有 rewards
-            best_solution: Best-of-N 的最佳解
+            best_solution: Best-of-N 的最佳解（字典，包含 code, value, observation, construction 等）
             metadata: 额外元数据（如 n_samples, model_name 等）
         """
         # 聚合分布式数据

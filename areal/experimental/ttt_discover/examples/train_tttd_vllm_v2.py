@@ -293,7 +293,6 @@ def main(args):
     # Create V2 workflow - inject sampler directly!
     workflow = TTTDiscoverWorkflowV2(
         env=env,
-        sampler=sampler,
         gconfig=config.gconfig,
         tokenizer=tokenizer,
         enable_thinking=config.enable_thinking,
@@ -423,13 +422,13 @@ def main(args):
         # ============================================================
         local_step_rewards = step_rewards.tolist()
         
+        # Get best solution from sampler (rank 0 only)
         current_best_solution = None
-        if hasattr(workflow, 'get_best_solution'):
+        if is_dp_head and hasattr(sampler, 'get_best_solution'):
             try:
-                # TODO: should let sampler to do this job
-                current_best_solution = workflow.get_best_solution()
-            except:
-                pass
+                current_best_solution = sampler.get_best_solution()
+            except Exception as e:
+                logger.warning(f"Failed to get best solution from sampler: {e}")
         
         history_logger.record_step(
             step=global_step,

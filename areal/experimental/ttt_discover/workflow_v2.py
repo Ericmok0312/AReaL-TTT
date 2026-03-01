@@ -21,7 +21,6 @@ Usage:
 """
 
 import asyncio
-import concurrent.futures
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -34,6 +33,7 @@ from areal.api.engine_api import InferenceEngine
 from areal.api.io_struct import ModelRequest, ModelResponse
 from areal.api.workflow_api import RolloutWorkflow
 from areal.utils import logging, stats_tracker
+from areal.utils.concurrent import get_executor
 from areal.utils.perf_tracer import atrace_session_phase, trace_session
 
 from .envs.env import BaseEnv, EnvResult
@@ -58,7 +58,6 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
     def __init__(
         self,
         env: BaseEnv,
-        sampler: "StateSampler | None",  # 直接注入 sampler
         gconfig: GenerationHyperparameters,
         tokenizer: PreTrainedTokenizerFast | str,
         enable_thinking: bool = False,
@@ -78,14 +77,8 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         self.gconfig = gconfig.new_with_stop_and_pad_token_ids(self.tokenizer)
         self.enable_thinking = enable_thinking
         
-        # Thread pool for running sync env.execute in background.
-        self._code_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=max_code_workers,
-            thread_name_prefix="tttd_code_exec"
-        )
-        
-        # Semaphore limits concurrent code execution to prevent ThreadPool exhaustion.
-        # Must be <= max_code_workers to ensure we never overwhelm the pool.
+        # Semaphore limits concurrent code execution to prevent overwhelming the shared thread pool.
+        # This protects both this workflow and other AReaL components using get_executor().
         self._code_semaphore = asyncio.Semaphore(max_code_workers)
         
         # Async-safe buffer for pending updates (GroupedRolloutWorkflow uses asyncio.gather)
@@ -194,9 +187,10 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 env_timeout = getattr(self.env, 'eval_timeout', 60)
                 asyncio_timeout = env_timeout + 5.0
                 try:
+                    # Use AReaL's global shared executor instead of creating our own
                     result = await asyncio.wait_for(
                         loop.run_in_executor(
-                            self._code_executor,
+                            get_executor(),  # Reuse AReaL's global thread pool
                             self.env.execute,
                             code,
                             state
@@ -384,14 +378,13 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
 
     
     def shutdown(self):
-        """Shutdown the thread pool executor to release resources."""
-        if hasattr(self, '_code_executor') and self._code_executor:
-            self._code_executor.shutdown(wait=False)
-            logger.info("Code execution ThreadPoolExecutor shut down")
+        """Cleanup resources.
+        
+        Note: We no longer manage our own thread pool. AReaL's global executor
+        (via get_executor()) is automatically cleaned up at process exit via atexit.
+        """
+        pass
     
     def __del__(self):
-        """Destructor to ensure executor is cleaned up."""
-        try:
-            self.shutdown()
-        except Exception:
-            pass
+        """Destructor for compatibility."""
+        pass

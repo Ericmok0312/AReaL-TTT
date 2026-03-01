@@ -47,6 +47,49 @@ class StateSampler(ABC):
     def flush(self, step: int | None = None):
         """Force save current state to disk."""
         pass
+
+    @abstractmethod
+    def get_best_solution(self) -> dict | None:
+        """Return the best state (highest value) in the sampler as a dictionary.
+        
+        Returns:
+            Dictionary containing the best state's information (code, value, 
+            observation, construction, etc.), or None if no states available.
+        """
+        pass
+
+    @staticmethod
+    def _state_to_dict(state: State) -> dict | None:
+        """Convert a State object to a dictionary for serialization.
+        
+        Args:
+            state: The State object to convert.
+            
+        Returns:
+            Dictionary containing state's attributes, or None if state is None.
+        """
+        if state is None:
+            return None
+        
+        result = {
+            "id": getattr(state, 'id', None),
+            "timestep": getattr(state, 'timestep', None),
+            "value": getattr(state, 'value', None),
+            "code": getattr(state, 'code', None),
+            "observation": getattr(state, 'observation', None),
+        }
+        
+        # Include construction if available (CirclePackingState, InequalitiesState, etc.)
+        if hasattr(state, 'construction'):
+            result["construction"] = state.construction
+        
+        # Include parents info for tracking lineage
+        if hasattr(state, 'parents'):
+            result["parents"] = state.parents
+        if hasattr(state, 'parent_values'):
+            result["parent_values"] = state.parent_values
+            
+        return result
     
     @staticmethod
     def _set_parent_info(child: State, parent: State):
@@ -293,6 +336,20 @@ class GreedySampler(StateSampler):
             self._current_step = step
             self._load(step)
 
+    def get_best_solution(self) -> dict | None:
+        """Return the best state (highest value) as a dictionary.
+        
+        GreedySampler keeps states sorted by value, so the first state is the best.
+        
+        Returns:
+            Dictionary containing the best state's information, or None if no states.
+        """
+        with self._lock:
+            if not self._top_states:
+                return None
+            best_state = self._top_states[0]
+            return self._state_to_dict(best_state)
+
 
 class FixedSampler(StateSampler):
     """Fixed distribution sampler - always returns same state, never updates."""
@@ -314,6 +371,10 @@ class FixedSampler(StateSampler):
 
     def reload_from_step(self, step: int):
         pass
+
+    def get_best_solution(self) -> dict | None:
+        """Return the fixed state as a dictionary."""
+        return self._state_to_dict(self._fixed_state) if self._fixed_state else None
 
 
 class PUCTSampler(StateSampler):
@@ -658,6 +719,21 @@ class PUCTSampler(StateSampler):
                     state = create_initial_state(self.env_type, self.initial_exp_type, self.budget_s)
                     self._initial_states.append(state)
                     self._states.append(state)
+
+    def get_best_solution(self) -> dict | None:
+        """Return the best state (highest value) in the buffer as a dictionary.
+        
+        Returns:
+            Dictionary containing the best state's information, or None if no states.
+        """
+        with self._lock:
+            if not self._states:
+                return None
+            best_state = max(
+                self._states,
+                key=lambda s: s.value if s.value is not None else float('-inf')
+            )
+            return self._state_to_dict(best_state)
 
     def get_sample_stats(self) -> dict:
         def _stats(values, prefix):
