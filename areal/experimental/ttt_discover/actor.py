@@ -364,11 +364,12 @@ class TTTDActor(FSDPEngine):
 
     def _gather_updates(self, local_children, local_parents, local_failed, step):
         """
-        Phase 1: Gather all local updates to rank 0.
+        Phase 1: Gather all local updates from all ranks.
+        
+        Uses all_gather_object for better compatibility (all ranks participate).
         
         Returns:
-            Tuple (all_children, all_parents, all_failed) on rank 0, 
-            or ([], [], []) on other ranks.
+            Tuple (all_children, all_parents, all_failed) on ALL ranks.
         """
         from areal.experimental.ttt_discover.state import state_from_dict
         
@@ -377,31 +378,28 @@ class TTTDActor(FSDPEngine):
         p_dicts = [s.to_dict() for s in (local_parents or [])]
         f_dicts = [s.to_dict() for s in (local_failed or [])]
         
-        # Prepare containers (only rank 0 needs them)
         world_size = self.data_parallel_world_size
-        is_rank0 = self.dp_rank == 0
         
-        all_c = [None] * world_size if is_rank0 else None
-        all_p = [None] * world_size if is_rank0 else None
-        all_f = [None] * world_size if is_rank0 else None
+        # Prepare containers (ALL ranks need them for all_gather)
+        all_c = [None] * world_size
+        all_p = [None] * world_size
+        all_f = [None] * world_size
         
         try:
-            dist.gather_object(c_dicts, all_c, dst=0, group=self.data_parallel_group)
-            dist.gather_object(p_dicts, all_p, dst=0, group=self.data_parallel_group)
-            dist.gather_object(f_dicts, all_f, dst=0, group=self.data_parallel_group)
+            # Use all_gather_object instead of gather_object for better compatibility
+            dist.all_gather_object(all_c, c_dicts, group=self.data_parallel_group)
+            dist.all_gather_object(all_p, p_dicts, group=self.data_parallel_group)
+            dist.all_gather_object(all_f, f_dicts, group=self.data_parallel_group)
         except Exception as e:
-            self.logger.error(f"[Rank {self.dp_rank}] Gather failed at step {step}: {e}")
+            self.logger.error(f"[Rank {self.dp_rank}] All-gather failed at step {step}: {e}")
             raise
         
-        if not is_rank0:
-            return [], [], []
-        
-        # Deserialize on rank 0
+        # Deserialize on ALL ranks
         children = [state_from_dict(d) for lst in all_c if lst for d in lst]
         parents = [state_from_dict(d) for lst in all_p if lst for d in lst]
         failed = [state_from_dict(d) for lst in all_f if lst for d in lst]
         
-        if step:
+        if step and self.dp_rank == 0:
             self.logger.info(
                 f"[Step {step}] Gathered from {world_size} ranks: "
                 f"children={len(children)}, parents={len(set(p.id for p in parents))}, failed={len(failed)}"
@@ -420,10 +418,15 @@ class TTTDActor(FSDPEngine):
             return None
         
         children, parents, failed = gathered_data
+        self.logger.info(f"[Step {step}] _apply_updates: acquired data, children={len(children)}, parents={len(parents)}, failed={len(failed)}")
         
+        self.logger.info(f"[Step {step}] _apply_updates: acquiring sampler lock...")
         with self.sampler._lock:
+            self.logger.info(f"[Step {step}] _apply_updates: acquired sampler lock")
+            
             # Record failures
             if failed:
+                self.logger.info(f"[Step {step}] _apply_updates: recording {len(failed)} failures...")
                 _T_before = self.sampler._T
                 for f in failed:
                     self.sampler.record_failed_rollout(f)
@@ -432,6 +435,7 @@ class TTTDActor(FSDPEngine):
             
             # Record successes
             if children:
+                self.logger.info(f"[Step {step}] _apply_updates: updating {len(children)} states...")
                 _T_before = self.sampler._T
                 self.sampler.update_states(children, parents, save=False)
                 if step:
@@ -442,7 +446,9 @@ class TTTDActor(FSDPEngine):
             
             # Save and package
             if step:
+                self.logger.info(f"[Step {step}] _apply_updates: flushing sampler...")
                 self.sampler.flush(step)
+                self.logger.info(f"[Step {step}] _apply_updates: flush complete")
             
             return {
                 'states': [s.to_dict() for s in self.sampler._states],
