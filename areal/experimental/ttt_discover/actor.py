@@ -351,15 +351,18 @@ class TTTDActor(FSDPEngine):
 
 
     def _apply_updates_locally(self, children, parents, failed, step):
-        """Apply updates without distributed communication (single-node shortcut)."""
-        with self.sampler._lock:
-            for f in (failed or []):
-                self.sampler.record_failed_rollout(f)
-            if children:
-                self.sampler.update_states(children, parents, save=False)
-            if step is not None:
-                self.sampler._current_step = step
-                self.sampler._save(step)
+        """Apply updates without distributed communication (single-node shortcut).
+        
+        NOTE: Do NOT acquire sampler._lock here! 
+        sampler methods have their own locking to avoid reentrancy deadlock.
+        """
+        for f in (failed or []):
+            self.sampler.record_failed_rollout(f)
+        if children:
+            self.sampler.update_states(children, parents, save=False)
+        if step is not None:
+            self.sampler._current_step = step
+            self.sampler._save(step)
 
 
     def _gather_updates(self, local_children, local_parents, local_failed, step):
@@ -411,6 +414,10 @@ class TTTDActor(FSDPEngine):
         """
         Phase 2: Rank 0 applies updates and prepares state for broadcast.
         
+        NOTE: Do NOT acquire sampler._lock here! 
+        sampler.update_states() and record_failed_rollout() have their own locking.
+        Using lock here would cause reentrancy deadlock.
+        
         Returns:
             State package (dict) if rank 0, else None.
         """
@@ -418,50 +425,42 @@ class TTTDActor(FSDPEngine):
             return None
         
         children, parents, failed = gathered_data
-        self.logger.info(f"[Step {step}] _apply_updates: acquired data, children={len(children)}, parents={len(parents)}, failed={len(failed)}")
+        self.logger.info(f"[Step {step}] _apply_updates: children={len(children)}, parents={len(parents)}, failed={len(failed)}")
         
-        self.logger.info(f"[Step {step}] _apply_updates: acquiring sampler lock...")
-        with self.sampler._lock:
-            self.logger.info(f"[Step {step}] _apply_updates: acquired sampler lock")
-            
-            # Record failures
-            if failed:
-                self.logger.info(f"[Step {step}] _apply_updates: recording {len(failed)} failures...")
-                _T_before = self.sampler._T
-                for f in failed:
-                    self.sampler.record_failed_rollout(f)
-                if step:
-                    self.logger.info(f"[Step {step}] Recorded {len(failed)} failures, _T: {_T_before} -> {self.sampler._T}")
-            
-            # Record successes
-            if children:
-                self.logger.info(f"[Step {step}] _apply_updates: updating {len(children)} states...")
-                _T_before = self.sampler._T
-                self.sampler.update_states(children, parents, save=False)
-                if step:
-                    self.logger.info(
-                        f"[Step {step}] Updated states: _T={self.sampler._T} (+{self.sampler._T - _T_before}), "
-                        f"total_states={len(self.sampler._states)}"
-                    )
-            
-            # Save and package
+        # Record failures (record_failed_rollout has its own lock)
+        if failed:
+            _T_before = self.sampler._T
+            for f in failed:
+                self.sampler.record_failed_rollout(f)
             if step:
-                self.logger.info(f"[Step {step}] _apply_updates: flushing sampler...")
-                self.sampler.flush(step)
-                self.logger.info(f"[Step {step}] _apply_updates: flush complete")
-            
-            return {
-                'states': [s.to_dict() for s in self.sampler._states],
-                'initial_states': [s.to_dict() for s in self.sampler._initial_states],
-                'T': self.sampler._T,
-                'n': self.sampler._n,
-                'm': self.sampler._m,
-                'current_step': self.sampler._current_step,
-                'last_sampled_states': [s.to_dict() for s in self.sampler._last_sampled_states],
-                'last_sampled_indices': self.sampler._last_sampled_indices,
-                'last_puct_stats': self.sampler._last_puct_stats,
-                'last_scale': self.sampler._last_scale,
-            }
+                self.logger.info(f"[Step {step}] Recorded {len(failed)} failures, _T: {_T_before} -> {self.sampler._T}")
+        
+        # Record successes (update_states has its own lock)
+        if children:
+            _T_before = self.sampler._T
+            self.sampler.update_states(children, parents, save=False)
+            if step:
+                self.logger.info(
+                    f"[Step {step}] Updated states: _T={self.sampler._T} (+{self.sampler._T - _T_before}), "
+                    f"total_states={len(self.sampler._states)}"
+                )
+        
+        # Save and package (flush has its own lock)
+        if step:
+            self.sampler.flush(step)
+        
+        return {
+            'states': [s.to_dict() for s in self.sampler._states],
+            'initial_states': [s.to_dict() for s in self.sampler._initial_states],
+            'T': self.sampler._T,
+            'n': self.sampler._n,
+            'm': self.sampler._m,
+            'current_step': self.sampler._current_step,
+            'last_sampled_states': [s.to_dict() for s in self.sampler._last_sampled_states],
+            'last_sampled_indices': self.sampler._last_sampled_indices,
+            'last_puct_stats': self.sampler._last_puct_stats,
+            'last_scale': self.sampler._last_scale,
+        }
 
 
     def _synchronize_state(self, state_package, step):
