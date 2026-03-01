@@ -180,7 +180,7 @@ sampler:
   initial_exp_type: best_available
   env_type: cp
   n_item: 26
-  eval_timeout: 300        # CP code execution timeout: 300s (5 minutes)
+  eval_timeout: 60        # CP code execution timeout: 300s (5 minutes)
   gpu_type: H100
   n: 100
   budget_s: 1000
