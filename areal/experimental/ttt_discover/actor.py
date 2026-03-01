@@ -327,14 +327,27 @@ class TTTDActor(FSDPEngine):
             self._apply_updates_locally(local_children, local_parents, local_failed, step)
             return
         
+        self.logger.info(f"[Rank {self.dp_rank}][Step {step}] sync_sampler START: "
+                        f"local_children={len(local_children or [])}, "
+                        f"local_parents={len(local_parents or [])}, "
+                        f"local_failed={len(local_failed or [])}")
+        
         # Phase 1: Gather updates from all ranks to rank 0
+        self.logger.info(f"[Rank {self.dp_rank}][Step {step}] Phase 1: Gathering updates...")
         gathered = self._gather_updates(local_children, local_parents, local_failed, step)
+        self.logger.info(f"[Rank {self.dp_rank}][Step {step}] Phase 1: Gather complete")
         
         # Phase 2: Rank 0 applies updates and prepares state package
+        self.logger.info(f"[Rank {self.dp_rank}][Step {step}] Phase 2: Applying updates...")
         state_package = self._apply_updates(gathered, step)
+        self.logger.info(f"[Rank {self.dp_rank}][Step {step}] Phase 2: Apply complete")
         
         # Phase 3: Broadcast and apply synchronized state to all ranks
+        self.logger.info(f"[Rank {self.dp_rank}][Step {step}] Phase 3: Synchronizing state...")
         self._synchronize_state(state_package, step)
+        self.logger.info(f"[Rank {self.dp_rank}][Step {step}] Phase 3: Sync complete")
+        
+        self.logger.info(f"[Rank {self.dp_rank}][Step {step}] sync_sampler END")
 
 
     def _apply_updates_locally(self, children, parents, failed, step):
@@ -470,4 +483,6 @@ class TTTDActor(FSDPEngine):
                     f"T={self.sampler._T}, states={len(self.sampler._states)}"
                 )
         
-        
+        # All ranks wait here to ensure synchronization is complete
+        if dist.is_initialized():
+            dist.barrier(group=self.data_parallel_group)
