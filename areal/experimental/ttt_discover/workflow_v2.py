@@ -64,7 +64,6 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         tokenizer: PreTrainedTokenizerFast | str,
         enable_thinking: bool = False,
         auto_flush: bool = True,  # 是否自动 flush
-        max_code_workers: int = 16,  # Max concurrent code executions
     ):
         self.env = env
         self.auto_flush = auto_flush
@@ -79,6 +78,11 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         self.gconfig = gconfig.new_with_stop_and_pad_token_ids(self.tokenizer)
         self.enable_thinking = enable_thinking
         
+        # Calculate number of workers based on CPU count (same logic as AsyncRewardWrapper)
+        cpu_count = os.cpu_count() or 1
+        # Conservative: use half of CPUs, at least 2, at most 8
+        max_code_workers = max(min(cpu_count // 2, 8), 2)
+        
         # Semaphore limits concurrent code execution to prevent overwhelming resources.
         self._code_semaphore = asyncio.Semaphore(max_code_workers)
         
@@ -87,13 +91,10 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         # 1. Process isolation - one hang doesn't affect others
         # 2. True parallelism for CPU-bound code execution
         # 3. Avoids GIL contention
-        cpu_count = os.cpu_count() or 1
-        # Conservative: use half of CPUs, at least 2
-        process_workers = max(min(max_code_workers, cpu_count // 2), 2)
         self._code_executor = ProcessPoolExecutor(
-            max_workers=process_workers,
+            max_workers=max_code_workers,
         )
-        logger.info(f"Created ProcessPoolExecutor with {process_workers} workers for code execution")
+        logger.info(f"Created ProcessPoolExecutor with {max_code_workers} workers for code execution (CPU count: {cpu_count})")
         
         # Async-safe buffer for pending updates (GroupedRolloutWorkflow uses asyncio.gather)
         # Stores (child_state, parent_state) tuples
