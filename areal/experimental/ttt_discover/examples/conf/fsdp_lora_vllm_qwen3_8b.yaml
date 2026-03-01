@@ -182,7 +182,6 @@ sampler:
   n_item: 26
   eval_timeout: 300        # CP code execution timeout: 300s (5 minutes)
   gpu_type: H100
-  eval_timeout: 60
   n: 100
   budget_s: 1000
 
