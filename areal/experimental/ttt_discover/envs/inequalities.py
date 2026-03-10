@@ -413,14 +413,14 @@ class InequalitiesEnv(BaseEnv):
         Returns (result, error_msg).
         """
         # Preprocess code: inject verifier and construction
+        import inspect
         if self.problem_type == "ac1":
-            verifier_src = f"""import numpy as np\n\ndef evaluate_sequence(sequence):\n    return {evaluate_sequence_ac1.__code__}"""
-            # Actually, use the function directly
-            import inspect
             verifier_src = inspect.getsource(evaluate_sequence_ac1)
+            # Add alias so generated code can call evaluate_sequence()
+            verifier_src += "\n\n# Alias for generated code compatibility\nevaluate_sequence = evaluate_sequence_ac1\n"
         else:
-            import inspect
             verifier_src = inspect.getsource(evaluate_sequence_ac2)
+            verifier_src += "\n\n# Alias for generated code compatibility\nevaluate_sequence = evaluate_sequence_ac2\n"
         
         numpy_import = "import numpy as np"
         scipy_import = "from scipy.optimize import minimize"
