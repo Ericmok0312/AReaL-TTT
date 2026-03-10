@@ -36,7 +36,7 @@ pyarrow==22.0.0
 # ==================== Utilities ====================
 joblib==1.5.2
 tqdm==4.67.1
-networkx==3.5
+networkx==3.3  # Compatible with Python 3.10
 
 # ==================== ML/DL (for model interaction) ====================
 torch==2.9.1
