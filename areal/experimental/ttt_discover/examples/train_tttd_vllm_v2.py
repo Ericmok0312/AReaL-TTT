@@ -272,17 +272,30 @@ def main(args):
         ref.initialize(None, ft_spec)
         logger.info(f"Reference model using DP-only strategy: {ref_parallel_strategy}")
     
-    # Environment setup (same as V1)
-    env_type = getattr(config.sampler, 'env_type', 'cp')
+    # Environment setup (AC1 or CP)
+    env_type = getattr(config.sampler, 'env_type', 'ac1')
+    eval_timeout = getattr(config.sampler, 'eval_timeout', 600)  # 10min default
+    
     if env_type == 'cp':
         from areal.experimental.ttt_discover.envs import CirclePackingEnv
         env = CirclePackingEnv(
             n_item=getattr(config.sampler, 'n_item', 26),
-            eval_timeout=300,
+            eval_timeout=eval_timeout,
             log_dir=config.saver.fileroot,
         )
+        logger.info(f"[Env] Using CirclePackingEnv with eval_timeout={eval_timeout}s")
+    elif env_type in ('ac1', 'ac2'):
+        from areal.experimental.ttt_discover.envs import InequalitiesEnv
+        env = InequalitiesEnv(
+            problem_type=env_type,
+            budget_s=getattr(config.sampler, 'budget_s', 1000),
+            eval_timeout=eval_timeout,
+            log_dir=config.saver.fileroot,
+            num_cpus=getattr(config.sampler, 'num_cpus', 2),
+        )
+        logger.info(f"[Env] Using InequalitiesEnv ({env_type}) with eval_timeout={eval_timeout}s, budget_s={env.budget_s}s")
     else:
-        raise ValueError(f"Unknown env_type: {env_type}")
+        raise ValueError(f"Unknown env_type: {env_type}. Must be 'cp', 'ac1', or 'ac2'")
     
     # Ensure stop tokens
     if tokenizer.pad_token_id not in config.gconfig.stop_token_ids:
@@ -430,15 +443,20 @@ def main(args):
             except Exception as e:
                 logger.warning(f"Failed to get best solution from sampler: {e}")
         
+        # Collect detailed metrics for this step
+        step_metrics = {
+            'batch_parents': batch_size,
+            'group_size': group_size,
+            'local_rollouts': local_rollouts,
+            'step_max_reward': step_max_reward,
+            'step_mean_reward': step_mean_reward,
+        }
+        
         history_logger.record_step(
             step=global_step,
             rewards=local_step_rewards,
             best_solution=current_best_solution,
-            additional_metrics={
-                'batch_parents': batch_size,
-                'group_size': group_size,
-                'local_rollouts': local_rollouts,
-            }
+            additional_metrics=step_metrics
         )
         
         logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] Rollouts: {local_rollouts}, "

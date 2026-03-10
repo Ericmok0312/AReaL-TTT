@@ -11,14 +11,29 @@ Usage:
     >>> from areal.experimental.ttt_discover.envs import CirclePackingEnv
     >>> from areal.experimental.ttt_discover.envs import create_initial_state_cp
     >>> 
-    >>> env = CirclePackingEnv(n_item=26, eval_timeout=60)
+    >>> env = CirclePackingEnv(n_item=26, eval_timeout=300)
     >>> state = create_initial_state_cp(n=26, initial_exp_type="best_available")
+    >>> prompt = env.get_prompt(state)
+    
+    >>> # For AC1 (Inequalities)
+    >>> from areal.experimental.ttt_discover.envs import InequalitiesEnv
+    >>> from areal.experimental.ttt_discover.envs import create_initial_state_ac1
+    >>> 
+    >>> env = InequalitiesEnv(problem_type="ac1", budget_s=1000, eval_timeout=600)
+    >>> state = create_initial_state_ac1(initial_exp_type="best_available")
     >>> prompt = env.get_prompt(state)
 """
 
 from areal.experimental.ttt_discover.envs.circle_packing import (
     CirclePackingEnv,
     create_initial_state_cp,
+)
+
+from areal.experimental.ttt_discover.envs.inequalities import (
+    InequalitiesEnv,
+    create_initial_state_ac1,
+    evaluate_sequence_ac1,
+    evaluate_sequence_ac2,
 )
 
 # GpuModeEnv is optional and requires additional dependencies
@@ -34,8 +49,15 @@ except ImportError:
     create_initial_state_gpu_mode = None  # type: ignore
 
 __all__ = [
+    # Circle Packing
     "CirclePackingEnv",
     "create_initial_state_cp",
+    # AC1/AC2 (Inequalities)
+    "InequalitiesEnv",
+    "create_initial_state_ac1",
+    "evaluate_sequence_ac1",
+    "evaluate_sequence_ac2",
+    # GPU Mode (optional)
     "GpuModeEnv",
     "create_initial_state_gpu_mode",
 ]
