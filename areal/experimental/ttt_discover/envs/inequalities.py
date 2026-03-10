@@ -367,13 +367,23 @@ class InequalitiesEnv(BaseEnv):
             is_maximize = True
         
         # Build value context string
+        # NOTE: state.value stores reward (1/bound for AC1, bound for AC2)
+        # Prompt should show the actual metric (bound for AC1)
+        def reward_to_bound(reward):
+            """Convert reward back to bound for display."""
+            if reward is None or reward <= 0:
+                return float('inf')
+            return 1.0 / reward
+        
         if state.parent_values and state.value is not None:
             if is_maximize:
+                # AC2: value is already the bound
                 before_val = state.parent_values[0]
                 after_val = state.value
             else:
-                before_val = -state.parent_values[0]
-                after_val = -state.value
+                # AC1: value is 1/bound, convert back
+                before_val = reward_to_bound(state.parent_values[0])
+                after_val = reward_to_bound(state.value)
             value_ctx = (
                 f"\nHere are the {metric_name}s before and after running the code above "
                 f"({'higher' if is_maximize else 'lower'} is better): "
@@ -381,7 +391,11 @@ class InequalitiesEnv(BaseEnv):
             )
             value_ctx += f"\nTarget: {target}. Further improvements will be generously rewarded."
         elif state.value is not None:
-            current_val = state.value if is_maximize else -state.value
+            if is_maximize:
+                current_val = state.value
+            else:
+                # AC1: convert reward back to bound
+                current_val = reward_to_bound(state.value)
             value_ctx = f"\nCurrent {metric_name} ({'higher' if is_maximize else 'lower'} is better): {current_val:.6f}"
             value_ctx += f"\nTarget: {target}. Further improvements will be generously rewarded."
         else:

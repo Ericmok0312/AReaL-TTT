@@ -128,107 +128,57 @@ def _sampler_file_for_step(base_path: str, step: int) -> str:
 
 
 def create_initial_state(env_type: str, initial_exp_type: str, budget_s: int = 1000) -> State:
-    """Create an initial state for a given env type."""
-    if initial_exp_type == "best_available":
-        if env_type == "ac1":
-            from tasks.alphaevolve_ac.sota_alphaevolve2 import height_sequence_1
-            construction = list(height_sequence_1)
-        elif env_type == "ac2":
-            from tasks.alphaevolve_ac2.ae_seq import height_sequence_2
-            construction = list(height_sequence_2)
-        else:
-            construction = []
-    elif initial_exp_type == "none":
-        construction = []
-    elif initial_exp_type == "random":
-        if env_type in {"ac1", "ac2"}:
-            rng = np.random.default_rng(12345)
-            construction = [rng.random()] * rng.integers(1000, 8000)
-        elif env_type == "erdos":
-            rng = np.random.default_rng()
-            n_points = rng.integers(40, 100)
-            construction = np.ones(n_points) * 0.5
-            perturbation = rng.uniform(-0.4, 0.4, n_points)
-            perturbation = perturbation - np.mean(perturbation)
-            construction = construction + perturbation
-            dx = 2.0 / n_points
-            correlation = np.correlate(construction, 1 - construction, mode="full") * dx
-            c5_bound = float(np.max(correlation))
-            return ErdosState(timestep=-1, code="", value=-c5_bound, c5_bound=c5_bound, construction=list(construction))
-        else:
-            construction = []
-    elif initial_exp_type == "random_no_code":
-        # Fixed construction of size 1000, deterministic seed for comparability
-        if env_type in {"ac1", "ac2"}:
-            rng = np.random.default_rng(42)
-            construction = list(rng.random(1000))
-        else:
-            construction = []
-    else:
-        raise ValueError(f"Unknown initial_exp_type: {initial_exp_type}")
-
-    # Compute initial value (higher = better)
-    if construction:
-        if env_type == "ac1":
-            from tasks.alphaevolve_ac.verifier_ae import evaluate_sequence
-            initial_value = -evaluate_sequence(construction)  # -upper_bound: higher = better
-        elif env_type == "ac2":
-            from tasks.alphaevolve_ac2.ae_verifier import evaluate_sequence
-            initial_value = evaluate_sequence(construction) # Maximize lower bound
-    elif env_type == "gpu_mode":
-        initial_value = -1_000_000 # Worse than max of initial distribution
-    elif env_type in {"ahc039", "ahc058"}:
-        initial_value = 0.0
-    elif env_type == "erdos":
-        initial_value = None  # No initial value for erdos
-    else:
-        initial_value = 0.0
-
-    timestep = -1
-
-    # Create state (timestep=-1 for initial states)
+    """
+    Create an initial state for a given env type.
+    
+    This function delegates to environment-specific create_initial_state_* functions
+    defined in each env module for better modularity.
+    """
     if env_type == "ac1":
-        from tasks.alphaevolve_ac.prompt import example_ae_program_best_init_and_random_init, example_ae_program
-        if initial_exp_type == "none":
-            code = "```python\n" + example_ae_program(budget_s) + "\n```"
-        elif initial_exp_type == "random_no_code":
-            code = ""
-        else:
-            code = "```python\n" + example_ae_program_best_init_and_random_init(budget_s) + "\n```"
-        return InequalitiesState(timestep=timestep, construction=construction, code=code, value=initial_value)
+        from areal.experimental.ttt_discover.envs.inequalities import create_initial_state_ac1
+        return create_initial_state_ac1(initial_exp_type=initial_exp_type, budget_s=budget_s)
     elif env_type == "ac2":
-        from tasks.alphaevolve_ac2.prompt import thetaevolve_initial_program, thetaevolve_initial_program_prev_init
-        if initial_exp_type == "none":
-            code = "```python\n" + thetaevolve_initial_program + "\n```"
-        elif initial_exp_type == "random_no_code":
-            code = ""
-        else:
-            code = "```python\n" + thetaevolve_initial_program_prev_init + "\n```"
-        return InequalitiesState(timestep=timestep, construction=construction, code=code, value=initial_value)
+        # AC2: maximize lower bound (value = bound directly)
+        from areal.experimental.ttt_discover.envs.inequalities import create_initial_state_ac1
+        state = create_initial_state_ac1(initial_exp_type=initial_exp_type, budget_s=budget_s)
+        # Re-evaluate with AC2 verifier (bound is the reward for maximization)
+        from areal.experimental.ttt_discover.envs.inequalities import evaluate_sequence_ac2
+        if state.construction:
+            state.value = evaluate_sequence_ac2(state.construction)
+        return state
     elif env_type == "cp":
-        return CirclePackingState(timestep=timestep, construction=None, code="", value=initial_value)
+        from areal.experimental.ttt_discover.envs.circle_packing import create_initial_state_cp
+        # Determine n_item from config or use default
+        return create_initial_state_cp(n=26, initial_exp_type=initial_exp_type)
+    elif env_type == "erdos":
+        # Erdos uses random construction
+        rng = np.random.default_rng()
+        n_points = rng.integers(40, 100)
+        construction = np.ones(n_points) * 0.5
+        perturbation = rng.uniform(-0.4, 0.4, n_points)
+        perturbation = perturbation - np.mean(perturbation)
+        construction = construction + perturbation
+        dx = 2.0 / n_points
+        correlation = np.correlate(construction, 1 - construction, mode="full") * dx
+        c5_bound = float(np.max(correlation))
+        return ErdosState(timestep=-1, code="", value=-c5_bound, c5_bound=c5_bound, construction=list(construction))
     elif env_type == "mla_decode_nvidia":
         from tasks.gpu_mode.initial_program_mla_decode import INITIAL_CODE, INITIAL_VALUE
-        code = INITIAL_CODE
-        initial_value = INITIAL_VALUE
-        return GpuModeState(timestep=timestep, code=code, value=initial_value)
+        return GpuModeState(timestep=-1, code=INITIAL_CODE, value=INITIAL_VALUE)
     elif env_type == "trimul":
-        # No initial code or value for trimul
-        return GpuModeState(timestep=timestep, code="", value=initial_value)
+        return GpuModeState(timestep=-1, code="", value=-1_000_000)
     elif env_type == "ahc039":
         if initial_exp_type == "best_available":
             from tasks.ale_bench.best_available import AHC039_BEST_CODE, AHC039_BEST_CODE_VALUE
-            return AleBenchState(timestep=timestep, code=AHC039_BEST_CODE, value=AHC039_BEST_CODE_VALUE)
-        return AleBenchState(timestep=timestep, code="", value=initial_value)
+            return AleBenchState(timestep=-1, code=AHC039_BEST_CODE, value=AHC039_BEST_CODE_VALUE)
+        return AleBenchState(timestep=-1, code="", value=0.0)
     elif env_type == "ahc058":
         if initial_exp_type == "best_available":
             raise ValueError("AHC058 has no best code available.")
-        return AleBenchState(timestep=timestep, code="", value=initial_value)
-    elif env_type == "erdos":
-        return ErdosState(timestep=timestep, code="", value=initial_value, c5_bound=None, construction=None)
+        return AleBenchState(timestep=-1, code="", value=0.0)
     elif env_type == "denoising":
         from tasks.denoising.task import MAGIC_FUNC
-        return DenoisingState(timestep=timestep, code=MAGIC_FUNC, value=0.24, mse=0.2316, poisson=0.0370)
+        return DenoisingState(timestep=-1, code=MAGIC_FUNC, value=0.24, mse=0.2316, poisson=0.0370)
     else:
         raise ValueError(f"Unknown env_type: {env_type}")
 
