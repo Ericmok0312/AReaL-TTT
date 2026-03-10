@@ -103,6 +103,10 @@ class SamplerConfig:
         default=1000,
         metadata={"help": "Budget parameter for inequalities"}
     )
+    num_cpus: int = field(
+        default=2,
+        metadata={"help": "Number of CPUs per task for code execution"}
+    )
 
 
 @dataclass
