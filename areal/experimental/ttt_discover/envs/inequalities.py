@@ -434,6 +434,11 @@ class InequalitiesEnv(BaseEnv):
         
         full_code = base + code
         
+        # Debug: log the full code being executed
+        logger.info(f"[AC1 Debug] Full code length: {len(full_code)} chars")
+        logger.info(f"[AC1 Debug] Base code:\n{base[:500]}...")
+        logger.info(f"[AC1 Debug] Generated code:\n{code[:500]}...")
+        
         # Write to temp file
         with tempfile.NamedTemporaryFile(
             suffix=".py",
@@ -521,8 +526,12 @@ except Exception as e:
                 
                 # No result found
                 if process.returncode != 0:
+                    logger.warning(f"[AC1 Debug] Process failed with code {process.returncode}")
+                    logger.warning(f"[AC1 Debug] stderr: {stderr[:1000]}")
+                    logger.warning(f"[AC1 Debug] stdout: {stdout[:1000]}")
                     return None, f"Process failed: {stderr[:500]}"
                 
+                logger.warning(f"[AC1 Debug] No result marker found. stdout: {stdout[:500]}")
                 return None, "No result returned"
                 
             except subprocess.TimeoutExpired:
@@ -545,6 +554,11 @@ except Exception as e:
         """Execute the generated code and compute reward."""
         try:
             output, error_msg = self._execute_code(code, state)
+            
+            # Debug: log first execution attempt
+            if error_msg:
+                logger.warning(f"[AC1 Debug] Execution error: {error_msg}")
+                logger.warning(f"[AC1 Debug] Generated code preview: {code[:500]}...")
             
             if error_msg:
                 is_timeout = "timeout" in error_msg.lower()
