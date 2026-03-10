@@ -23,7 +23,7 @@ Usage:
 import asyncio
 import os
 import uuid
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -91,15 +91,15 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         # Semaphore limits concurrent code execution to prevent overwhelming resources.
         self._code_semaphore = asyncio.Semaphore(max_code_workers)
         
-        # Create dedicated ProcessPoolExecutor for code execution (isolated from AReaL's shared pool)
-        # ProcessPool is better than ThreadPool for executing arbitrary user code because:
-        # 1. Process isolation - one hang doesn't affect others
-        # 2. True parallelism for CPU-bound code execution
-        # 3. Avoids GIL contention
-        self._code_executor = ProcessPoolExecutor(
+        # Create dedicated ThreadPoolExecutor for code execution (isolated from AReaL's shared pool)
+        # ThreadPool is sufficient here because:
+        # 1. env.execute() launches subprocess.Popen() for actual code execution (true process isolation)
+        # 2. ThreadPool threads just wait for subprocess I/O completion (not CPU-bound)
+        # 3. Avoids nested process creation overhead (ProcessPool worker + subprocess = 2x processes)
+        self._code_executor = ThreadPoolExecutor(
             max_workers=max_code_workers,
         )
-        logger.info(f"Created ProcessPoolExecutor with {max_code_workers} workers for code execution (CPU count: {cpu_count})")
+        logger.info(f"Created ThreadPoolExecutor with {max_code_workers} workers for code execution (CPU count: {cpu_count})")
         
         # Async-safe buffer for pending updates (GroupedRolloutWorkflow uses asyncio.gather)
         # Stores (child_state, parent_state) tuples
@@ -444,10 +444,10 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
     def shutdown(self):
         """Cleanup resources.
         
-        Shuts down the dedicated ProcessPoolExecutor for code execution.
+        Shuts down the dedicated ThreadPoolExecutor for code execution.
         """
         if hasattr(self, '_code_executor') and self._code_executor:
-            logger.info("Shutting down ProcessPoolExecutor for code execution...")
+            logger.info("Shutting down ThreadPoolExecutor for code execution...")
             self._code_executor.shutdown(wait=False, cancel_futures=True)
             self._code_executor = None
     
