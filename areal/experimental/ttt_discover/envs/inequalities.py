@@ -434,11 +434,6 @@ class InequalitiesEnv(BaseEnv):
         
         full_code = base + code
         
-        # Debug: log the full code being executed
-        logger.info(f"[AC1 Debug] Full code length: {len(full_code)} chars")
-        logger.info(f"[AC1 Debug] Base code:\n{base[:500]}...")
-        logger.info(f"[AC1 Debug] Generated code:\n{code[:500]}...")
-        
         # Write to temp file
         with tempfile.NamedTemporaryFile(
             suffix=".py",
@@ -472,27 +467,18 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "{max(1, self.num_cpus)}")
 
 sys.path.insert(0, "{str(self.log_dir)}")
 
-print("[AC1-Runner] Starting execution", file=sys.stderr)
-
 try:
-    print("[AC1-Runner] Loading program module from {code_path}...", file=sys.stderr)
     spec = _il.spec_from_file_location("program", "{code_path}")
     program = _il.module_from_spec(spec)
     spec.loader.exec_module(program)
     sys.modules["program"] = program
-    print("[AC1-Runner] Module loaded successfully", file=sys.stderr)
     
-    print("[AC1-Runner] Getting function: {self.entrypoint}", file=sys.stderr)
     func = getattr(program, "{self.entrypoint}")
-    print("[AC1-Runner] Calling function...", file=sys.stderr)
-    
     result = func()
-    print(f"[AC1-Runner] Function returned type: {{type(result)}}", file=sys.stderr)
     
     print(f"REWARD_RESULT: {{result}}")
     
 except Exception as e:
-    print(f"[AC1-Runner] Exception occurred: {{e}}", file=sys.stderr)
     print(f"REWARD_ERROR: {{e}}")
     traceback.print_exc()
 '''
@@ -520,10 +506,6 @@ except Exception as e:
                 stdout = stdout.decode("utf-8", errors="replace")
                 stderr = stderr.decode("utf-8", errors="replace")
                 
-                # Debug: log stderr from runner
-                if stderr.strip():
-                    logger.info(f"[AC1 Debug] Runner stderr:\n{stderr[:2000]}")
-                
                 # Parse result
                 for line in stdout.split("\n"):
                     if line.startswith("REWARD_RESULT:"):
@@ -539,12 +521,8 @@ except Exception as e:
                 
                 # No result found
                 if process.returncode != 0:
-                    logger.warning(f"[AC1 Debug] Process failed with code {process.returncode}")
-                    logger.warning(f"[AC1 Debug] stderr: {stderr[:1000]}")
-                    logger.warning(f"[AC1 Debug] stdout: {stdout[:1000]}")
                     return None, f"Process failed: {stderr[:500]}"
                 
-                logger.warning(f"[AC1 Debug] No result marker found. stdout: {stdout[:500]}")
                 return None, "No result returned"
                 
             except subprocess.TimeoutExpired:
@@ -567,11 +545,6 @@ except Exception as e:
         """Execute the generated code and compute reward."""
         try:
             output, error_msg = self._execute_code(code, state)
-            
-            # Debug: log first execution attempt
-            if error_msg:
-                logger.warning(f"[AC1 Debug] Execution error: {error_msg}")
-                logger.warning(f"[AC1 Debug] Generated code preview: {code[:500]}...")
             
             if error_msg:
                 is_timeout = "timeout" in error_msg.lower()
