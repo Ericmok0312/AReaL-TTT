@@ -64,9 +64,11 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         tokenizer: PreTrainedTokenizerFast | str,
         enable_thinking: bool = False,
         auto_flush: bool = True,  # 是否自动 flush
+        max_prompt_thinking_tokens: int = 26000,  # Paper: limit prompt + thinking tokens
     ):
         self.env = env
         self.auto_flush = auto_flush
+        self.max_prompt_thinking_tokens = max_prompt_thinking_tokens
         
         # Initialize tokenizer
         if isinstance(tokenizer, str):
@@ -77,6 +79,9 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             
         self.gconfig = gconfig.new_with_stop_and_pad_token_ids(self.tokenizer)
         self.enable_thinking = enable_thinking
+        
+        # Teacher forcing message for stopping thinking
+        self.force_stop_message = "... okay, I am out of thinking tokens. I need to send my final message now"
         
         # Calculate number of workers based on CPU count (same logic as AsyncRewardWrapper)
         cpu_count = os.cpu_count() or 1
@@ -267,7 +272,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             )
         
         try:
-            # Generate
+            # Generate - Phase 1: Normal thinking
             prompt = self.env.get_prompt(state)
             messages = [{"role": "user", "content": prompt}]
             input_ids = list(self.tokenizer.apply_chat_template(
@@ -277,21 +282,65 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 enable_thinking=self.enable_thinking,
             ))
             
+            # Paper: limit prompt + thinking tokens to 26000, leave room for final response
+            prompt_length = len(input_ids)
+            max_context = 32768
+            max_thinking_tokens = self.max_prompt_thinking_tokens - prompt_length
+            max_new_tokens_phase1 = min(
+                self.gconfig.max_new_tokens,
+                max_context - prompt_length,
+                max(2048, max_thinking_tokens)  # Leave at least 2048 for final response
+            )
+            
+            if prompt_length > self.max_prompt_thinking_tokens:
+                logger.warning(f"Prompt length {prompt_length} exceeds limit {self.max_prompt_thinking_tokens}, truncating")
+                input_ids = input_ids[:self.max_prompt_thinking_tokens]
+            
             req = ModelRequest(
                 rid=uuid.uuid4().hex,
                 input_ids=input_ids,
-                gconfig=self.gconfig.new(n_samples=1),
+                gconfig=self.gconfig.new(n_samples=1, max_new_tokens=max_new_tokens_phase1),
                 tokenizer=self.tokenizer,
             )
             
             async with atrace_session_phase("generate"):
                 resp = await engine.agenerate(req)
             
-            # Check if generation was truncated
-            if resp.stop_reason == "length":
-                logger.warning(f"Generation truncated (max_tokens={self.gconfig.max_new_tokens})")
+            # Check if generation was truncated or no valid code
+            completion_str = self.tokenizer.decode(resp.output_tokens)
+            code = self.env.extract_code(completion_str)
             
-            # Compute reward
+            # Phase 2: Teacher forcing if no valid code extracted
+            if code is None:
+                logger.info(f"[Teacher Forcing] No valid code in first generation, forcing final response")
+                
+                # Append teacher forcing message
+                force_message = {"role": "assistant", "content": self.force_stop_message}
+                messages_with_force = messages + [force_message]
+                
+                input_ids_force = list(self.tokenizer.apply_chat_template(
+                    messages_with_force,
+                    tokenize=True,
+                    add_generation_prompt=False,  # Continue from assistant message
+                    enable_thinking=self.enable_thinking,
+                ))
+                
+                # Second generation with remaining tokens
+                remaining_tokens = max_context - len(input_ids_force)
+                
+                req_force = ModelRequest(
+                    rid=uuid.uuid4().hex + "_force",
+                    input_ids=input_ids_force,
+                    gconfig=self.gconfig.new(n_samples=1, max_new_tokens=remaining_tokens),
+                    tokenizer=self.tokenizer,
+                )
+                
+                async with atrace_session_phase("generate_forced"):
+                    resp = await engine.agenerate(req_force)
+                
+                logger.info(f"[Teacher Forcing] Forced generation completed")
+            
+            # Compute reward on final response
             reward, result, code = await self._compute_reward(resp, data)
             
             # Log validation failure (concise)

@@ -304,11 +304,13 @@ def main(args):
         config.gconfig.stop_token_ids.append(tokenizer.eos_token_id)
     
     # Create V2 workflow - inject sampler directly!
+    # Paper: "limit the total length of the prompt and the thinking tokens to 26000"
     workflow = TTTDiscoverWorkflowV2(
         env=env,
         gconfig=config.gconfig,
         tokenizer=tokenizer,
         enable_thinking=config.enable_thinking,
+        max_prompt_thinking_tokens=config.max_prompt_thinking_tokens,
     )
     
     saver = Saver(config.saver, ft_spec)

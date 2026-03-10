@@ -472,18 +472,27 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "{max(1, self.num_cpus)}")
 
 sys.path.insert(0, "{str(self.log_dir)}")
 
+print("[AC1-Runner] Starting execution", file=sys.stderr)
+
 try:
+    print("[AC1-Runner] Loading program module from {code_path}...", file=sys.stderr)
     spec = _il.spec_from_file_location("program", "{code_path}")
     program = _il.module_from_spec(spec)
     spec.loader.exec_module(program)
     sys.modules["program"] = program
+    print("[AC1-Runner] Module loaded successfully", file=sys.stderr)
     
+    print("[AC1-Runner] Getting function: {self.entrypoint}", file=sys.stderr)
     func = getattr(program, "{self.entrypoint}")
+    print("[AC1-Runner] Calling function...", file=sys.stderr)
+    
     result = func()
+    print(f"[AC1-Runner] Function returned type: {{type(result)}}", file=sys.stderr)
     
     print(f"REWARD_RESULT: {{result}}")
     
 except Exception as e:
+    print(f"[AC1-Runner] Exception occurred: {{e}}", file=sys.stderr)
     print(f"REWARD_ERROR: {{e}}")
     traceback.print_exc()
 '''
@@ -510,6 +519,10 @@ except Exception as e:
                 stdout, stderr = process.communicate(timeout=self.eval_timeout)
                 stdout = stdout.decode("utf-8", errors="replace")
                 stderr = stderr.decode("utf-8", errors="replace")
+                
+                # Debug: log stderr from runner
+                if stderr.strip():
+                    logger.info(f"[AC1 Debug] Runner stderr:\n{stderr[:2000]}")
                 
                 # Parse result
                 for line in stdout.split("\n"):

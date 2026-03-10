@@ -294,6 +294,13 @@ class TTTDPPOActorConfig(PPOActorConfig):
                          "Default is True to avoid _T inflation across different training runs."}
     )
     
+    # Teacher forcing for thinking tokens (paper: limit prompt + thinking to 26000)
+    max_prompt_thinking_tokens: int = field(
+        default=26000,
+        metadata={"help": "Maximum tokens for prompt + thinking phase. Paper: 26000 to leave room for final response. "
+                         "If model exceeds this without producing valid code, teacher forcing is applied."}
+    )
+    
     def __post_init__(self):
         """Validate configuration consistency and convert nested dicts to objects"""
         # Convert mb_spec from dict to MicroBatchSpec if needed

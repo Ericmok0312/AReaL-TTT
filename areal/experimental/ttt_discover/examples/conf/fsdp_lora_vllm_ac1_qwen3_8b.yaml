@@ -132,6 +132,9 @@ gconfig:
   top_p: 0.95
   lora_name: tttd_lora_adapter
 
+# Paper: "limit the total length of the prompt and the thinking tokens to 26000"
+max_prompt_thinking_tokens: 26000
+
 # CRITICAL FIX: ref 也需要 mb_spec（如果与 actor 不同步会出错）
 ref:
   experiment_name: ${experiment_name}
