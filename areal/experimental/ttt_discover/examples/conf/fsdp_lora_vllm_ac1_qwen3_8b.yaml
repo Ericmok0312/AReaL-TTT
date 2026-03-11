@@ -207,7 +207,7 @@ saver:
   freq_secs: null
 
 recover:
-  mode: on  # Enable automatic recovery
+  mode: "on"  # Enable automatic recovery (quoted to prevent YAML bool parsing)
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
