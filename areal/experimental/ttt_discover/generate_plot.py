@@ -29,7 +29,8 @@ Usage:
         --benchmark_value 1.5030 \
         --xlabel "Upper Bound (lower is better ←)" \
         --higher_is_better False \
-        --benchmark_label "Literature SOTA"
+        --benchmark_label "Literature SOTA" \
+        --xlim 1.4 2.5
 
     # 自定义输出路径
     python generate_plot.py --history_path ./outputs/training_history.pkl \
@@ -41,11 +42,12 @@ import pickle
 import sys
 from pathlib import Path
 
-# 添加项目根目录到路径
-project_root = Path(__file__).parent.parent.parent.parent
-sys.path.insert(0, str(project_root))
+# 添加 ttt_discover 目录到路径以导入 ttt_visualizer
+# 避免通过 areal 包导入，防止加载不必要的依赖
+current_dir = Path(__file__).parent
+sys.path.insert(0, str(current_dir))
 
-from areal.experimental.ttt_discover.ttt_visualizer import TTTVisualizer
+from ttt_visualizer import TTTVisualizer
 
 
 def parse_args():
@@ -72,7 +74,8 @@ Examples:
       --benchmark_value 1.5030 \\
       --xlabel "Upper Bound (lower is better ←)" \\
       --higher_is_better False \\
-      --benchmark_label "Literature SOTA"
+      --benchmark_label "Literature SOTA" \\
+      --xlim 1.4 2.5
   
   # Custom steps (overrides auto-detection)
   python generate_plot.py --history_path ./outputs/training_history.pkl \\
@@ -168,6 +171,16 @@ Examples:
         help='Transform applied to rewards before plotting. '
              '"reciprocal" or "ac1": plot 1/reward (for AC1 where reward=1/bound). '
              '"none": no transform (default: none)'
+    )
+    
+    parser.add_argument(
+        '--xlim',
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=('MIN', 'MAX'),
+        help='X-axis display range (min, max). Useful for AC1 to filter out '
+             'extreme values from failed executions (e.g., --xlim 1.4 2.0)'
     )
     
     parser.add_argument(

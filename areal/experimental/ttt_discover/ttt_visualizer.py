@@ -66,6 +66,7 @@ class TTTVisualizer:
         show_arrow: bool = True,
         arrow_y_offset: float = 0.95,
         reward_transform: Optional[callable] = None,
+        xlim: Optional[tuple[float, float]] = None,
     ) -> None:
         """
         绘制训练动态分布图（类似论文 Figure 1）
@@ -89,6 +90,7 @@ class TTTVisualizer:
             show_arrow: 是否显示优化方向箭头
             arrow_y_offset: 箭头在 y 轴的位置（0-1 之间，相对于 y 轴范围）
             reward_transform: 可选的 reward 转换函数，如 lambda r: 1/r 用于 AC1
+            xlim: 可选的 x 轴显示范围元组 (min, max)，用于聚焦有效值区域
         """
         # 创建图形
         fig, ax = plt.subplots(figsize=figsize)
@@ -198,6 +200,10 @@ class TTTVisualizer:
         
         # 设置 y 轴从 0 开始
         ax.set_ylim(bottom=0)
+        
+        # 设置 x 轴显示范围（如果指定了 xlim）
+        if xlim is not None:
+            ax.set_xlim(xlim)
         
         # 添加图例
         ax.legend(loc='best', framealpha=0.9)
@@ -393,6 +399,7 @@ def plot_training_dynamics(
     output_path: str = 'training_dynamics.png',
     higher_is_better: bool = True,
     reward_transform: Optional[callable] = None,
+    xlim: Optional[tuple[float, float]] = None,
 ) -> None:
     """
     便捷的函数接口：绘制训练动态分布图
@@ -408,6 +415,7 @@ def plot_training_dynamics(
         output_path: 输出图片路径
         higher_is_better: reward 是否越大越好
         reward_transform: 可选的 reward 转换函数，如 lambda r: 1/r 用于 AC1
+        xlim: 可选的 x 轴显示范围元组 (min, max)
     """
     visualizer = TTTVisualizer(higher_is_better=higher_is_better)
     visualizer.plot_training_dynamics(
@@ -420,6 +428,7 @@ def plot_training_dynamics(
         ylabel=ylabel,
         output_path=output_path,
         reward_transform=reward_transform,
+        xlim=xlim,
     )
 
 
