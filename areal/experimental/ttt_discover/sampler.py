@@ -790,6 +790,39 @@ def create_sampler(
     raise ValueError(f"Unknown sampler_type: {sampler_type}")
 
 
+def _find_latest_sampler_step(log_path: str, sampler_type: str = "puct") -> int | None:
+    """Find the latest sampler checkpoint step in the log directory.
+    
+    Args:
+        log_path: Directory containing sampler checkpoint files
+        sampler_type: Type of sampler (puct, greedy, etc.)
+        
+    Returns:
+        Latest step number, or None if no checkpoint found
+    """
+    import glob
+    import re
+    
+    if not os.path.exists(log_path):
+        return None
+    
+    # Pattern: {sampler_type}_sampler_step_{step:06d}.json
+    pattern = os.path.join(log_path, f"{sampler_type}_sampler_step_*.json")
+    files = glob.glob(pattern)
+    
+    if not files:
+        return None
+    
+    # Extract step numbers from filenames
+    steps = []
+    for f in files:
+        match = re.search(r'step_(\d{6})\.json$', f)
+        if match:
+            steps.append(int(match.group(1)))
+    
+    return max(steps) if steps else None
+
+
 def create_sampler_from_config(
     config,
     log_path: str | None = None,
@@ -836,6 +869,13 @@ def create_sampler_from_config(
     temperature = getattr(config, 'temperature', 1.0)
     save_freq = getattr(config, 'save_freq', 100)
     
+    # Auto-detect latest sampler checkpoint step
+    resume_step = _find_latest_sampler_step(log_path, sampler_type)
+    if resume_step is not None:
+        import logging
+        logger = logging.getLogger("Sampler")
+        logger.info(f"[Auto-Resume] Found latest sampler checkpoint at step {resume_step}")
+    
     return create_sampler(
         sampler_type=sampler_type,
         log_path=log_path,
@@ -843,7 +883,7 @@ def create_sampler_from_config(
         budget_s=save_freq,  # Use save_freq as budget proxy
         initial_exp_type=initial_exp_type,
         batch_size=batch_size,
-        resume_step=None,
+        resume_step=resume_step,  # Auto-detected or None
         # PUCT-specific kwargs
         c_puct=c_puct,
         gamma=gamma,

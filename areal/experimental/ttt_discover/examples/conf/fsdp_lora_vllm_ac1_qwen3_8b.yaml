@@ -203,16 +203,16 @@ saver:
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
   freq_epochs: 1
-  freq_steps: null
+  freq_steps: 1  # Save LoRA weights every step
   freq_secs: null
 
 recover:
-  mode: disabled
+  mode: on  # Enable automatic recovery
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
   freq_epochs: 1
-  freq_steps: null
+  freq_steps: 1  # Save recover checkpoint every step
   freq_secs: 3600
 
 evaluator:
