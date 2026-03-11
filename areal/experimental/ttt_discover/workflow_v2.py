@@ -86,7 +86,8 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         # Calculate number of workers based on CPU count (same logic as AsyncRewardWrapper)
         cpu_count = os.cpu_count() or 1
         # Conservative: use half of CPUs, at least 2, at most 8
-        max_code_workers = max(min(cpu_count // 2, 8), 2)
+        # MODIFIED: Use 64 workers for 160-core CPU (Scheme A)
+        max_code_workers = 64
         
         # Semaphore limits concurrent code execution to prevent overwhelming resources.
         self._code_semaphore = asyncio.Semaphore(max_code_workers)
