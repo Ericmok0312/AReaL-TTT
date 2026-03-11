@@ -65,6 +65,7 @@ class TTTVisualizer:
         show_mean_lines: bool = False,
         show_arrow: bool = True,
         arrow_y_offset: float = 0.95,
+        reward_transform: Optional[callable] = None,
     ) -> None:
         """
         绘制训练动态分布图（类似论文 Figure 1）
@@ -87,6 +88,7 @@ class TTTVisualizer:
             show_mean_lines: 是否显示均值垂直线
             show_arrow: 是否显示优化方向箭头
             arrow_y_offset: 箭头在 y 轴的位置（0-1 之间，相对于 y 轴范围）
+            reward_transform: 可选的 reward 转换函数，如 lambda r: 1/r 用于 AC1
         """
         # 创建图形
         fig, ax = plt.subplots(figsize=figsize)
@@ -113,6 +115,11 @@ class TTTVisualizer:
             
             step_data = history[key]
             rewards = np.array(step_data['rewards'])
+            
+            # 应用 reward transform（如 AC1: 1/reward）
+            if reward_transform is not None:
+                rewards = reward_transform(rewards)
+            
             all_rewards.extend(rewards)
             
             # 计算 KDE
@@ -132,7 +139,11 @@ class TTTVisualizer:
             
             # 可选：绘制均值线
             if show_mean_lines:
-                mean_val = step_data.get('mean_reward', np.mean(rewards))
+                raw_mean = step_data.get('mean_reward', np.mean(step_data['rewards']))
+                if reward_transform is not None:
+                    mean_val = reward_transform(raw_mean)
+                else:
+                    mean_val = raw_mean
                 ax.axvline(
                     mean_val, 
                     color=color, 
@@ -146,6 +157,11 @@ class TTTVisualizer:
             bon_data = history_dict[best_of_n_key]
             if isinstance(bon_data, dict) and 'rewards' in bon_data:
                 rewards = np.array(bon_data['rewards'])
+                
+                # 应用 reward transform
+                if reward_transform is not None:
+                    rewards = reward_transform(rewards)
+                
                 all_rewards.extend(rewards)
                 
                 kde, x_range, y_values = self._compute_kde(rewards)
@@ -294,6 +310,7 @@ class TTTVisualizer:
         output_path: str = 'reward_progression.png',
         figsize: tuple = (10, 6),
         dpi: int = 300,
+        reward_transform: Optional[callable] = None,
     ) -> None:
         """
         绘制 reward 进展图（mean/max/std 随 step 变化）
@@ -303,6 +320,7 @@ class TTTVisualizer:
             output_path: 输出图片路径
             figsize: 图片尺寸
             dpi: 图片分辨率
+            reward_transform: 可选的 reward 转换函数，如 lambda r: 1/r 用于 AC1
         """
         history = history_dict.get('history', history_dict)
         
@@ -316,9 +334,16 @@ class TTTVisualizer:
             if key.startswith('step_'):
                 step_data = history[key]
                 steps.append(step_data['step'])
-                mean_rewards.append(step_data['mean_reward'])
-                max_rewards.append(step_data['max_reward'])
-                std_rewards.append(step_data.get('std_reward', 0))
+                
+                # 应用 reward transform
+                if reward_transform is not None:
+                    mean_rewards.append(reward_transform(step_data['mean_reward']))
+                    max_rewards.append(reward_transform(step_data['max_reward']))
+                    std_rewards.append(reward_transform(step_data.get('std_reward', 0)))
+                else:
+                    mean_rewards.append(step_data['mean_reward'])
+                    max_rewards.append(step_data['max_reward'])
+                    std_rewards.append(step_data.get('std_reward', 0))
         
         if not steps:
             warnings.warn("No step data found in history")
@@ -367,6 +392,7 @@ def plot_training_dynamics(
     ylabel: str = 'Probability Density',
     output_path: str = 'training_dynamics.png',
     higher_is_better: bool = True,
+    reward_transform: Optional[callable] = None,
 ) -> None:
     """
     便捷的函数接口：绘制训练动态分布图
@@ -381,6 +407,7 @@ def plot_training_dynamics(
         ylabel: Y 轴标签
         output_path: 输出图片路径
         higher_is_better: reward 是否越大越好
+        reward_transform: 可选的 reward 转换函数，如 lambda r: 1/r 用于 AC1
     """
     visualizer = TTTVisualizer(higher_is_better=higher_is_better)
     visualizer.plot_training_dynamics(
@@ -392,12 +419,14 @@ def plot_training_dynamics(
         xlabel=xlabel,
         ylabel=ylabel,
         output_path=output_path,
+        reward_transform=reward_transform,
     )
 
 
 def plot_reward_progression(
     history_dict: dict,
     output_path: str = 'reward_progression.png',
+    reward_transform: Optional[callable] = None,
 ) -> None:
     """
     便捷的函数接口：绘制 reward 进展图
@@ -405,6 +434,7 @@ def plot_reward_progression(
     Args:
         history_dict: 训练历史数据字典
         output_path: 输出图片路径
+        reward_transform: 可选的 reward 转换函数，如 lambda r: 1/r 用于 AC1
     """
     visualizer = TTTVisualizer()
-    visualizer.plot_reward_progression(history_dict, output_path)
+    visualizer.plot_reward_progression(history_dict, output_path, reward_transform=reward_transform)

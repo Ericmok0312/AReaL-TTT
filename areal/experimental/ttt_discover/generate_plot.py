@@ -23,6 +23,14 @@ Usage:
         --xlabel "Runtime μs (lower is better ←)" \
         --higher_is_better False
 
+    # AC1 任务（reward 存储的是 1/bound，需要转换回 bound）
+    python generate_plot.py --history_path ./outputs/training_history.pkl \
+        --reward_transform ac1 \
+        --benchmark_value 1.5030 \
+        --xlabel "Upper Bound (lower is better ←)" \
+        --higher_is_better False \
+        --benchmark_label "Literature SOTA"
+
     # 自定义输出路径
     python generate_plot.py --history_path ./outputs/training_history.pkl \
         --output_path ./figures/my_training.png
@@ -57,6 +65,14 @@ Examples:
       --benchmark_value 100 \\
       --xlabel "Runtime μs (lower is better ←)" \\
       --higher_is_better False
+  
+  # AC1 (AlphaEvolve) - reward stored as 1/bound
+  python generate_plot.py --history_path ./outputs/training_history.pkl \\
+      --reward_transform ac1 \\
+      --benchmark_value 1.5030 \\
+      --xlabel "Upper Bound (lower is better ←)" \\
+      --higher_is_better False \\
+      --benchmark_label "Literature SOTA"
   
   # Custom steps (overrides auto-detection)
   python generate_plot.py --history_path ./outputs/training_history.pkl \\
@@ -142,6 +158,16 @@ Examples:
         type=int,
         default=300,
         help='Output image DPI (default: 300)'
+    )
+    
+    parser.add_argument(
+        '--reward_transform',
+        type=str,
+        default='none',
+        choices=['none', 'reciprocal', 'ac1'],
+        help='Transform applied to rewards before plotting. '
+             '"reciprocal" or "ac1": plot 1/reward (for AC1 where reward=1/bound). '
+             '"none": no transform (default: none)'
     )
     
     parser.add_argument(
@@ -268,6 +294,13 @@ def main():
             valid_steps = available_steps
             print(f"Using all {len(valid_steps)} available steps: {valid_steps}")
     
+    # 确定 reward transform
+    reward_transform = None
+    if args.reward_transform in ['reciprocal', 'ac1']:
+        reward_transform = lambda r: 1.0 / (r + 1e-10)  # 避免除以零
+        print(f"\n[AC1 Mode] Using reward transform: 1/reward (converting to bound)")
+        print(f"  Original reward: 1/bound -> Plotting bound directly")
+    
     # 创建可视化器
     visualizer = TTTVisualizer(higher_is_better=args.higher_is_better)
     
@@ -287,6 +320,7 @@ def main():
         title=args.title,
         output_path=str(output_path),
         dpi=args.dpi,
+        reward_transform=reward_transform,
     )
     print(f"Saved to: {output_path.absolute()}")
     
@@ -299,8 +333,9 @@ def main():
             history_dict=history_dict,
             output_path=str(progression_path),
             dpi=args.dpi,
+            reward_transform=reward_transform,
         )
-        print(f"Saved to: {progression_output.absolute()}")
+        print(f"Saved to: {progression_path.absolute()}")
     
     print("\n" + "="*60)
     print("Visualization complete!")
