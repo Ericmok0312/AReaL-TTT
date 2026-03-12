@@ -188,6 +188,7 @@ sampler:
   num_cpus: 2              # Paper: "2 CPUs each"
   gpu_type: H100
   n: 100
+  reset_puct_stats_on_resume: false
 
 # CRITICAL FIX: 添加 max_length 过滤超长样本
 train_dataset:
