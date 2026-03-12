@@ -430,6 +430,28 @@ def main(args):
         step_rewards = batch["rewards"].cpu().numpy()
         step_max_reward = float(step_rewards.max())
         step_mean_reward = float(step_rewards.mean())
+        
+        # ============================================================
+        # Global Reward Statistics (All-Reduce across all ranks)
+        # ============================================================
+        if dist.is_initialized():
+            # Convert to tensors for all-reduce
+            local_max = torch.tensor([step_max_reward], dtype=torch.float32, device=actor.device)
+            local_sum = torch.tensor([step_rewards.sum()], dtype=torch.float32, device=actor.device)
+            local_count = torch.tensor([len(step_rewards)], dtype=torch.float32, device=actor.device)
+            
+            # All-reduce: MAX for max reward, SUM for sum and count
+            dist.all_reduce(local_max, op=dist.ReduceOp.MAX)
+            dist.all_reduce(local_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(local_count, op=dist.ReduceOp.SUM)
+            
+            # Update with global statistics
+            step_max_reward = local_max.item()
+            step_mean_reward = (local_sum / local_count).item() if local_count.item() > 0 else 0.0
+            global_rollouts = int(local_count.item())
+        else:
+            global_rollouts = local_rollouts
+        
         best_reward = max(best_reward, step_max_reward)
         
         # ============================================================
@@ -450,6 +472,7 @@ def main(args):
             'batch_parents': batch_size,
             'group_size': group_size,
             'local_rollouts': local_rollouts,
+            'global_rollouts': global_rollouts,
             'step_max_reward': step_max_reward,
             'step_mean_reward': step_mean_reward,
         }
@@ -461,12 +484,12 @@ def main(args):
             additional_metrics=step_metrics
         )
         
-        logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] Rollouts: {local_rollouts}, "
+        logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] Rollouts: {local_rollouts} (global: {global_rollouts}), "
                    f"batch parents: {batch_size}, group_size: {group_size}")
         
         # Collect metrics for stats_logger
         metrics = {
-            "rollout/count": local_rollouts,
+            "rollout/count": global_rollouts,
             "reward/max": step_max_reward,
             "reward/mean": step_mean_reward,
             "reward/best_overall": best_reward,
