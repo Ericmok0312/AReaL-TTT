@@ -183,8 +183,8 @@ sampler:
   initial_exp_type: random  # Paper: "we initialize the buffer with random states"
   env_type: ac1  # 改为 AC1
   # AC1-specific parameters
-  budget_s: 600           # Paper: algorithm budget in seconds
-  eval_timeout: 600        # 10分钟 timeout (1100秒)
+  budget_s: 1100           # Paper: algorithm budget in seconds
+  eval_timeout: 1100        #  timeout (1100秒)
   num_cpus: 2              # Paper: "2 CPUs each"
   gpu_type: H100
   n: 100
