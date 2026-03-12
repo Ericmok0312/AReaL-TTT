@@ -326,6 +326,33 @@ def main(args):
     start_step = recover_info.last_step_info.next().global_step if recover_info else 0
     
     # ============================================================
+    # Clear stale pending rollouts from interrupted runs
+    # Ensures we start from a clean state at start_step, not mid-step
+    # ============================================================
+    if recover_info:
+        stale_total = 0
+        # Clear _pending_inputs deque in WorkflowExecutor
+        if hasattr(rollout, 'workflow_executor') and hasattr(rollout.workflow_executor, '_pending_inputs'):
+            stale_count = len(rollout.workflow_executor._pending_inputs)
+            if stale_count > 0:
+                rollout.workflow_executor._pending_inputs.clear()
+                stale_total += stale_count
+        
+        # Clear AsyncTaskRunner input_queue
+        if hasattr(rollout, 'workflow_executor') and hasattr(rollout.workflow_executor, 'runner'):
+            runner = rollout.workflow_executor.runner
+            if hasattr(runner, 'input_queue'):
+                while not runner.input_queue.empty():
+                    try:
+                        runner.input_queue.get_nowait()
+                        stale_total += 1
+                    except:
+                        break
+        
+        if stale_total > 0:
+            logger.warning(f"[Resume] Cleared {stale_total} stale pending rollouts. Starting step {start_step} from clean state.")
+    
+    # ============================================================
     # Reset PUCT stats if resuming from checkpoint (prevents _T inflation)
     # ============================================================
     if recover_info and getattr(config, 'reset_puct_stats_on_resume', True):
