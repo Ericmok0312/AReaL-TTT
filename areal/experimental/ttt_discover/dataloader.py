@@ -157,12 +157,20 @@ class TTTDiscoverDataLoader(StatefulDataLoader):
     def load_state_dict(self, state_dict: dict[str, Any], reset_puct_stats: bool = True):
         """Restore DataLoader iteration and PUCT sampler state.
         
+        NOTE: We intentionally do NOT call super().load_state_dict() because
+        StatefulDataLoader's iterator state restoration conflicts with our
+        custom _StateSamplerIterableDataset which uses an infinite __iter__
+        that calls sample_states() on each iteration. Restoring iterator
+        position for such a dataset is meaningless and can cause duplicate
+        sampling after resume.
+        
         Args:
             state_dict: State dict to load
             reset_puct_stats: If True, reset PUCT stats (_T, _n, _m) to 0 after loading.
                             This prevents _T inflation when starting a new experiment.
         """
-        super().load_state_dict(state_dict)
+        # Skip super().load_state_dict() to avoid iterator state restoration issues
+        # with infinite iterable datasets. Only restore sampler state.
         
         if 'sampler_step' in state_dict:
             step = state_dict['sampler_step']

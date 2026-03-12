@@ -331,6 +331,16 @@ def main(args):
     # ============================================================
     if recover_info:
         stale_total = 0
+        
+        # Clear WorkflowExecutor's data_generator cache to prevent stale data
+        # This is critical because StatefulDataLoader.load_state_dict() restores iterator state,
+        # but WorkflowExecutor's cached data_generator may be out of sync with the restored state,
+        # causing duplicate or incorrect requests after resume.
+        if hasattr(rollout, 'workflow_executor') and hasattr(rollout.workflow_executor, 'data_generator'):
+            delattr(rollout.workflow_executor, 'data_generator')
+            stale_total += 1
+            logger.info("[Resume] Cleared WorkflowExecutor data_generator cache to sync with restored dataloader state.")
+        
         # Clear _pending_inputs deque in WorkflowExecutor
         if hasattr(rollout, 'workflow_executor') and hasattr(rollout.workflow_executor, '_pending_inputs'):
             stale_count = len(rollout.workflow_executor._pending_inputs)
@@ -350,7 +360,7 @@ def main(args):
                         break
         
         if stale_total > 0:
-            logger.warning(f"[Resume] Cleared {stale_total} stale pending rollouts. Starting step {start_step} from clean state.")
+            logger.warning(f"[Resume] Cleared {stale_total} stale pending rollouts/caches. Starting step {start_step} from clean state.")
     
     # ============================================================
     # Reset PUCT stats if resuming from checkpoint (prevents _T inflation)
