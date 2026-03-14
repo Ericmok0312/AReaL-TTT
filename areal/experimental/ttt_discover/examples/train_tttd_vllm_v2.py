@@ -330,55 +330,91 @@ def main(args):
     # Ensures we start from a clean state at start_step, not mid-step
     # ============================================================
     if recover_info:
+        import queue
+        from areal.api.io_struct import RolloutStat
+        
         stale_total = 0
+        dispatcher = rollout.workflow_executor._dispatcher
         
-        # Clear WorkflowExecutor's data_generator cache to prevent stale data
-        # This is critical because StatefulDataLoader.load_state_dict() restores iterator state,
-        # but WorkflowExecutor's cached data_generator may be out of sync with the restored state,
-        # causing duplicate or incorrect requests after resume.
-        if hasattr(rollout, 'workflow_executor') and hasattr(rollout.workflow_executor, 'data_generator'):
+        # 1. 【关键】重置 StalenessManager - 解决 capacity 计算错误导致的 rollout 数量不对
+        sm = dispatcher.staleness_manager
+        with sm.lock:
+            old_stat = sm.rollout_stat
+            if old_stat.running > 0 or old_stat.enqueued > 0:
+                sm.rollout_stat = RolloutStat()  # 全部归零
+                stale_total += old_stat.running + old_stat.enqueued
+                logger.info(f"[Resume] Reset StalenessManager: "
+                           f"running={old_stat.running}->0, enqueued={old_stat.enqueued}->0, "
+                           f"accepted={old_stat.accepted}->0, rejected={old_stat.rejected}->0")
+        
+        # 2. 【关键】清理 _pending_results - 防止取到旧 step 的已完成结果
+        with dispatcher._result_lock:
+            stale_results = len(dispatcher._pending_results)
+            if stale_results > 0:
+                dispatcher._pending_results.clear()
+                dispatcher._active_task_ids.clear()
+                stale_total += stale_results
+                logger.info(f"[Resume] Cleared {stale_results} stale pending results")
+        
+        # 3. 清理 _pending_inputs（等待提交的任务）
+        with dispatcher._input_lock:
+            stale_inputs = len(dispatcher._pending_inputs)
+            if stale_inputs > 0:
+                dispatcher._pending_inputs.clear()
+                stale_total += stale_inputs
+                logger.info(f"[Resume] Cleared {stale_inputs} pending inputs")
+        
+        # 4. 清理 AsyncTaskRunner 的 input/output 队列
+        runner = dispatcher.runner
+        queue_cleared = 0
+        for q in [runner.input_queue, runner.output_queue]:
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                    queue_cleared += 1
+                except queue.Empty:
+                    break
+        if queue_cleared > 0:
+            stale_total += queue_cleared
+            logger.info(f"[Resume] Cleared {queue_cleared} items from async queues")
+        
+        # 5. 清理 data_generator 缓存
+        if hasattr(rollout.workflow_executor, 'data_generator'):
             delattr(rollout.workflow_executor, 'data_generator')
-            stale_total += 1
-            logger.info("[Resume] Cleared WorkflowExecutor data_generator cache to sync with restored dataloader state.")
-        
-        # Clear _pending_inputs deque in WorkflowExecutor
-        if hasattr(rollout, 'workflow_executor') and hasattr(rollout.workflow_executor, '_pending_inputs'):
-            stale_count = len(rollout.workflow_executor._pending_inputs)
-            if stale_count > 0:
-                rollout.workflow_executor._pending_inputs.clear()
-                stale_total += stale_count
-        
-        # Clear AsyncTaskRunner input_queue
-        if hasattr(rollout, 'workflow_executor') and hasattr(rollout.workflow_executor, 'runner'):
-            runner = rollout.workflow_executor.runner
-            if hasattr(runner, 'input_queue'):
-                while not runner.input_queue.empty():
-                    try:
-                        runner.input_queue.get_nowait()
-                        stale_total += 1
-                    except:
-                        break
+            logger.info("[Resume] Cleared data_generator cache")
         
         if stale_total > 0:
-            logger.warning(f"[Resume] Cleared {stale_total} stale pending rollouts/caches. Starting step {start_step} from clean state.")
+            logger.warning(f"[Resume] Total cleared: {stale_total} stale items. Starting step {start_step} from clean state.")
+        else:
+            logger.info(f"[Resume] No stale items found. Starting step {start_step}")
     
     # ============================================================
-    # Reset PUCT stats if resuming from checkpoint (prevents _T inflation)
+    # Print PUCTSampler state after recovery (for verification)
     # ============================================================
-    if recover_info and getattr(config, 'reset_puct_stats_on_resume', True):
-        if is_dp_head and hasattr(sampler, '_T'):
-            old_T = sampler._T
-            old_n_len = len(sampler._n)
-            old_m_len = len(sampler._m)
-            sampler._T = 0
-            sampler._n = {}
-            sampler._m = {}
-            logger.info("="*80)
-            logger.info(f"[PUCT Reset] Reset PUCT statistics on resume (reset_puct_stats_on_resume=true)")
-            logger.info(f"[PUCT Reset] _T: {old_T} -> 0")
-            logger.info(f"[PUCT Reset] _n entries: {old_n_len} -> 0")
-            logger.info(f"[PUCT Reset] _m entries: {old_m_len} -> 0")
-            logger.info("="*80)
+    if recover_info and is_dp_head and hasattr(sampler, '_states'):
+        logger.info("="*80)
+        logger.info(f"[PUCTSampler State] Loaded {len(sampler._states)} states at step {start_step}")
+        logger.info(f"[PUCTSampler State] _T={sampler._T}, _n entries={len(sampler._n)}, _m entries={len(sampler._m)}")
+        
+        # 打印前10个 states
+        display_count = min(10, len(sampler._states))
+        if display_count > 0:
+            logger.info(f"[PUCTSampler State] Top {display_count} states by value:")
+            # 按 value 排序，取前10
+            sorted_states = sorted(
+                sampler._states, 
+                key=lambda s: s.value if s.value is not None else float('-inf'), 
+                reverse=True
+            )[:display_count]
+            
+            for i, state in enumerate(sorted_states):
+                parent_info = ""
+                if state.parents:
+                    parent_id = state.parents[0].get('id', 'N/A')[:8] if state.parents else 'N/A'
+                    parent_info = f" (parent={parent_id}...)"
+                logger.info(f"  [{i+1}] id={state.id[:8]}... timestep={state.timestep} "
+                           f"value={state.value:.4f}{parent_info}")
+        logger.info("="*80)
     
     max_steps = getattr(config, 'max_steps', 50)
     best_reward = float('-inf')
@@ -386,11 +422,15 @@ def main(args):
     # ============================================================
     # Initialize Training History Logger
     # ============================================================
-    save_steps = getattr(config, 'save_steps', [i for i in range(0, max_steps)])
-    save_steps = [s for s in save_steps if start_step <= s < max_steps]
+    # 生成完整的 save_steps 列表（包含所有可能需要记录的 step）
+    all_save_steps = getattr(config, 'save_steps', list(range(0, max_steps)))
+    
+    # 对于续训：只记录 >= start_step 的 steps（避免重复记录已完成的 steps）
+    # 但 history 会从 checkpoint 加载之前的记录
+    future_save_steps = [s for s in all_save_steps if start_step <= s < max_steps]
     
     history_logger = TTTTrainingLogger(
-        save_steps=save_steps,
+        save_steps=future_save_steps,  # 只记录未来的 steps
         output_dir=config.saver.fileroot,
         is_dp_head=is_dp_head,
         filename='training_history.pkl',
@@ -399,7 +439,10 @@ def main(args):
     )
     
     if is_dp_head:
-        logger.info(f"[TTTLogger] Initialized with save_steps: {save_steps}")
+        existing_snapshots = len(history_logger.history) if recover_info else 0
+        logger.info(f"[TTTLogger] Initialized for step {start_step} to {max_steps}")
+        logger.info(f"[TTTLogger] Future save_steps: {future_save_steps}")
+        logger.info(f"[TTTLogger] Existing snapshots from checkpoint: {existing_snapshots}")
         logger.info(f"[TTTLogger] Output directory: {config.saver.fileroot}")
     
     logger.info(f"Starting training from step {start_step}/{max_steps}")

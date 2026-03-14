@@ -76,7 +76,7 @@ class TTTTrainingLogger:
         self.checkpoint_filename = checkpoint_filename
         self.aggregate_distributed = aggregate_distributed
         
-        # 训练历史数据
+        # 训练历史数据（从 checkpoint 恢复时会追加）
         self.history: dict[str, Any] = {}
         self.best_of_n_data: Optional[dict[str, Any]] = None
         
@@ -85,9 +85,15 @@ class TTTTrainingLogger:
         self.overall_best_solution: Optional[dict] = None
         self.overall_best_step: int = -1
         
-        # 尝试从 checkpoint 恢复
+        # 尝试从 checkpoint 恢复（支持断点续训追加记录）
         if self.is_dp_head:
-            self._try_load_checkpoint()
+            loaded = self._try_load_checkpoint()
+            if loaded:
+                logger.info(f"[TTTLogger] Resumed from checkpoint. "
+                           f"Existing history has {len(self.history)} snapshots, "
+                           f"overall_best={self.overall_best_reward:.4f} at step {self.overall_best_step}")
+            else:
+                logger.info(f"[TTTLogger] Starting fresh training history")
     
     def _try_load_checkpoint(self) -> bool:
         """尝试从 checkpoint 恢复历史记录"""
