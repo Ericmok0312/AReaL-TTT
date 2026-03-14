@@ -325,9 +325,9 @@ def main(args):
     )
     start_step = recover_info.last_step_info.next().global_step if recover_info else 0
     
-    ============================================================
-    FIX: Clear stale state after recovery (CORRECTED VERSION)
-    ============================================================
+    # ============================================================
+    # FIX: Clear stale state after recovery (CORRECTED VERSION)
+    # ============================================================
     if recover_info:
         import queue as queue_module
         
