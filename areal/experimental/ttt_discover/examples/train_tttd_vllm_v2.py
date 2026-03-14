@@ -334,8 +334,17 @@ def main(args):
         if is_dp_head:
             logger.info(f"[Resume] Cleaning up stale state for step {start_step}")
         
-        # 1. Reset StalenessManager to ensure correct capacity calculation
         dispatcher = rollout.workflow_executor._dispatcher
+        
+        # 1. Clear _pending_inputs - CRITICAL: prevents _commit_loop from submitting stale tasks
+        with dispatcher._input_lock:
+            stale_inputs = len(dispatcher._pending_inputs)
+            if stale_inputs > 0:
+                dispatcher._pending_inputs.clear()
+                if is_dp_head:
+                    logger.info(f"[Resume] Cleared {stale_inputs} stale pending inputs")
+        
+        # 2. Reset StalenessManager to ensure correct capacity calculation
         sm = dispatcher.staleness_manager
         with sm.lock:
             old_stat = sm.rollout_stat
@@ -344,11 +353,20 @@ def main(args):
                 logger.info(f"[Resume] Reset rollout stats: "
                            f"r={old_stat.running}/e={old_stat.enqueued}/a={old_stat.accepted}")
         
-        # 2. Clear data_generator cache to force fresh iteration
+        # 3. Clear data_generator cache to force fresh iteration
         if hasattr(rollout.workflow_executor, 'data_generator'):
             delattr(rollout.workflow_executor, 'data_generator')
             if is_dp_head:
                 logger.info("[Resume] Cleared data generator cache")
+        
+        # 4. Clear _pending_results to prevent stale results from being collected
+        with dispatcher._result_lock:
+            stale_results = len(dispatcher._pending_results)
+            if stale_results > 0:
+                dispatcher._pending_results.clear()
+                dispatcher._active_task_ids.clear()
+                if is_dp_head:
+                    logger.info(f"[Resume] Cleared {stale_results} stale pending results")
         
         if is_dp_head:
             logger.info(f"[Resume] Ready to start from step {start_step}")
