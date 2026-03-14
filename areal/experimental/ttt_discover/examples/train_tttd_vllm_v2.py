@@ -328,87 +328,87 @@ def main(args):
     # ============================================================
     # FIX: Clear stale state after recovery (CORRECTED VERSION)
     # ============================================================
-    if recover_info:
-        import queue as queue_module
+    # if recover_info:
+    #     import queue as queue_module
         
-        if is_dp_head:
-            logger.info(f"[Resume] Cleaning up stale state for step {start_step}")
+    #     if is_dp_head:
+    #         logger.info(f"[Resume] Cleaning up stale state for step {start_step}")
         
-        dispatcher = rollout.workflow_executor._dispatcher
+    #     dispatcher = rollout.workflow_executor._dispatcher
         
-        # 1. Clear _pending_inputs - CRITICAL: prevents _commit_loop from submitting stale tasks
-        with dispatcher._input_lock:
-            stale_inputs = len(dispatcher._pending_inputs)
-            if stale_inputs > 0:
-                dispatcher._pending_inputs.clear()
-                if is_dp_head:
-                    logger.info(f"[Resume] Cleared {stale_inputs} stale pending inputs")
+    #     # 1. Clear _pending_inputs - CRITICAL: prevents _commit_loop from submitting stale tasks
+    #     with dispatcher._input_lock:
+    #         stale_inputs = len(dispatcher._pending_inputs)
+    #         if stale_inputs > 0:
+    #             dispatcher._pending_inputs.clear()
+    #             if is_dp_head:
+    #                 logger.info(f"[Resume] Cleared {stale_inputs} stale pending inputs")
         
-        # 2. Clear AsyncTaskRunner queues - CRITICAL: tasks may have been submitted before cleanup
-        runner = dispatcher.runner
-        queue_cleared = 0
-        for q in [runner.input_queue, runner.output_queue]:
-            while not q.empty():
-                try:
-                    q.get_nowait()
-                    queue_cleared += 1
-                except queue_module.Empty:
-                    break
-        if is_dp_head and queue_cleared > 0:
-            logger.info(f"[Resume] Cleared {queue_cleared} items from async task queues")
+    #     # 2. Clear AsyncTaskRunner queues - CRITICAL: tasks may have been submitted before cleanup
+    #     runner = dispatcher.runner
+    #     queue_cleared = 0
+    #     for q in [runner.input_queue, runner.output_queue]:
+    #         while not q.empty():
+    #             try:
+    #                 q.get_nowait()
+    #                 queue_cleared += 1
+    #             except queue_module.Empty:
+    #                 break
+    #     if is_dp_head and queue_cleared > 0:
+    #         logger.info(f"[Resume] Cleared {queue_cleared} items from async task queues")
         
-        # 3. CRITICAL FIX: Set correct 'accepted' count for capacity calculation
-        # Normal training: accepted = step * batch_size at each step start
-        # Recovery: version = start_step, so accepted should be (start_step - 1) * batch_size
-        # This ensures staleness_capacity = (0 + 37 + 1) * 8 - 296 = 8 (same as normal training)
-        sm = dispatcher.staleness_manager
-        with sm.lock:
-            consumer_bs = sm.consumer_batch_size
-            # Calculate what accepted should be: (completed_steps) * batch_size
-            completed_steps = start_step  # Steps 0..start_step-1 are completed
-            expected_accepted = completed_steps * batch_size
+    #     # 3. CRITICAL FIX: Set correct 'accepted' count for capacity calculation
+    #     # Normal training: accepted = step * consumer_batch_size at each step start
+    #     # Recovery: version = start_step, so accepted should be start_step * consumer_batch_size
+    #     # This ensures staleness_capacity = (0 + 37 + 1) * 2 - 74 = 2 (same as normal training)
+    #     sm = dispatcher.staleness_manager
+    #     with sm.lock:
+    #         consumer_bs = sm.consumer_batch_size
+    #         # Calculate what accepted should be: completed_steps * consumer_batch_size
+    #         completed_steps = start_step  # Steps 0..start_step-1 are completed
+    #         expected_accepted = completed_steps * consumer_bs
             
-            old_accepted = sm.rollout_stat.accepted
-            old_running = sm.rollout_stat.running
-            old_enqueued = sm.rollout_stat.enqueued
+    #         old_accepted = sm.rollout_stat.accepted
+    #         old_running = sm.rollout_stat.running
+    #         old_enqueued = sm.rollout_stat.enqueued
             
-            # Reset running and enqueued (these are transient)
-            sm.rollout_stat.running = 0
-            sm.rollout_stat.enqueued = 0
+    #         # Reset running and enqueued (these are transient)
+    #         sm.rollout_stat.running = 0
+    #         sm.rollout_stat.enqueued = 0
             
-            # Set accepted to expected value for correct capacity calculation
-            if old_accepted != expected_accepted:
-                sm.rollout_stat.accepted = expected_accepted
-                if is_dp_head:
-                    logger.info(f"[Resume] Fixed accepted count: {old_accepted} -> {expected_accepted} "
-                               f"(expected after {completed_steps} completed steps, batch_size={batch_size})")
-            elif is_dp_head:
-                logger.info(f"[Resume] accepted count is correct: {old_accepted}")
+    #         # Set accepted to expected value for correct capacity calculation
+    #         if old_accepted != expected_accepted:
+    #             sm.rollout_stat.accepted = expected_accepted
+    #             if is_dp_head:
+    #                 logger.info(f"[Resume] Fixed accepted count: {old_accepted} -> {expected_accepted} "
+    #                            f"(expected after {completed_steps} completed steps, consumer_batch_size={consumer_bs})")
+    #         elif is_dp_head:
+    #             logger.info(f"[Resume] accepted count is correct: {old_accepted}")
             
-            # Verify capacity will be correct
-            version = rollout.get_version()  # Should be start_step
-            max_staleness = sm.max_staleness
-            capacity = (max_staleness + version + 1) * consumer_bs - sm.rollout_stat.accepted
-            if is_dp_head:
-                logger.info(f"[Resume] staleness_capacity = ({max_staleness} + {version} + 1) * {consumer_bs} - {sm.rollout_stat.accepted} = {capacity}")
+    #         # Verify capacity will be correct
+    #         version = rollout.get_version()  # Should be start_step
+    #         max_staleness = sm.max_staleness
+    #         capacity = (max_staleness + version + 1) * consumer_bs - sm.rollout_stat.accepted
+    #         if is_dp_head:
+    #             logger.info(f"[Resume] staleness_capacity = ({max_staleness} + {version} + 1) * {consumer_bs} - {sm.rollout_stat.accepted} = {capacity}")
         
-        # 4. Clear data_generator cache to force fresh iteration
-        if hasattr(rollout.workflow_executor, 'data_generator'):
-            delattr(rollout.workflow_executor, 'data_generator')
-            if is_dp_head:
-                logger.info("[Resume] Cleared data generator cache")
+    #     # 4. Clear data_generator cache to force fresh iteration
+    #     if hasattr(rollout.workflow_executor, 'data_generator'):
+    #         delattr(rollout.workflow_executor, 'data_generator')
+    #         if is_dp_head:
+    #             logger.info("[Resume] Cleared data generator cache")
         
-        # 5. Clear _pending_results to prevent stale results from being collected
-        with dispatcher._result_lock:
-            stale_results = len(dispatcher._pending_results)
-            if stale_results > 0:
-                dispatcher._pending_results.clear()
-                dispatcher._active_task_ids.clear()
-                if is_dp_head:
-                    logger.info(f"[Resume] Cleared {stale_results} stale pending results")
+    #     # 5. Clear _pending_results to prevent stale results from being collected
+    #     with dispatcher._result_lock:
+    #         stale_results = len(dispatcher._pending_results)
+    #         if stale_results > 0:
+    #             dispatcher._pending_results.clear()
+    #             dispatcher._active_task_ids.clear()
+    #             if is_dp_head:
+    #                 logger.info(f"[Resume] Cleared {stale_results} stale pending results")
         
-        if is_dp_head:
-            logger.info(f"[Resume] Ready to start from step {start_step}")
+    #     if is_dp_head:
+    #         logger.info(f"[Resume] Ready to start from step {start_step}")
     
     # ============================================================
     # Print PUCTSampler state after recovery (for verification)
