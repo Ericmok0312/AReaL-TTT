@@ -326,67 +326,32 @@ def main(args):
     start_step = recover_info.last_step_info.next().global_step if recover_info else 0
     
     # ============================================================
-    # Clear stale pending rollouts from interrupted runs
-    # Ensures we start from a clean state at start_step, not mid-step
+    # FIX: Clear stale state after recovery
     # ============================================================
     if recover_info:
-        import queue
         from areal.api.io_struct import RolloutStat
         
-        stale_total = 0
-        dispatcher = rollout.workflow_executor._dispatcher
+        if is_dp_head:
+            logger.info(f"[Resume] Cleaning up stale state for step {start_step}")
         
-        # 1. 【关键】重置 StalenessManager - 解决 capacity 计算错误导致的 rollout 数量不对
+        # 1. Reset StalenessManager to ensure correct capacity calculation
+        dispatcher = rollout.workflow_executor._dispatcher
         sm = dispatcher.staleness_manager
         with sm.lock:
             old_stat = sm.rollout_stat
-            if old_stat.running > 0 or old_stat.enqueued > 0:
-                sm.rollout_stat = RolloutStat()  # 全部归零
-                stale_total += old_stat.running + old_stat.enqueued
-                logger.info(f"[Resume] Reset StalenessManager: "
-                           f"running={old_stat.running}->0, enqueued={old_stat.enqueued}->0, "
-                           f"accepted={old_stat.accepted}->0, rejected={old_stat.rejected}->0")
+            sm.rollout_stat = RolloutStat()  # Fresh stats
+            if is_dp_head and (old_stat.running or old_stat.enqueued or old_stat.accepted):
+                logger.info(f"[Resume] Reset rollout stats: "
+                           f"r={old_stat.running}/e={old_stat.enqueued}/a={old_stat.accepted}")
         
-        # 2. 【关键】清理 _pending_results - 防止取到旧 step 的已完成结果
-        with dispatcher._result_lock:
-            stale_results = len(dispatcher._pending_results)
-            if stale_results > 0:
-                dispatcher._pending_results.clear()
-                dispatcher._active_task_ids.clear()
-                stale_total += stale_results
-                logger.info(f"[Resume] Cleared {stale_results} stale pending results")
-        
-        # 3. 清理 _pending_inputs（等待提交的任务）
-        with dispatcher._input_lock:
-            stale_inputs = len(dispatcher._pending_inputs)
-            if stale_inputs > 0:
-                dispatcher._pending_inputs.clear()
-                stale_total += stale_inputs
-                logger.info(f"[Resume] Cleared {stale_inputs} pending inputs")
-        
-        # 4. 清理 AsyncTaskRunner 的 input/output 队列
-        runner = dispatcher.runner
-        queue_cleared = 0
-        for q in [runner.input_queue, runner.output_queue]:
-            while not q.empty():
-                try:
-                    q.get_nowait()
-                    queue_cleared += 1
-                except queue.Empty:
-                    break
-        if queue_cleared > 0:
-            stale_total += queue_cleared
-            logger.info(f"[Resume] Cleared {queue_cleared} items from async queues")
-        
-        # 5. 清理 data_generator 缓存
+        # 2. Clear data_generator cache to force fresh iteration
         if hasattr(rollout.workflow_executor, 'data_generator'):
             delattr(rollout.workflow_executor, 'data_generator')
-            logger.info("[Resume] Cleared data_generator cache")
+            if is_dp_head:
+                logger.info("[Resume] Cleared data generator cache")
         
-        if stale_total > 0:
-            logger.warning(f"[Resume] Total cleared: {stale_total} stale items. Starting step {start_step} from clean state.")
-        else:
-            logger.info(f"[Resume] No stale items found. Starting step {start_step}")
+        if is_dp_head:
+            logger.info(f"[Resume] Ready to start from step {start_step}")
     
     # ============================================================
     # Print PUCTSampler state after recovery (for verification)
