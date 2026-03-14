@@ -498,6 +498,7 @@ except Exception as e:
 '''
             f.write(runner_code)
         
+        process = None
         try:
             # Run in subprocess with timeout
             env = os.environ.copy()
@@ -545,10 +546,29 @@ except Exception as e:
                     os.killpg(os.getpgid(process.pid), signal.SIGKILL)
                 except:
                     pass
+                # CRITICAL: Must wait() to reap zombie process
+                try:
+                    process.wait(timeout=5)
+                except:
+                    pass
                 return None, f"Timeout after {self.eval_timeout}s"
             
         finally:
-            # Cleanup
+            # CRITICAL: Ensure subprocess is always cleaned up to prevent zombie processes
+            if process is not None:
+                if process.poll() is None:
+                    # Process is still running, kill it
+                    try:
+                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    except:
+                        pass
+                # Always wait to reap zombie, even if process already terminated
+                try:
+                    process.wait(timeout=5)
+                except:
+                    pass
+            
+            # Cleanup temp files
             try:
                 os.unlink(code_path)
                 os.unlink(runner_path)
