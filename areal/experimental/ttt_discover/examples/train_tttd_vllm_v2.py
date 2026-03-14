@@ -329,6 +329,7 @@ def main(args):
     # FIX: Clear stale state after recovery
     # ============================================================
     if recover_info:
+        import queue as queue_module
         from areal.api.io_struct import RolloutStat
         
         if is_dp_head:
@@ -344,7 +345,20 @@ def main(args):
                 if is_dp_head:
                     logger.info(f"[Resume] Cleared {stale_inputs} stale pending inputs")
         
-        # 2. Reset StalenessManager to ensure correct capacity calculation
+        # 2. Clear AsyncTaskRunner queues - CRITICAL: tasks may have been submitted before cleanup
+        runner = dispatcher.runner
+        queue_cleared = 0
+        for q in [runner.input_queue, runner.output_queue]:
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                    queue_cleared += 1
+                except queue_module.Empty:
+                    break
+        if is_dp_head and queue_cleared > 0:
+            logger.info(f"[Resume] Cleared {queue_cleared} items from async task queues")
+        
+        # 3. Reset StalenessManager to ensure correct capacity calculation
         sm = dispatcher.staleness_manager
         with sm.lock:
             old_stat = sm.rollout_stat
@@ -353,13 +367,13 @@ def main(args):
                 logger.info(f"[Resume] Reset rollout stats: "
                            f"r={old_stat.running}/e={old_stat.enqueued}/a={old_stat.accepted}")
         
-        # 3. Clear data_generator cache to force fresh iteration
+        # 4. Clear data_generator cache to force fresh iteration
         if hasattr(rollout.workflow_executor, 'data_generator'):
             delattr(rollout.workflow_executor, 'data_generator')
             if is_dp_head:
                 logger.info("[Resume] Cleared data generator cache")
         
-        # 4. Clear _pending_results to prevent stale results from being collected
+        # 5. Clear _pending_results to prevent stale results from being collected
         with dispatcher._result_lock:
             stale_results = len(dispatcher._pending_results)
             if stale_results > 0:
