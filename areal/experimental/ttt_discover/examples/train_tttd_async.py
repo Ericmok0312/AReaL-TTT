@@ -106,10 +106,7 @@ class TTTDPPOTrainer(PPOTrainer):
         if config.actor.kl_ctl > 0 and config.ref is not None:
             self.ref = self._create_tttd_actor(config.ref)
         
-        # Connect sampler to actor for distributed synchronization
-        self.actor.connect_sampler(self.sampler)
-        
-        # Create dataloaders using sampler
+        # Create dataloaders using sampler (before engine init, only needs process group)
         self.train_dataloader = self._create_tttd_dataloader(
             sampler=self.sampler,
             rank=self.actor.data_parallel_rank,
@@ -125,6 +122,10 @@ class TTTDPPOTrainer(PPOTrainer):
         
         # Initialize models
         self._initialize_engines()
+        
+        # Connect sampler to actor for distributed synchronization
+        # Must be after _initialize_engines() because it uses self.cpu_group
+        self.actor.connect_sampler(self.sampler)
         
         # Setup weight update meta
         self._setup_weight_update_meta()
