@@ -424,10 +424,9 @@ class TTTDPPOTrainer(PPOTrainer):
         logger.info(f"Starting training from step {start_step}/{max_steps}")
         
         for global_step in range(start_step, max_steps):
-            if (
-                config.total_train_steps is not None
-                and global_step >= config.total_train_steps
-            ):
+            # TTT-Discover uses max_steps for termination
+            max_steps_limit = getattr(config, 'max_steps', None)
+            if max_steps_limit is not None and global_step >= max_steps_limit:
                 break
             
             # In TTT-Discover, each step is effectively an epoch
@@ -695,6 +694,19 @@ class TTTDPPOTrainer(PPOTrainer):
                     f"    --history_path {history_path} \\\n"
                     f"    --benchmark_value 2.635983"
                 )
+
+    def close(self):
+        """Cleanup resources. Overrides parent to handle missing eval_rollout."""
+        self.stats_logger.close()
+        # TTT-Discover doesn't use eval_rollout
+        if hasattr(self, 'rollout') and self.rollout is not None:
+            self.rollout.destroy()
+        if hasattr(self, 'ref') and self.ref is not None:
+            self.ref.destroy()
+        if hasattr(self, 'actor') and self.actor is not None:
+            self.actor.destroy()
+        from areal.utils import perf_tracer
+        perf_tracer.save(force=True)
 
 
 def main(args):
