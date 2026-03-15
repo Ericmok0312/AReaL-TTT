@@ -445,9 +445,10 @@ class TTTDPPOTrainer(PPOTrainer):
             # === Simplified Timing: only 3 phases ===
             step_start_time = time.perf_counter()
             
-            # Reset workflow buffers
-            if hasattr(workflow, 'reset'):
-                workflow.reset()
+            # Note: We intentionally do NOT call workflow.reset() here.
+            # In pure async mode, we want to process ALL completed rollouts,
+            # including those from previous steps that finished late.
+            # get_pending_updates(clear=True) handles cleanup automatically.
             
             # === Rollout with async prepare_batch ===
             rollout_start = time.perf_counter()
@@ -473,6 +474,28 @@ class TTTDPPOTrainer(PPOTrainer):
             
             # === Sampler Synchronization (part of training phase) ===
             local_children, local_parents, local_failed = workflow.get_pending_updates(clear=True)
+            
+            # Async monitoring: track expected vs actual rollouts for research analysis
+            expected_per_rank = (batch_size * group_size) // self.actor.data_parallel_world_size
+            actual_children = len(local_children)
+            actual_failed = len(local_failed)
+            actual_total = actual_children + actual_failed
+            async_overhead = actual_total - expected_per_rank
+            
+            # Record async metrics for history_logger analysis
+            async_metrics = {
+                'expected_rollouts': expected_per_rank,
+                'actual_children': actual_children,
+                'actual_failed': actual_failed,
+                'actual_total': actual_total,
+                'async_overhead': async_overhead,
+            }
+            
+            if async_overhead != 0:
+                logger.info(f"[Async Monitor][Step {global_step}][Rank {self.actor.dp_rank}] "
+                           f"expected={expected_per_rank}, actual={actual_total} "
+                           f"(children={actual_children}, failed={actual_failed}), "
+                           f"overhead={async_overhead:+d}")
             
             logger.info(f"[Step {global_step}][Rank {self.actor.dp_rank}] Local updates: "
                        f"children={len(local_children)}, parents={len(local_parents)}, failed={len(local_failed)}")
@@ -642,6 +665,9 @@ class TTTDPPOTrainer(PPOTrainer):
             # Add detailed timing stats if available
             if timing_stats:
                 step_metrics['timing_stats'] = timing_stats
+            
+            # Add async metrics for research analysis
+            step_metrics['async'] = async_metrics
             
             # Record to history logger (now includes timing)
             self.history_logger.record_step(
