@@ -202,8 +202,13 @@ def main(args):
     if config.use_lora and not config.skip_lora_check:
         import json
         lora_output_path = "./lora_init"
-        if hasattr(config, 'vllm') and isinstance(config.vllm, dict):
-            lora_modules_str = config.vllm.get('lora_modules', '')
+        # Support both dict (legacy) and vLLMConfig dataclass
+        if hasattr(config, 'vllm'):
+            if isinstance(config.vllm, dict):
+                lora_modules_str = config.vllm.get('lora_modules', '')
+            else:
+                # vLLMConfig dataclass
+                lora_modules_str = getattr(config.vllm, 'lora_modules', '') or ''
             if lora_modules_str:
                 try:
                     lora_modules = json.loads(lora_modules_str)

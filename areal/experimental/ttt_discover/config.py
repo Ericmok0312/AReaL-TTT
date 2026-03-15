@@ -12,6 +12,8 @@ from areal.api.cli_args import (
     GenerationHyperparameters,
     MicroBatchSpec,
     PPOCriticConfig,
+    vLLMConfig,
+    SGLangConfig,
 )
 
 
@@ -171,12 +173,12 @@ class TTTDPPOActorConfig(PPOActorConfig):
         default=None,
         metadata={"help": "Critic model configuration"}
     )
-    sglang: dict = field(
-        default_factory=dict,
+    sglang: SGLangConfig = field(
+        default_factory=SGLangConfig,
         metadata={"help": "SGLang configuration"}
     )
-    vllm: dict = field(
-        default_factory=dict,
+    vllm: vLLMConfig = field(
+        default_factory=vLLMConfig,
         metadata={"help": "vLLM configuration"}
     )
     sampler: SamplerConfig = field(
@@ -319,6 +321,14 @@ class TTTDPPOActorConfig(PPOActorConfig):
         # Convert ref from dict to PPOActorConfig if needed
         if isinstance(self.ref, dict):
             self.ref = PPOActorConfig(**self.ref)
+        
+        # Convert vllm from dict to vLLMConfig if needed
+        if isinstance(self.vllm, dict):
+            self.vllm = vLLMConfig(**self.vllm)
+        
+        # Convert sglang from dict to SGLangConfig if needed
+        if isinstance(self.sglang, dict):
+            self.sglang = SGLangConfig(**self.sglang)
         
         # Convert mb_spec from dict to MicroBatchSpec if needed
         if isinstance(self.mb_spec, dict):
