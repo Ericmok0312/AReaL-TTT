@@ -322,3 +322,42 @@ class TTTDPPOActorConfig(PPOActorConfig):
             # Optional: Warn or auto-adjust if using entropic with default reward scaling
             if not hasattr(self, 'reward_scaling') or self.reward_scaling == 1.0:
                 pass
+
+
+# Import envs here to avoid circular imports
+def create_env_from_config(config):
+    """
+    Create environment based on config's sampler.env_type.
+    
+    Supports:
+    - 'cp': Circle Packing
+    - 'ac1', 'ac2': Inequalities (AC1/AC2)
+    
+    Args:
+        config: Config object with sampler and saver attributes
+        
+    Returns:
+        Environment instance
+    """
+    # Import here to avoid circular imports
+    from .envs import CirclePackingEnv, InequalitiesEnv
+    
+    env_type = getattr(config.sampler, 'env_type', 'ac1')
+    eval_timeout = getattr(config.sampler, 'eval_timeout', 600)
+    
+    if env_type == 'cp':
+        return CirclePackingEnv(
+            n_item=getattr(config.sampler, 'n_item', 26),
+            eval_timeout=eval_timeout,
+            log_dir=config.saver.fileroot,
+        )
+    elif env_type in ('ac1', 'ac2'):
+        return InequalitiesEnv(
+            problem_type=env_type,
+            budget_s=getattr(config.sampler, 'budget_s', 1000),
+            eval_timeout=eval_timeout,
+            log_dir=config.saver.fileroot,
+            num_cpus=getattr(config.sampler, 'num_cpus', 2),
+        )
+    else:
+        raise ValueError(f"Unknown env_type: {env_type}")

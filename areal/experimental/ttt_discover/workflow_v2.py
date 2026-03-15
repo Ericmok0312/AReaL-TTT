@@ -114,6 +114,60 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         
         # Cache failed rollouts for delayed update (synced across ranks in distributed training)
         self._failed_parents: list[Any] = []
+        
+        # Track timing for execute tail latency analysis
+        # Records (gpu_done_time, execute_done_time) for each rollout
+        self._rollout_timing_pairs: list[tuple[float, float]] = []
+
+    def get_execute_tail_latency(self, clear: bool = True) -> float:
+        """
+        Calculate execute tail latency: time from last GPU done to last execute done.
+        
+        This measures how long it takes to finish all code executions after
+        all LLM inferences are complete.
+        
+        Returns:
+            float: Tail latency in seconds, or 0.0 if no data
+        """
+        if not self._rollout_timing_pairs:
+            return 0.0
+        
+        gpu_times = [t[0] for t in self._rollout_timing_pairs]
+        exec_times = [t[1] for t in self._rollout_timing_pairs]
+        
+        last_gpu_done = max(gpu_times)
+        last_exec_done = max(exec_times)
+        
+        tail_latency = last_exec_done - last_gpu_done
+        
+        if clear:
+            self._rollout_timing_pairs = []
+        
+        return tail_latency
+    
+    def get_timing_stats(self, clear: bool = True) -> dict:
+        """Get detailed timing statistics for analysis."""
+        if not self._rollout_timing_pairs:
+            return {}
+        
+        gpu_times = [t[0] for t in self._rollout_timing_pairs]
+        exec_times = [t[1] for t in self._rollout_timing_pairs]
+        
+        stats = {
+            'n_rollouts': len(self._rollout_timing_pairs),
+            'first_gpu_done': min(gpu_times),
+            'last_gpu_done': max(gpu_times),
+            'first_exec_done': min(exec_times),
+            'last_exec_done': max(exec_times),
+            'gpu_span': max(gpu_times) - min(gpu_times),
+            'exec_span': max(exec_times) - min(exec_times),
+            'tail_latency': max(exec_times) - max(gpu_times),
+        }
+        
+        if clear:
+            self._rollout_timing_pairs = []
+        
+        return stats
 
     def _create_trajectory(
         self,
@@ -172,13 +226,21 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         self,
         resp: ModelResponse,
         task_data: dict[str, Any],
+        gpu_done_time: float | None = None,
     ) -> tuple[float, EnvResult, str]:
         """Compute reward by executing code in environment.
         
         This method uses run_in_executor to run sync env.execute in a thread pool,
         preventing blocking of the async event loop. This allows multiple rollouts
         to execute code concurrently without stalling AReaL's AsyncTaskRunner.
+        
+        Args:
+            resp: Model response from generation
+            task_data: Task data including state object
+            gpu_done_time: Timestamp when GPU inference completed (for tail latency measurement)
         """
+        import time
+        
         completion_str = self.tokenizer.decode(resp.output_tokens)
         
         code = self.env.extract_code(completion_str)
@@ -191,6 +253,9 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 state=state,
                 fail_type="code_extraction_failed",
             )
+            # Still record timing even for failed code extraction
+            if gpu_done_time is not None:
+                self._rollout_timing_pairs.append((gpu_done_time, time.perf_counter()))
             return result.reward, result, ""
         
         try:
@@ -244,6 +309,10 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             is_valid=float(result.is_valid),
         )
         
+        # Record timing pair: (gpu_done_time, execute_done_time)
+        if gpu_done_time is not None:
+            self._rollout_timing_pairs.append((gpu_done_time, time.perf_counter()))
+        
         return result.reward, result, code
 
     @trace_session("arun_episode")
@@ -263,6 +332,8 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         
         No external metadata needed - everything is handled internally.
         """
+        import time
+        
         state = data.get("_state_obj")
         if state is None:
             logger.error("Missing '_state_obj' in data")
@@ -341,8 +412,11 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 
                 logger.info(f"[Teacher Forcing] Forced generation completed")
             
-            # Compute reward on final response
-            reward, result, code = await self._compute_reward(resp, data)
+            # Record GPU completion time for tail latency measurement
+            gpu_done_time = time.perf_counter()
+            
+            # Compute reward on final response (pass gpu_done_time for timing measurement)
+            reward, result, code = await self._compute_reward(resp, data, gpu_done_time)
             
             # Log validation failure (concise)
             if not result.is_valid:

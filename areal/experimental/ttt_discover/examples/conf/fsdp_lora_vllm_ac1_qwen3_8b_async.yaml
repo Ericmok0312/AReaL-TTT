@@ -1,0 +1,345 @@
+# TTT-Discover Async Training Configuration
+# FSDP + LoRA + vLLM for AC1 (Inequality) with Qwen3-8B
+# 
+# This config uses AReaL's native async training framework with:
+# - max_head_offpolicyness > 0 for async rollout
+# - Standard PPOConfig structure
+# - TTTDPPOTrainer for custom advantage computation
+#
+# Usage:
+#   python -m areal.experimental.ttt_discover.examples.train_tttd_async \
+#     --config conf/fsdp_lora_vllm_ac1_qwen3_8b_async.yaml
+
+experiment_name: tttd-async-qwen3-8b-ac1
+trial_name: trial0
+
+seed: 1
+enable_offload: false
+total_train_epochs: 50
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 1
+  n_gpus_per_node: 8
+  fileroot: ./outputs_async_ac1
+  name_resolve:
+    type: nfs
+    nfs_record_root: /tmp/areal/name_resolve
+
+# Allocation mode: vLLM for rollout, FSDP for training
+# Format: vllm[rollout]:d{dp_size}p{pp_size}t{tp_size}+fsdp[actor]:d{dp_size}p{pp_size}t{tp_size}
+allocation_mode: vllm[rollout]:d4p1t1+fsdp[actor]:d4p1t1
+
+scheduler:
+  type: null
+
+# ============================================
+# Actor (Training) Configuration
+# ============================================
+actor:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: Qwen/Qwen3-8B
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  
+  # Micro-batch spec for training
+  mb_spec:
+    max_tokens_per_mb: 32768
+    n_mbs: 1
+    granularity: 1
+  
+  # Optimizer settings (from paper)
+  optimizer:
+    type: adam
+    lr: 4e-5
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.95
+    eps: 1e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.001
+  
+  # PPO parameters
+  eps_clip: 0.4
+  eps_clip_higher: null
+  temperature: ${gconfig.temperature}
+  reward_scaling: 10.0
+  reward_bias: -0.5
+  kl_ctl: 0.1
+  kl_estimator: k1
+  ppo_n_minibatches: 1
+  
+  # Async RL parameters
+  recompute_logprob: true
+  use_decoupled_loss: true
+  behav_imp_weight_cap: 5.0
+  importance_sampling_level: token
+  prox_logp_method: recompute
+  
+  # Reward normalization
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+    mean_leave1out: false
+    std_unbiased: true
+    eps: 1e-5
+  
+  # Advantage normalization
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+    mean_leave1out: false
+    std_unbiased: true
+    eps: 1e-5
+  
+  # LoRA settings
+  weight_update_mode: xccl
+  use_lora: true
+  peft_type: lora
+  lora_rank: 32
+  lora_alpha: 16
+  target_modules: [all-linear]
+  
+  # TTT-Discover specific advantage estimator
+  # Options: gae, mean_baseline, entropic, entropic_adaptive_beta
+  adv_estimator: entropic_adaptive_beta
+  adv_estimator_beta: 1.0
+  adv_estimator_target_kl: 0.693
+  adv_estimator_beta_max: 1000000.0
+  adv_estimator_beta_iters: 60
+  
+  max_new_tokens: ${gconfig.max_new_tokens}
+  
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars: {}
+
+# ============================================
+# Reference Model Configuration
+# ============================================
+ref:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${actor.path}
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: false
+  dtype: ${actor.dtype}
+  mb_spec:
+    max_tokens_per_mb: 32768
+    n_mbs: 1
+  optimizer: null
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  scheduling_spec: ${actor.scheduling_spec}
+
+# ============================================
+# Rollout (Inference) Configuration
+# ============================================
+rollout:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  
+  # Async training parameters
+  # max_head_offpolicyness > 0 enables async training
+  # Higher values = more async = higher throughput but more off-policy
+  max_head_offpolicyness: 2
+  max_concurrent_rollouts: 512
+  queue_size: null
+  consumer_batch_size: ${sampler.batch_size}
+  
+  enable_rollout_tracing: false
+  pause_grace_period: 1.0
+  scheduling_spec: ${actor.scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+  use_lora: ${actor.use_lora}
+  
+  # Request scheduling
+  schedule_policy: round_robin
+  setup_timeout: 300.0
+  request_timeout: 3600
+  request_retries: 3
+
+# ============================================
+# vLLM Configuration
+# ============================================
+vllm:
+  model: ${actor.path}
+  seed: ${seed}
+  skip_tokenizer_init: false
+  dtype: ${actor.dtype}
+  max_model_len: 32768
+  gpu_memory_utilization: 0.85
+  enforce_eager: false
+  
+  # LoRA configuration
+  enable_lora: ${actor.use_lora}
+  max_lora_rank: 32
+  # CRITICAL: This path must exist BEFORE training starts
+  # Run prepare_lora_init.py first to create the initial LoRA adapter
+  lora_modules: '{"name": "${gconfig.lora_name}", "path": "./lora_init_ac1_async", "base_model_name": "${actor.path}"}'
+  
+  # Performance settings
+  max_num_seqs: 256
+  block_size: 16
+  swap_space: 4
+  cpu_offload_gb: 0
+  disable_sliding_window: true
+  no_enable_chunked_prefill: false
+  no_enable_prefix_caching: true
+  distributed_executor_backend: mp
+  worker_extension_cls: areal.engine.vllm_ext.vllm_worker_extension.VLLMWorkerExtension
+
+# ============================================
+# Generation Configuration
+# ============================================
+gconfig:
+  n_samples: 64
+  min_new_tokens: 0
+  max_new_tokens: 32768
+  max_tokens: 32768
+  greedy: false
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 100000000
+  stop_token_ids: []
+  ignore_eos: false
+  skip_special_tokens: true
+  stop: null
+  frequency_penalty: 0.0
+  lora_name: tttd_lora_adapter
+  use_beam_search: false
+
+# Evaluation generation config (optional, uses gconfig if not specified)
+eval_gconfig: null
+
+# ============================================
+# Sampler Configuration (TTT-Discover specific)
+# ============================================
+sampler:
+  type: puct
+  batch_size: 8
+  c_puct: 1.0
+  gamma: 0.95
+  max_children: 100
+  max_states: 10000
+  top_k: 1000
+  temperature: 1.0
+  save_freq: 100
+  checkpoint_dir: ${cluster.fileroot}/${experiment_name}/${trial_name}/sampler
+  initial_exp_type: random
+  env_type: ac1
+  # AC1-specific parameters
+  budget_s: 1100
+  eval_timeout: 1100
+  num_cpus: 2
+  gpu_type: H100
+  n: 100
+
+# ============================================
+# TTT-Discover Specific Settings
+# ============================================
+enable_thinking: true
+max_prompt_thinking_tokens: 26000
+save_steps: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49]
+skip_lora_check: false
+reset_puct_stats_on_resume: false
+
+# ============================================
+# Dynamic Batch Size (for async training)
+# ============================================
+dynamic_bs: false
+
+# ============================================
+# Dataset Configuration (placeholder, not used directly)
+# ============================================
+train_dataset:
+  batch_size: ${sampler.batch_size}
+  path: placeholder
+  type: rl
+  max_length: 32768
+  shuffle: true
+  pin_memory: true
+  num_workers: 0
+  drop_last: true
+
+valid_dataset: null
+
+# ============================================
+# Saver Configuration
+# ============================================
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: 1
+  freq_secs: null
+
+# ============================================
+# Recovery Configuration
+# ============================================
+recover:
+  mode: "on"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: 1
+  freq_secs: 3600
+  retries: 3
+
+# ============================================
+# Evaluator Configuration
+# ============================================
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+# ============================================
+# Stats Logger Configuration
+# ============================================
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+    project: tttd-async-qwen3-8b-ac1
+    entity: null
+  swanlab:
+    mode: disabled
+    project: null
+    name: null
+  tensorboard:
+    path: null
+
+# ============================================
+# Performance Tracer Configuration
+# ============================================
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  save_interval: 1
+  profile_steps: null
+  session_tracer:
+    enabled: false
+    flush_threshold: 256

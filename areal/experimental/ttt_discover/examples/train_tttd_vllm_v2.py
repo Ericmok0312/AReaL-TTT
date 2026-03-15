@@ -21,7 +21,10 @@ from areal.utils.recover import RecoverHandler
 from areal.utils.saver import Saver
 from areal.utils.stats_logger import StatsLogger
 
-from areal.experimental.ttt_discover.config import TTTDPPOActorConfig
+from areal.experimental.ttt_discover.config import (
+    TTTDPPOActorConfig,
+    create_env_from_config,
+)
 from areal.experimental.ttt_discover.actor import TTTDActor
 from areal.experimental.ttt_discover.dataloader import create_tttd_dataloader
 from areal.experimental.ttt_discover.sampler import create_sampler_from_config
@@ -273,29 +276,8 @@ def main(args):
         logger.info(f"Reference model using DP-only strategy: {ref_parallel_strategy}")
     
     # Environment setup (AC1 or CP)
-    env_type = getattr(config.sampler, 'env_type', 'ac1')
-    eval_timeout = getattr(config.sampler, 'eval_timeout', 600)  # 10min default
-    
-    if env_type == 'cp':
-        from areal.experimental.ttt_discover.envs import CirclePackingEnv
-        env = CirclePackingEnv(
-            n_item=getattr(config.sampler, 'n_item', 26),
-            eval_timeout=eval_timeout,
-            log_dir=config.saver.fileroot,
-        )
-        logger.info(f"[Env] Using CirclePackingEnv with eval_timeout={eval_timeout}s")
-    elif env_type in ('ac1', 'ac2'):
-        from areal.experimental.ttt_discover.envs import InequalitiesEnv
-        env = InequalitiesEnv(
-            problem_type=env_type,
-            budget_s=getattr(config.sampler, 'budget_s', 1000),
-            eval_timeout=eval_timeout,
-            log_dir=config.saver.fileroot,
-            num_cpus=getattr(config.sampler, 'num_cpus', 2),
-        )
-        logger.info(f"[Env] Using InequalitiesEnv ({env_type}) with eval_timeout={eval_timeout}s, budget_s={env.budget_s}s")
-    else:
-        raise ValueError(f"Unknown env_type: {env_type}. Must be 'cp', 'ac1', or 'ac2'")
+    env = create_env_from_config(config)
+    logger.info(f"[Env] Created {env.__class__.__name__} with eval_timeout={env.eval_timeout}s")
     
     # Ensure stop tokens
     if tokenizer.pad_token_id not in config.gconfig.stop_token_ids:
