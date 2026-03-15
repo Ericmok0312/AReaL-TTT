@@ -35,8 +35,10 @@ from areal.api.cli_args import (
 from areal.api.io_struct import FinetuneSpec, StepInfo, WeightUpdateMeta
 from areal.infra import (
     current_platform,
-    is_single_controller,
 )
+
+from areal.utils.environ import is_single_controller
+
 from areal.utils import logging, seeding, stats_tracker
 
 from areal.experimental.ttt_discover.config import (
