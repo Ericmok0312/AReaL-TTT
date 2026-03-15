@@ -692,7 +692,7 @@ class TTTDPPOTrainer(PPOTrainer):
 
 def main(args):
     """Main training function."""
-    config, _ = load_expr_config(args, TTTDAsyncConfig)
+    config, _ = load_expr_config(args, TTTDPPOActorConfig)
     
     # Ensure stop tokens are set
     if config.tokenizer_path:
