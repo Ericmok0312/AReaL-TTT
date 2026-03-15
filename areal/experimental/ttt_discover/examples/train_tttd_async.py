@@ -49,55 +49,11 @@ from areal.experimental.ttt_discover.dataloader import create_tttd_dataloader
 from areal.experimental.ttt_discover.actor import TTTDActor
 from areal.experimental.ttt_discover.workflow_v2 import TTTDiscoverWorkflowV2
 from areal.experimental.ttt_discover.ttt_logger import TTTTrainingLogger
+from areal.utils.stats_logger import StatsLogger
+from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 
 logger = logging.getLogger("train_tttd_async")
 
-
-@dataclass
-class TTTDAsyncConfig(PPOConfig):
-    """
-    Extended PPOConfig for TTT-Discover async training.
-    """
-    
-    # TTT-Discover specific settings
-    enable_thinking: bool = field(
-        default=False,
-        metadata={"help": "Enable thinking mode for Qwen3 models"}
-    )
-    max_prompt_thinking_tokens: int = field(
-        default=26000,
-        metadata={"help": "Maximum tokens for prompt + thinking phase"}
-    )
-    
-    # Sampler configuration
-    sampler: SamplerConfig = field(
-        default_factory=SamplerConfig,
-        metadata={"help": "Configuration for PUCTSampler"}
-    )
-    
-    # Training history recording
-    save_steps: list[int] = field(
-        default_factory=lambda: [0, 9, 24, 49],
-        metadata={"help": "Steps to save training history snapshots for visualization"}
-    )
-    
-    # LoRA check control
-    skip_lora_check: bool = field(
-        default=False,
-        metadata={"help": "Skip LoRA adapter existence check at training start"}
-    )
-    
-    # PUCT stats reset on resume
-    reset_puct_stats_on_resume: bool = field(
-        default=True,
-        metadata={"help": "Reset PUCT statistics when resuming from checkpoint"}
-    )
-    
-    # Dynamic batch size for async training
-    dynamic_bs: bool = field(
-        default=False,
-        metadata={"help": "Enable dynamic batch sizing for async training (skip slow rollouts)"}
-    )
 
 
 class TTTDPPOTrainer(PPOTrainer):
@@ -110,7 +66,7 @@ class TTTDPPOTrainer(PPOTrainer):
     - Original recovery handling
     """
     
-    def __init__(self, config: TTTDAsyncConfig):
+    def __init__(self, config: TTTDPPOActorConfig):
         # Initialize basic attributes first
         self.config = config
         rank = int(__import__('os').getenv("RANK", "0"))
@@ -164,7 +120,6 @@ class TTTDPPOTrainer(PPOTrainer):
         
         # Initialize inference engines
         self.rollout = self._init_rollout(config.rollout, is_eval=False)
-        self.eval_rollout = self._init_rollout(config.rollout, is_eval=True)
         
         # Initialize models
         self._initialize_engines()
@@ -656,7 +611,6 @@ class TTTDPPOTrainer(PPOTrainer):
             self.actor.update_weights(self.weight_update_meta)
             self.actor.set_version(global_step + 1)
             self.rollout.set_version(global_step + 1)
-            self.eval_rollout.set_version(global_step + 1)
             
             self._save_hf(epoch=epoch, epoch_step=step, global_step=global_step)
             self._save_recover_checkpoint(epoch=epoch, epoch_step=step, global_step=global_step)
