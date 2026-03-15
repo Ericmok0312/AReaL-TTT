@@ -103,10 +103,13 @@ class TTTDPPOTrainer(PPOTrainer):
         )
         
         # Create TTTDActor (no critic - TTT-Discover doesn't use value function)
-        self.actor = self._create_tttd_actor(config.actor)
+        # Pass full config (TTTDPPOActorConfig) instead of config.actor to enable
+        # entropic advantage computation with adv_estimator settings
+        self.actor = self._create_tttd_actor(config)
         # No critic - TTT-Discover uses entropic objective without value function
         self.ref = None
         if config.actor.kl_ctl > 0 and config.ref is not None:
+            # ref model only needs PPOActorConfig (no adv_estimator needed)
             self.ref = self._create_tttd_actor(config.ref)
         
         # Create dataloaders using sampler (before engine init, only needs process group)
@@ -142,7 +145,7 @@ class TTTDPPOTrainer(PPOTrainer):
         # Initialize proxy workers flag
         self._proxy_started = False
     
-    def _create_tttd_actor(self, actor_config: PPOActorConfig):
+    def _create_tttd_actor(self, actor_config: TTTDPPOActorConfig):
         """Create TTTDActor with custom compute_advantages."""
         if is_single_controller():
             actor = TTTDActor.as_controller(actor_config, self.scheduler)
