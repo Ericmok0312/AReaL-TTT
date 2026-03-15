@@ -83,11 +83,11 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         # Teacher forcing message for stopping thinking
         self.force_stop_message = "... okay, I am out of thinking tokens. I need to send my final message now"
         
-        # Calculate number of workers based on CPU count (same logic as AsyncRewardWrapper)
-        cpu_count = os.cpu_count() or 1
-
-        # each rank get their own pool
-        max_code_workers = 64
+        # Hardcode max_code_workers to 16 for balanced throughput and safety
+        # This uses 4 ranks * 16 workers * 2 CPU = 128 CPU out of 160 (80% utilization)
+        # Allow override via environment variable for flexibility
+        max_code_workers = int(os.environ.get('TTTD_MAX_CODE_WORKERS', '16'))
+        logger.info(f"max_code_workers={max_code_workers} (hardcoded default 16, override with TTTD_MAX_CODE_WORKERS)")
         
         # Semaphore limits concurrent code execution to prevent overwhelming resources.
         self._code_semaphore = asyncio.Semaphore(max_code_workers)
@@ -100,7 +100,6 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         self._code_executor = ThreadPoolExecutor(
             max_workers=max_code_workers,
         )
-        logger.info(f"Created ThreadPoolExecutor with {max_code_workers} workers for code execution (CPU count: {cpu_count})")
         
         # Async-safe buffer for pending updates (GroupedRolloutWorkflow uses asyncio.gather)
         # Stores (child_state, parent_state) tuples
