@@ -159,6 +159,10 @@ class TTTDPPOActorConfig(PPOActorConfig):
         default_factory=GenerationHyperparameters,
         metadata={"help": "Generation configuration"}
     )
+    eval_gconfig: GenerationHyperparameters | None = field(
+        default=None,
+        metadata={"help": "Generation hyperparameters for evaluation. If None, use gconfig."}
+    )
     ref: PPOActorConfig | None = field(
         default=None,
         metadata={"help": "Reference model configuration"}
@@ -306,6 +310,10 @@ class TTTDPPOActorConfig(PPOActorConfig):
         # Convert mb_spec from dict to MicroBatchSpec if needed
         if isinstance(self.mb_spec, dict):
             self.mb_spec = MicroBatchSpec(**self.mb_spec)
+        
+        # Set default eval_gconfig if not provided
+        if self.eval_gconfig is None:
+            self.eval_gconfig = self.gconfig.new()
         
         # Call parent validation
         super().__post_init__()
