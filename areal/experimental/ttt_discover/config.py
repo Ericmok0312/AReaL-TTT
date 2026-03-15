@@ -305,6 +305,12 @@ class TTTDPPOActorConfig(PPOActorConfig):
                          "If model exceeds this without producing valid code, teacher forcing is applied."}
     )
     
+    # Dynamic batch size for async training
+    dynamic_bs: bool = field(
+        default=False,
+        metadata={"help": "Enable dynamic batch sizing for async training (skip slow rollouts)"}
+    )
+    
     def __post_init__(self):
         """Validate configuration consistency and convert nested dicts to objects"""
         # Convert mb_spec from dict to MicroBatchSpec if needed
