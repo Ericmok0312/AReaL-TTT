@@ -87,7 +87,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         cpu_count = os.cpu_count() or 1
 
         # each rank get their own pool
-        max_code_workers = 32
+        max_code_workers = 64
         
         # Semaphore limits concurrent code execution to prevent overwhelming resources.
         self._code_semaphore = asyncio.Semaphore(max_code_workers)
