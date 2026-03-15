@@ -260,12 +260,11 @@ class TTTDPPOActorConfig(PPOActorConfig):
         metadata={"help": "Internal flag to identify TTT-D config"}
     )
     
-    # Actor field for local launcher compatibility
-    # This field exists to satisfy the launcher validation, but the actual
-    # actor config is this object itself (flattened structure)
-    actor: Any = field(
-        default=None,
-        metadata={"help": "Actor configuration (for local launcher compatibility)"}
+    # Actor field - contains the training engine configuration
+    # This is used by TTTDPPOTrainer to create the actor engine
+    actor: PPOActorConfig = field(
+        default_factory=PPOActorConfig,
+        metadata={"help": "Actor training engine configuration"}
     )
     
     # Enable thinking mode for Qwen3 models
@@ -313,6 +312,14 @@ class TTTDPPOActorConfig(PPOActorConfig):
     
     def __post_init__(self):
         """Validate configuration consistency and convert nested dicts to objects"""
+        # Convert actor from dict to PPOActorConfig if needed
+        if isinstance(self.actor, dict):
+            self.actor = PPOActorConfig(**self.actor)
+        
+        # Convert ref from dict to PPOActorConfig if needed
+        if isinstance(self.ref, dict):
+            self.ref = PPOActorConfig(**self.ref)
+        
         # Convert mb_spec from dict to MicroBatchSpec if needed
         if isinstance(self.mb_spec, dict):
             self.mb_spec = MicroBatchSpec(**self.mb_spec)
