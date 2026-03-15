@@ -15,8 +15,6 @@ from areal.api.cli_args import (
     vLLMConfig,
     SGLangConfig,
     PerfTracerConfig,
-    TrainDatasetConfig,
-    ValidDatasetConfig,
 )
 
 
@@ -188,11 +186,11 @@ class TTTDPPOActorConfig(PPOActorConfig):
         default_factory=SamplerConfig,
         metadata={"help": "Configuration for PUCTSampler"}
     )
-    train_dataset: TrainDatasetConfig = field(
-        default_factory=TrainDatasetConfig,
+    train_dataset: dict = field(
+        default_factory=dict,
         metadata={"help": "Training dataset configuration"}
     )
-    valid_dataset: Optional[ValidDatasetConfig] = field(
+    valid_dataset: Optional[dict] = field(
         default=None,
         metadata={"help": "Validation dataset configuration"}
     )
@@ -337,13 +335,8 @@ class TTTDPPOActorConfig(PPOActorConfig):
         if isinstance(self.perf_tracer, dict):
             self.perf_tracer = PerfTracerConfig(**self.perf_tracer)
         
-        # Convert train_dataset from dict to TrainDatasetConfig if needed
-        if isinstance(self.train_dataset, dict):
-            self.train_dataset = TrainDatasetConfig(**self.train_dataset)
-        
-        # Convert valid_dataset from dict to ValidDatasetConfig if needed
-        if isinstance(self.valid_dataset, dict):
-            self.valid_dataset = ValidDatasetConfig(**self.valid_dataset)
+        # Note: train_dataset and valid_dataset are kept as dict
+        # because TTT-Discover doesn't use standard dataset configuration
         
         # Convert mb_spec from dict to MicroBatchSpec if needed
         if isinstance(self.mb_spec, dict):
