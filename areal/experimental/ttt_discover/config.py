@@ -187,8 +187,8 @@ class TTTDPPOActorConfig(PPOActorConfig):
         default_factory=dict,
         metadata={"help": "Training dataset configuration"}
     )
-    valid_dataset: dict = field(
-        default_factory=dict,
+    valid_dataset: Optional[dict] = field(
+        default=None,
         metadata={"help": "Validation dataset configuration"}
     )
     saver: SaverConfig = field(
