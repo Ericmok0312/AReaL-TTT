@@ -586,11 +586,13 @@ class TTTDPPOTrainer(PPOTrainer):
             if self.ref is not None:
                 rollout_batch["ref_logp"] = self.ref.compute_logp(rollout_batch)
             
-            adv_batch = self.actor.compute_advantages(rollout_batch)
+            # Use rollout_batch directly (compute_advantages modifies in-place)
+            # This matches train_tttd_vllm_v2.py behavior
+            self.actor.compute_advantages(rollout_batch)
             
             # Add advantage statistics
-            if "advantages" in adv_batch:
-                adv = adv_batch["advantages"].cpu().numpy()
+            if "advantages" in rollout_batch:
+                adv = rollout_batch["advantages"].cpu().numpy()
                 metrics.update({
                     "advantage/mean": float(adv.mean()),
                     "advantage/std": float(adv.std()),
@@ -599,7 +601,7 @@ class TTTDPPOTrainer(PPOTrainer):
                 })
             
             # PPO update
-            self.actor.ppo_update(adv_batch)
+            self.actor.ppo_update(rollout_batch)
             self.actor.step_lr_scheduler()
             
             # Add training stats
