@@ -147,10 +147,9 @@ class TTTDPPOTrainer(PPOTrainer):
     
     def _create_tttd_actor(self, actor_config: TTTDPPOActorConfig):
         """Create TTTDActor with custom compute_advantages."""
-        if is_single_controller():
-            actor = TTTDActor.as_controller(actor_config, self.scheduler)
-        else:
-            actor = TTTDActor(config=actor_config)
+        # Always create TTTDActor directly (not as_controller) to avoid RPC issues
+        # This matches the behavior of train_tttd_vllm_v2.py
+        actor = TTTDActor(config=actor_config)
         actor.create_process_group(parallel_strategy=self.allocation_mode.train)
         return actor
     
@@ -582,6 +581,9 @@ class TTTDPPOTrainer(PPOTrainer):
             
             if config.actor.should_compute_prox_logp():
                 rollout_batch["prox_logp"] = self.actor.compute_logp(rollout_batch)
+                logger.info(f"[Rank {self.actor.dp_rank}][Step {global_step}] compute_logp done, prox_logp shape: {rollout_batch['prox_logp'].shape}, dtype: {rollout_batch['prox_logp'].dtype}")
+            else:
+                logger.info(f"[Rank {self.actor.dp_rank}][Step {global_step}] should_compute_prox_logp=False, prox_logp not computed")
             
             if self.ref is not None:
                 rollout_batch["ref_logp"] = self.ref.compute_logp(rollout_batch)
@@ -589,6 +591,14 @@ class TTTDPPOTrainer(PPOTrainer):
             # Use rollout_batch directly (compute_advantages modifies in-place)
             # This matches train_tttd_vllm_v2.py behavior
             self.actor.compute_advantages(rollout_batch)
+            
+            # DEBUG: Check prox_logp status before ppo_update
+            bs, max_seqlen = rollout_batch['input_ids'].shape
+            if 'prox_logp' in rollout_batch and rollout_batch['prox_logp'] is not None:
+                prox_logp = rollout_batch['prox_logp']
+                logger.info(f"[Rank {self.actor.dp_rank}][Step {global_step}] Before ppo_update: prox_logp shape={prox_logp.shape}, numel={prox_logp.numel()}, expected={bs * max_seqlen}")
+            else:
+                logger.warning(f"[Rank {self.actor.dp_rank}][Step {global_step}] Before ppo_update: prox_logp is None or missing!")
             
             # Add advantage statistics
             if "advantages" in rollout_batch:
