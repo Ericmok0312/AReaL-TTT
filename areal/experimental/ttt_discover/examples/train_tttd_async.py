@@ -108,7 +108,8 @@ class TTTDPPOTrainer(PPOTrainer):
         self.actor = self._create_tttd_actor(config)
         # No critic - TTT-Discover uses entropic objective without value function
         self.ref = None
-        if config.actor.kl_ctl > 0 and config.ref is not None:
+        # Use top-level config.kl_ctl instead of config.actor.kl_ctl
+        if config.kl_ctl > 0 and config.ref is not None:
             # ref model only needs PPOActorConfig (no adv_estimator needed)
             self.ref = self._create_tttd_actor(config.ref)
         
@@ -192,7 +193,9 @@ class TTTDPPOTrainer(PPOTrainer):
         """Setup weight update meta and connect to inference engine."""
         config = self.config
         
-        if config.actor.weight_update_mode == "disk":
+        # Use top-level config values (same as train_tttd_vllm_v2.py)
+        # because TTTDPPOActorConfig inherits these from PPOActorConfig
+        if config.weight_update_mode == "disk":
             disk_kwargs = {
                 "experiment_name": config.experiment_name,
                 "trial_name": config.trial_name,
@@ -200,30 +203,32 @@ class TTTDPPOTrainer(PPOTrainer):
                 "name": "default",
                 "clear_checkpoint_after_load": True,
             }
-            if config.actor.use_lora:
+            if config.use_lora:
                 disk_kwargs.update({
-                    "use_lora": config.actor.use_lora,
+                    "use_lora": config.use_lora,
                     "lora_name": config.gconfig.lora_name,
-                    "base_model_name": config.actor.path,
+                    "lora_int_id": 1,
+                    "base_model_name": config.path,
                 })
             self.weight_update_meta = WeightUpdateMeta.from_disk(**disk_kwargs)
-        elif config.actor.weight_update_mode == "xccl":
+        elif config.weight_update_mode == "xccl":
             if self.allocation_mode.train_backend == "megatron":
                 self.weight_update_meta = WeightUpdateMeta.from_megatron_xccl(
                     self.allocation_mode
                 )
             else:
                 xccl_kwargs = {"allocation_mode": self.allocation_mode}
-                if config.actor.use_lora:
+                if config.use_lora:
                     xccl_kwargs.update({
-                        "use_lora": config.actor.use_lora,
+                        "use_lora": config.use_lora,
                         "lora_name": config.gconfig.lora_name,
-                        "base_model_name": config.actor.path,
+                        "lora_int_id": 1,
+                        "base_model_name": config.path,
                     })
                 self.weight_update_meta = WeightUpdateMeta.from_fsdp_xccl(**xccl_kwargs)
         else:
             raise ValueError(
-                f"Invalid weight update mode: {config.actor.weight_update_mode}"
+                f"Invalid weight update mode: {config.weight_update_mode}"
             )
         
         self.actor.connect_engine(self.rollout, self.weight_update_meta)
@@ -752,6 +757,10 @@ class TTTDPPOTrainer(PPOTrainer):
 
 def main(args):
     """Main training function."""
+    import json
+    import os
+    from areal.utils import logging
+    
     config, _ = load_expr_config(args, TTTDPPOActorConfig)
     
     # Ensure stop tokens are set
@@ -763,6 +772,47 @@ def main(args):
         if tokenizer.eos_token_id not in config.gconfig.stop_token_ids:
             config.gconfig.stop_token_ids.append(tokenizer.eos_token_id)
     
+    # ============================================================
+    # Verify LoRA adapter exists (same as train_tttd_vllm_v2.py)
+    # ============================================================
+    if config.use_lora and not config.skip_lora_check:
+        lora_output_path = "./lora_init"
+        # Support both dict (legacy) and vLLMConfig dataclass
+        if hasattr(config, 'vllm'):
+            if isinstance(config.vllm, dict):
+                lora_modules_str = config.vllm.get('lora_modules', '')
+            else:
+                # vLLMConfig dataclass
+                lora_modules_str = getattr(config.vllm, 'lora_modules', '') or ''
+            if lora_modules_str:
+                try:
+                    lora_modules = json.loads(lora_modules_str)
+                    if isinstance(lora_modules, dict):
+                        lora_output_path = lora_modules.get('path', lora_output_path)
+                except json.JSONDecodeError:
+                    pass
+        
+        lora_output_path = os.path.abspath(lora_output_path)
+        adapter_config_path = os.path.join(lora_output_path, "adapter_config.json")
+        
+        if not os.path.exists(adapter_config_path):
+            error_msg = (
+                f"\n{'='*80}\n"
+                f"ERROR: Initial LoRA adapter not found at {lora_output_path}\n"
+                f"{'='*80}\n\n"
+                f"The LoRA adapter must be created BEFORE starting training because\n"
+                f"vLLM loads it at startup (before this training script runs).\n\n"
+                f"To fix this, run the preparation script first:\n"
+                f"  python areal/experimental/ttt_discover/examples/prepare_lora_init.py \\\n"
+                f"    --config-path <your_config.yaml>\n\n"
+                f"If you have already initialized the LoRA adapter elsewhere, you can\n"
+                f"skip this check by adding '+skip_lora_check=true' to your command.\n"
+                f"{'='*80}\n"
+            )
+            raise RuntimeError(error_msg)
+        
+        logger.info(f"[LoRA Check] ✓ LoRA adapter verified at {lora_output_path}")
+    
     # Create environment
     env = create_env_from_config(config)
     
@@ -773,6 +823,7 @@ def main(args):
         tokenizer=config.tokenizer_path,
         enable_thinking=config.enable_thinking,
         max_prompt_thinking_tokens=config.max_prompt_thinking_tokens,
+        max_reward_workers=20
     )
     
     # Workflow kwargs

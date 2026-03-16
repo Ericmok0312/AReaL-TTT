@@ -23,8 +23,6 @@ Usage:
 import asyncio
 import os
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -33,12 +31,14 @@ from transformers import PreTrainedTokenizerFast
 from areal.api.cli_args import GenerationHyperparameters
 from areal.api.engine_api import InferenceEngine
 from areal.api.io_struct import ModelRequest, ModelResponse
+from areal.api.reward_api import AsyncRewardWrapper
 from areal.api.workflow_api import RolloutWorkflow
 from areal.utils import logging, stats_tracker
 
 from areal.utils.perf_tracer import atrace_session_phase, trace_session
 
 from .envs.env import BaseEnv, EnvResult
+from .reward import tttd_reward_fn
 
 if TYPE_CHECKING:
     from .sampler import StateSampler
@@ -62,10 +62,28 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         env: BaseEnv,
         gconfig: GenerationHyperparameters,
         tokenizer: PreTrainedTokenizerFast | str,
+        reward_fn: Callable = tttd_reward_fn,
         enable_thinking: bool = False,
-        auto_flush: bool = True,  # 是否自动 flush
-        max_prompt_thinking_tokens: int = 26000,  # Paper: limit prompt + thinking tokens
+        auto_flush: bool = True,
+        max_prompt_thinking_tokens: int = 26000,
+        max_reward_workers: int | None = None,
     ):
+        """
+        Initialize TTT-Discover Workflow V2.
+        
+        Args:
+            env: Environment instance (e.g., InequalitiesEnv, CirclePackingEnv)
+            gconfig: Generation hyperparameters
+            tokenizer: Tokenizer or path to tokenizer
+            reward_fn: Reward function following AReaL convention:
+                fn(prompt, completions, prompt_ids, completion_ids, **data) -> float
+                Default is tttd_reward_fn which requires _env and _state in data.
+            enable_thinking: Whether to enable thinking mode
+            auto_flush: Whether to auto-flush sampler updates
+            max_prompt_thinking_tokens: Max tokens for prompt + thinking
+            max_reward_workers: Max workers for AsyncRewardWrapper. 
+                Defaults to TTTD_MAX_CODE_WORKERS env var or 16.
+        """
         self.env = env
         self.auto_flush = auto_flush
         self.max_prompt_thinking_tokens = max_prompt_thinking_tokens
@@ -83,23 +101,22 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         # Teacher forcing message for stopping thinking
         self.force_stop_message = "... okay, I am out of thinking tokens. I need to send my final message now"
         
-        # Hardcode max_code_workers to 16 for balanced throughput and safety
-        # This uses 4 ranks * 16 workers * 2 CPU = 128 CPU out of 160 (80% utilization)
-        # Allow override via environment variable for flexibility
-        max_code_workers = int(os.environ.get('TTTD_MAX_CODE_WORKERS', '16'))
-        logger.info(f"max_code_workers={max_code_workers} (hardcoded default 16, override with TTTD_MAX_CODE_WORKERS)")
+        # Configure parallel code execution with AsyncRewardWrapper
+        # Follows AReaL best practice: wrap reward_fn once during initialization
+        if max_reward_workers is None:
+            max_reward_workers = int(os.environ.get('TTTD_MAX_CODE_WORKERS', '16'))
         
-        # Semaphore limits concurrent code execution to prevent overwhelming resources.
-        self._code_semaphore = asyncio.Semaphore(max_code_workers)
+        logger.info(f"TTTDiscoverWorkflowV2: max_reward_workers={max_reward_workers}")
         
-        # Create dedicated ThreadPoolExecutor for code execution (isolated from AReaL's shared pool)
-        # ThreadPool is sufficient here because:
-        # 1. env.execute() launches subprocess.Popen() for actual code execution (true process isolation)
-        # 2. ThreadPool threads just wait for subprocess I/O completion (not CPU-bound)
-        # 3. Avoids nested process creation overhead (ProcessPool worker + subprocess = 2x processes)
-        self._code_executor = ThreadPoolExecutor(
-            max_workers=max_code_workers,
+        # Wrap reward function with AsyncRewardWrapper (AReaL standard pattern)
+        # This dispatches reward computation to a dedicated process pool
+        self.async_reward_fn = AsyncRewardWrapper(
+            reward_fn=reward_fn,
+            timeout_seconds=getattr(env, 'eval_timeout', 60) + 10,
+            max_workers=max_reward_workers,
+            max_retries=1,
         )
+        logger.info(f"AsyncRewardWrapper initialized with {max_reward_workers} workers")
         
         # Async-safe buffer for pending updates (GroupedRolloutWorkflow uses asyncio.gather)
         # Stores (child_state, parent_state) tuples
@@ -227,92 +244,74 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         task_data: dict[str, Any],
         gpu_done_time: float | None = None,
     ) -> tuple[float, EnvResult, str]:
-        """Compute reward by executing code in environment.
+        """Compute reward by executing code using AsyncRewardWrapper.
         
-        This method uses run_in_executor to run sync env.execute in a thread pool,
-        preventing blocking of the async event loop. This allows multiple rollouts
-        to execute code concurrently without stalling AReaL's AsyncTaskRunner.
+        This method uses AsyncRewardWrapper with tttd_reward_fn to run env.execute 
+        in a ProcessPoolExecutor, enabling true process-level parallelism for code 
+        verification. The reward function returns (reward, EnvResult, code) tuple
+        to avoid re-executing code.
         
         Args:
             resp: Model response from generation
             task_data: Task data including state object
             gpu_done_time: Timestamp when GPU inference completed (for tail latency measurement)
+            
+        Returns:
+            tuple: (reward_value, EnvResult, extracted_code)
         """
         import time
+        start_time = time.time()
         
         completion_str = self.tokenizer.decode(resp.output_tokens)
-        
         code = self.env.extract_code(completion_str)
         state = task_data.get("_state_obj")
         
         if code is None:
-            logger.warning(f"Code extraction failed")
-            # Use env's failure result for consistent handling
+            logger.warning("Code extraction failed")
             result = self.env.get_failure_result(
                 state=state,
                 fail_type="code_extraction_failed",
             )
-            # Still record timing even for failed code extraction
             if gpu_done_time is not None:
                 self._rollout_timing_pairs.append((gpu_done_time, time.perf_counter()))
             return result.reward, result, ""
         
         try:
-            # Run sync env.execute in dedicated thread pool with semaphore control.
-            # The semaphore limits concurrent executions to prevent CPU overload.
-            # Add asyncio.timeout to prevent indefinite hanging.
-            import time
-            start_time = time.time()
+            # Use AsyncRewardWrapper with tttd_reward_fn
+            # tttd_reward_fn returns (reward, EnvResult, code) tuple
+            prompt_str = self.tokenizer.decode(resp.input_tokens)
             
-            async with self._code_semaphore:
-                loop = asyncio.get_running_loop()
-                # Use asyncio.wait_for to add timeout protection at asyncio level
-                # This is in addition to env.execute's internal timeout
-                env_timeout = getattr(self.env, 'eval_timeout', 60)
-                asyncio_timeout = env_timeout + 10.0  # Add 10s buffer for process overhead
-                try:
-                    # Use dedicated ProcessPoolExecutor (NOT AReaL's shared thread pool)
-                    # This prevents deadlocks when executing slow user code
-                    result = await asyncio.wait_for(
-                        loop.run_in_executor(
-                            self._code_executor,  # Dedicated process pool
-                            self.env.execute,
-                            code,
-                            state
-                        ),
-                        timeout=asyncio_timeout
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning(f"Code execution timed out after {asyncio_timeout}s")
-                    result = self.env.get_failure_result(
-                        state=state,
-                        fail_type="async_timeout",
-                        error_msg=f"Code execution timed out (timeout={asyncio_timeout}s)",
-                    )
+            reward, result, extracted_code = await self.async_reward_fn(
+                prompt_str,
+                completion_str,
+                resp.input_tokens,
+                resp.output_tokens,
+                _env=self.env,
+                _state=state,
+            )
             
             elapsed = time.time() - start_time
             fail_type_info = f", fail_type={result.fail_type}" if result.fail_type else ""
             logger.info(f"reward={result.reward:.4f}, valid={result.is_valid}, elapsed={elapsed:.1f}s{fail_type_info}")
+            
         except Exception as e:
-            # Execution errors (TimeoutError is typically caught by env and returned as result with fail_type)
             logger.warning(f"Execution failed: {e}")
-            # Use env's failure result for consistent handling
             result = self.env.get_failure_result(
                 state=state,
                 fail_type="execution_error",
                 error_msg=str(e),
             )
+            extracted_code = code  # Use originally extracted code on failure
         
         stats_tracker.get("rollout").scalar(
             reward=result.reward,
             is_valid=float(result.is_valid),
         )
         
-        # Record timing pair: (gpu_done_time, execute_done_time)
         if gpu_done_time is not None:
             self._rollout_timing_pairs.append((gpu_done_time, time.perf_counter()))
         
-        return result.reward, result, code
+        return result.reward, result, extracted_code
 
     @trace_session("arun_episode")
     async def arun_episode(
@@ -518,12 +517,14 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
     def shutdown(self):
         """Cleanup resources.
         
-        Shuts down the dedicated ThreadPoolExecutor for code execution.
+        AsyncRewardWrapper uses ProcessPoolExecutor with automatic cleanup via weakref.
+        No explicit shutdown needed, but we clear the reference.
         """
-        if hasattr(self, '_code_executor') and self._code_executor:
-            logger.info("Shutting down ThreadPoolExecutor for code execution...")
-            self._code_executor.shutdown(wait=False, cancel_futures=True)
-            self._code_executor = None
+        if hasattr(self, 'async_reward_fn'):
+            logger.info("Cleaning up AsyncRewardWrapper...")
+            # AsyncRewardWrapper uses weakref.finalize for automatic cleanup
+            # Just clear the reference to allow garbage collection
+            self.async_reward_fn = None
     
     def __del__(self):
         """Destructor for compatibility."""
