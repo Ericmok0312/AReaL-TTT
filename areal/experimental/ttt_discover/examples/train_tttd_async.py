@@ -579,7 +579,10 @@ class TTTDPPOTrainer(PPOTrainer):
                 "reward/best_overall": best_reward,
             }
             
-            if config.actor.should_compute_prox_logp():
+            # FIX: Use config.should_compute_prox_logp() instead of config.actor.should_compute_prox_logp()
+            # because the actor config is nested and doesn't inherit top-level settings like
+            # use_decoupled_loss and recompute_logprob
+            if config.should_compute_prox_logp():
                 rollout_batch["prox_logp"] = self.actor.compute_logp(rollout_batch)
                 logger.info(f"[Rank {self.actor.dp_rank}][Step {global_step}] compute_logp done, prox_logp shape: {rollout_batch['prox_logp'].shape}, dtype: {rollout_batch['prox_logp'].dtype}")
             else:
