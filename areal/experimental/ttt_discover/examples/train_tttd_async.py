@@ -772,12 +772,7 @@ class TTTDPPOTrainer(PPOTrainer):
         """
         Override parent _save_hf to remove extra barrier.
         
-        The parent implementation calls saver.save() (which has FSDP sync inside)
-        followed by an additional dist.barrier(). This can cause deadlock if
-        freq_ctl.check() returns inconsistent results across ranks.
-        
-        FIXME: This is a workaround. The real fix should ensure freq_ctl state
-        is consistent across all ranks.
+        FIXME: Workaround for freq_ctl.check() inconsistency across ranks.
         """
         self.saver.save(
             self.actor,
@@ -787,10 +782,52 @@ class TTTDPPOTrainer(PPOTrainer):
             tokenizer=self.tokenizer,
             processor=getattr(self, 'processor', None),
         )
-        # NOTE: Intentionally NOT calling dist.barrier() here.
-        # The saver.save() -> engine.save() -> _save_model_to_hf() 
-        # already includes FSDP collective operations and a barrier.
-        # Adding another barrier here can cause deadlock.
+        # NOTE: No extra barrier - saver.save() already has FSDP sync.
+
+    def _save_recover_checkpoint(self, epoch: int, epoch_step: int, global_step: int):
+        """
+        Override parent _save_recover_checkpoint to remove extra barrier.
+        
+        FIXME: Workaround for freq_ctl.check() inconsistency in recover_handler.dump().
+        """
+        from areal.api.io_struct import StepInfo
+        
+        to_save = dict(default=self.actor)
+        step_info = StepInfo(
+            global_step=global_step,
+            epoch=epoch,
+            epoch_step=epoch_step,
+            steps_per_epoch=1,  # TTT-Discover: each step is effectively an epoch
+        )
+        
+        # Directly dump without freq_ctl check to avoid sync issues
+        self.recover_handler._save_checkpoint(
+            self.actor,
+            name="default",
+            tokenizer=self.tokenizer,
+            processor=getattr(self, 'processor', None),
+        )
+        
+        # Update last_step_info
+        self.recover_handler.last_step_info = step_info
+        
+        # Save recover info metadata
+        from areal.utils.recover import RecoverInfo
+        recover_info = RecoverInfo(
+            last_step_info=step_info,
+            saver_info=self.saver.state_dict(),
+            evaluator_info=self.evaluator.state_dict(),
+            stats_logger_info=self.stats_logger.state_dict(),
+            dataloader_info=self.train_dataloader.state_dict(),
+            checkpoint_info=self.recover_handler.freq_ctl.state_dict(),
+        )
+        recover_info_path = self.recover_handler.recover_info_path(
+            self.config.experiment_name,
+            self.config.trial_name,
+            self.config.recover.fileroot,
+        )
+        recover_info.dump(recover_info_path)
+        # NOTE: No extra barrier - _save_checkpoint already handles sync.
 
     def close(self):
         """Cleanup resources. Overrides parent to handle missing eval_rollout."""
