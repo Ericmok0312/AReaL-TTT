@@ -425,12 +425,21 @@ class TTTDPPOTrainer(PPOTrainer):
         group_size = config.gconfig.n_samples
         best_reward = float('-inf')
         
+        # DEBUG: Log critical values
+        logger.info(f"[DEBUG] max_steps={max_steps}, start_step={start_step}, range={start_step}-{max_steps-1}")
+        logger.info(f"[DEBUG] config.max_steps={getattr(config, 'max_steps', None)}, config.total_train_epochs={config.total_train_epochs}")
+        
         logger.info(f"Starting training from step {start_step}/{max_steps}")
         
+        loop_count = 0
         for global_step in range(start_step, max_steps):
+            loop_count += 1
+            logger.info(f"[DEBUG] Loop #{loop_count}: global_step={global_step}, max_steps={max_steps}")
+            
             # TTT-Discover uses max_steps for termination
             max_steps_limit = getattr(config, 'max_steps', None)
             if max_steps_limit is not None and global_step >= max_steps_limit:
+                logger.info(f"[DEBUG] Breaking loop at global_step={global_step}, max_steps_limit={max_steps_limit}")
                 break
             
             # In TTT-Discover, each step is effectively an epoch
@@ -666,9 +675,13 @@ class TTTDPPOTrainer(PPOTrainer):
             self._save_hf(epoch=epoch, epoch_step=step, global_step=global_step)
             self._save_recover_checkpoint(epoch=epoch, epoch_step=step, global_step=global_step)
             
+            logger.info(f"[DEBUG][Step {global_step}] Before dist.barrier")
             dist.barrier(group=self.actor.cpu_group)
+            logger.info(f"[DEBUG][Step {global_step}] After dist.barrier")
             current_platform.synchronize()
+            logger.info(f"[DEBUG][Step {global_step}] After platform.synchronize")
             self.rollout.resume()
+            logger.info(f"[DEBUG][Step {global_step}] After rollout.resume")
             
             training_time = time.perf_counter() - training_start
             step_total = time.perf_counter() - step_start_time
@@ -718,6 +731,12 @@ class TTTDPPOTrainer(PPOTrainer):
                         f"total={step_total:.2f}s | "
                         f"reward={step_max_reward:.4f}"
                     )
+            
+            # DEBUG: End of loop iteration
+            logger.info(f"[DEBUG] Loop #{loop_count} (global_step={global_step}) completed successfully")
+        
+        # DEBUG: Loop ended
+        logger.info(f"[DEBUG] Loop ended after {loop_count} iterations. global_step={global_step if 'global_step' in locals() else 'N/A'}")
         
         # === Save Final Training History ===
         if is_dp_head:
@@ -823,7 +842,7 @@ def main(args):
         tokenizer=config.tokenizer_path,
         enable_thinking=config.enable_thinking,
         max_prompt_thinking_tokens=config.max_prompt_thinking_tokens,
-        max_reward_workers=20
+        max_reward_workers=64
     )
     
     # Workflow kwargs
