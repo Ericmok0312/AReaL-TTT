@@ -23,7 +23,7 @@ Usage:
 import asyncio
 import os
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 from transformers import PreTrainedTokenizerFast
