@@ -67,6 +67,9 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         auto_flush: bool = True,
         max_prompt_thinking_tokens: int = 26000,
         max_reward_workers: int | None = None,
+        strict_sync_mode: bool = False,
+        batch_size: int | None = None,
+        group_size: int | None = None,
     ):
         """
         Initialize TTT-Discover Workflow V2.
@@ -83,10 +86,26 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             max_prompt_thinking_tokens: Max tokens for prompt + thinking
             max_reward_workers: Max workers for AsyncRewardWrapper. 
                 Defaults to TTTD_MAX_CODE_WORKERS env var or 16.
+            strict_sync_mode: If True, strictly mimic sync version behavior by only
+                processing batch_size * group_size rollouts per step with proper
+                parent-child matching. If False (default), process all pending updates.
+            batch_size: Number of parent states per step (required if strict_sync_mode=True)
+            group_size: Number of rollouts per parent (required if strict_sync_mode=True)
         """
         self.env = env
         self.auto_flush = auto_flush
         self.max_prompt_thinking_tokens = max_prompt_thinking_tokens
+        
+        # Mode configuration
+        self.strict_sync_mode = strict_sync_mode
+        self.batch_size = batch_size
+        self.group_size = group_size
+        
+        if strict_sync_mode:
+            if batch_size is None or group_size is None:
+                raise ValueError("batch_size and group_size must be provided when strict_sync_mode=True")
+            self.expected_rollouts_per_step = batch_size * group_size
+            logger.info(f"TTTDiscoverWorkflowV2: Strict sync mode enabled, expected_rollouts_per_step={self.expected_rollouts_per_step}")
         
         # Initialize tokenizer
         if isinstance(tokenizer, str):
@@ -134,6 +153,17 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         # Track timing for execute tail latency analysis
         # Records (gpu_done_time, execute_done_time) for each rollout
         self._rollout_timing_pairs: list[tuple[float, float]] = []
+        
+        # Staleness tracking for research analysis
+        # Key: parent_id, Value: {
+        #   'sample_version': int,          # Model version when parent was sampled
+        #   'children_completed': int, 
+        #   'total_expected': int,
+        #   'parent_timestep': int
+        # }
+        # Staleness = current_version - sample_version
+        self._staleness_tracker: dict[str, dict] = {}
+        self._current_version: int = 0  # Current model version, set externally
 
     def get_execute_tail_latency(self, clear: bool = True) -> float:
         """
@@ -454,6 +484,48 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                             self._parent_stats[pid] = []
                         self._parent_stats[pid].append(reward)
                         
+                        # Staleness tracking: record model version when parent was sampled
+                        # Staleness = current_version - sample_version
+                        try:
+                            current_version = engine.get_version()
+                        except Exception:
+                            current_version = -1  # Fallback if engine doesn't support versioning
+                        
+                        is_new_parent = pid not in self._staleness_tracker
+                        
+                        if is_new_parent:
+                            self._staleness_tracker[pid] = {
+                                'sample_version': current_version,  # Version when first child completed
+                                'children_completed': 1,
+                                'total_expected': self.gconfig.n_samples if hasattr(self.gconfig, 'n_samples') else None,
+                                'parent_timestep': state.timestep,
+                            }
+                            logger.info(f"[STALENESS_NEW] parent_id={pid} "
+                                       f"sample_version={current_version} "
+                                       f"parent_timestep={state.timestep} "
+                                       f"total_expected={self._staleness_tracker[pid]['total_expected']}")
+                        else:
+                            self._staleness_tracker[pid]['children_completed'] += 1
+                            tracker = self._staleness_tracker[pid]
+                            # Staleness is version difference: current - sample_version
+                            staleness = current_version - tracker['sample_version']
+                            logger.info(f"[STALENESS_CONT] parent_id={pid} "
+                                       f"child_num={tracker['children_completed']}/{tracker['total_expected']} "
+                                       f"sample_version={tracker['sample_version']} "
+                                       f"current_version={current_version} "
+                                       f"staleness={staleness}")
+                        
+                        # Log staleness info for research analysis (regex-friendly format)
+                        tracker = self._staleness_tracker[pid]
+                        staleness = current_version - tracker['sample_version'] if current_version >= 0 else -1
+                        logger.info(f"[STALENESS] parent_id={pid} "
+                                   f"child_num={tracker['children_completed']}/{tracker['total_expected']} "
+                                   f"sample_version={tracker['sample_version']} "
+                                   f"current_version={current_version} "
+                                   f"staleness={staleness} "
+                                   f"is_new={is_new_parent} "
+                                   f"parent_timestep={tracker['parent_timestep']}")
+                        
                 except Exception as e:
                     logger.warning(f"Failed to create child state: {e}")
             elif not result.is_valid:
@@ -499,17 +571,73 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         self._failed_parents.clear()
         self._parent_stats.clear()
 
+    def set_current_version(self, version: int):
+        """Set the current model version for staleness calculation.
+        
+        Should be called at the beginning of each training step with the
+        current actor version, so staleness = current_version - sample_version.
+        """
+        self._current_version = version
+        logger.debug(f"[WORKFLOW] Set current version to {version}")
+    
     def get_pending_updates(self, clear: bool = True) -> tuple[list, list, list]:
         """Return the buffered pending updates (children, parents, failed_parents) for this batch."""
         children = self._pending_children.copy()
         parents = self._pending_parents.copy()
         failed = self._failed_parents.copy()
         
+        # Calculate staleness statistics for research analysis
+        if self._staleness_tracker and children:
+            current_version = self._current_version
+            staleness_list = []
+            incomplete_parents = 0
+            
+            # Track parents that have all children completed (for cleanup later)
+            parents_to_cleanup = set()
+            
+            for pid, tracker in self._staleness_tracker.items():
+                # Staleness = current_version - sample_version
+                staleness = current_version - tracker['sample_version']
+                staleness_list.append(staleness)
+                
+                # Check if this parent has all expected children
+                total_expected = tracker.get('total_expected') or tracker['children_completed']
+                is_complete = tracker['children_completed'] >= total_expected
+                
+                if not is_complete:
+                    incomplete_parents += 1
+                    # Log incomplete parent for tracking (regex-friendly)
+                    logger.info(f"[STALENESS_INCOMPLETE] parent_id={pid} "
+                               f"completed={tracker['children_completed']}/{total_expected} "
+                               f"sample_version={tracker['sample_version']} "
+                               f"current_version={current_version} "
+                               f"staleness={staleness}")
+                else:
+                    parents_to_cleanup.add(pid)
+            
+            if staleness_list:
+                avg_staleness = sum(staleness_list) / len(staleness_list)
+                max_staleness = max(staleness_list)
+                # Regex-friendly format for post-processing (version-based staleness)
+                logger.info(f"[STALENESS_BATCH] n_parents={len(staleness_list)} "
+                           f"avg_staleness={avg_staleness:.2f} max_staleness={max_staleness} "
+                           f"current_version={current_version} "
+                           f"incomplete={incomplete_parents} "
+                           f"complete={len(parents_to_cleanup)} "
+                           f"total_children={len(children)}")
+        
         if clear:
             self._pending_children.clear()
             self._pending_parents.clear()
             self._failed_parents.clear()
             self._parent_stats.clear()
+            # CRITICAL FIX: Only cleanup staleness tracker entries for parents that are COMPLETE
+            # Incomplete parents must retain their first_child_time for accurate staleness tracking
+            if 'parents_to_cleanup' in locals():
+                for pid in parents_to_cleanup:
+                    if pid in self._staleness_tracker:
+                        logger.debug(f"[STALENESS_CLEANUP] Removing complete parent {pid} from tracker")
+                        del self._staleness_tracker[pid]
         
         return children, parents, failed
 

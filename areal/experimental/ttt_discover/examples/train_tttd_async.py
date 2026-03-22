@@ -463,6 +463,10 @@ class TTTDPPOTrainer(PPOTrainer):
             # including those from previous steps that finished late.
             # get_pending_updates(clear=True) handles cleanup automatically.
             
+            # Set current version for staleness tracking (version = global_step)
+            if hasattr(workflow, 'set_current_version'):
+                workflow.set_current_version(global_step)
+            
             # === Rollout with async prepare_batch ===
             rollout_start = time.perf_counter()
             with stats_tracker.record_timing("rollout"):
@@ -510,8 +514,27 @@ class TTTDPPOTrainer(PPOTrainer):
                            f"(children={actual_children}, failed={actual_failed}), "
                            f"overhead={async_overhead:+d}")
             
+            # Calculate unique parents and completion rate
+            unique_parents = set(p.id for p in local_parents) if local_parents else set()
+            n_unique_parents = len(unique_parents)
+            avg_children_per_parent = len(local_children) / n_unique_parents if n_unique_parents > 0 else 0
+            
             logger.info(f"[Step {global_step}][Rank {self.actor.dp_rank}] Local updates: "
-                       f"children={len(local_children)}, parents={len(local_parents)}, failed={len(local_failed)}")
+                       f"children={len(local_children)}, parents={len(local_parents)} "
+                       f"unique_parents={n_unique_parents}, failed={len(local_failed)} "
+                       f"avg_children_per_parent={avg_children_per_parent:.2f}")
+            
+            # Detailed parent-child mapping for analysis (regex-friendly)
+            if local_parents and local_children:
+                parent_child_counts = {}
+                for parent in local_parents:
+                    pid = parent.id
+                    parent_child_counts[pid] = parent_child_counts.get(pid, 0) + 1
+                
+                # Log distribution of children per parent
+                for pid, count in sorted(parent_child_counts.items())[:10]:  # Limit to first 10 to avoid log spam
+                    logger.info(f"[PARENT_CHILD_MAP] step={global_step} rank={self.actor.dp_rank} "
+                               f"parent_id={pid[:8]}... children_count={count}")
             
             self.actor.sync_sampler(
                 local_children=local_children,
@@ -581,6 +604,23 @@ class TTTDPPOTrainer(PPOTrainer):
                 'step_max_reward': step_max_reward,
                 'step_mean_reward': step_mean_reward,
             }
+            
+            # Add staleness metrics if available from workflow (version-based staleness)
+            if hasattr(workflow, '_staleness_tracker') and workflow._staleness_tracker:
+                current_version = global_step
+                staleness_values = []
+                for pid, tracker in workflow._staleness_tracker.items():
+                    staleness = current_version - tracker['sample_version']
+                    staleness_values.append(staleness)
+                
+                if staleness_values:
+                    step_metrics['staleness'] = {
+                        'avg': sum(staleness_values) / len(staleness_values),
+                        'max': max(staleness_values),
+                        'min': min(staleness_values),
+                        'n_parents': len(staleness_values),
+                        'current_version': current_version,
+                    }
             
             logger.info(f"[Rank {self.actor.dp_rank}][Step {global_step}] Rollouts: {local_rollouts} (global: {global_rollouts}), "
                        f"batch parents: {batch_size}, group_size: {group_size}")
