@@ -18,6 +18,8 @@ Usage:
     )
 """
 
+from typing import Any
+
 from areal.utils import logging
 
 logger = logging.getLogger("TTTDReward")
