@@ -11,16 +11,13 @@ import subprocess
 import pickle
 import signal
 import shutil
-import asyncio
 from pathlib import Path
 from typing import Any
-from functools import partial
 
 import numpy as np
 
 from areal.experimental.ttt_discover.envs.env import BaseEnv, EnvResult
 from areal.experimental.ttt_discover.state import InequalitiesState, State
-from areal.api.reward_api import AsyncRewardWrapper
 from areal.utils import logging
 
 import torch
@@ -335,8 +332,6 @@ class InequalitiesEnv(BaseEnv):
         eval_timeout: int = 600,
         log_dir: str = "/tmp/ttt_logs",
         num_cpus: int = 2,
-        use_async_reward: bool = True,
-        max_reward_workers: int = 16,
     ):
         self.problem_type = problem_type
         self.budget_s = budget_s
@@ -344,7 +339,6 @@ class InequalitiesEnv(BaseEnv):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.num_cpus = num_cpus
-        self.use_async_reward = use_async_reward
         
         # Select verifier based on problem type
         if problem_type == "ac1":
@@ -357,25 +351,6 @@ class InequalitiesEnv(BaseEnv):
             self.entrypoint = "construct_function"
         else:
             raise ValueError(f"Unknown problem_type: {problem_type}. Must be 'ac1' or 'ac2'")
-        
-        # Initialize AsyncRewardWrapper for parallel code execution
-        if self.use_async_reward:
-            # Use a module-level function that can be pickled for ProcessPoolExecutor
-            self._async_wrapper = AsyncRewardWrapper(
-                reward_fn=_execute_code_static,
-                timeout_seconds=eval_timeout + 10,  # Add buffer for process overhead
-                max_workers=max_reward_workers,
-                max_retries=2,
-            )
-            # Store env config for static function access
-            self._env_config = {
-                'problem_type': problem_type,
-                'eval_timeout': eval_timeout,
-                'num_cpus': num_cpus,
-                'log_dir': str(self.log_dir),
-                'entrypoint': self.entrypoint,
-            }
-            logger.info(f"InequalitiesEnv initialized with AsyncRewardWrapper (max_workers={max_reward_workers})")
     
     def get_prompt(self, state: InequalitiesState) -> str:
         """Generate improvement prompt."""
@@ -599,121 +574,6 @@ except Exception as e:
                 os.unlink(runner_path)
             except:
                 pass
-    
-    async def execute_async(self, code: str, state: InequalitiesState) -> EnvResult:
-        """
-        Execute code asynchronously using AsyncRewardWrapper for parallel execution.
-        
-        This method runs code in a ProcessPoolExecutor, allowing multiple 
-        code executions to run in parallel without blocking the async event loop.
-        """
-        if not self.use_async_reward:
-            # Fallback to sync execution
-            return self.execute(code, state)
-        
-        import time
-        start_time = time.time()
-        
-        try:
-            # Serialize state data for pickling
-            state_data = {
-                'construction': state.construction if state else None,
-            }
-            
-            # Use AsyncRewardWrapper to execute in process pool
-            result = await self._async_wrapper(code, state_data)
-            
-            # Unpack result: (output, error_msg)
-            if isinstance(result, tuple) and len(result) == 2:
-                output, error_msg = result
-            else:
-                error_msg = "Invalid result format from async execution"
-                output = None
-            
-            elapsed = time.time() - start_time
-            
-            if error_msg:
-                is_timeout = "timeout" in error_msg.lower()
-                fail_type = "timeout" if is_timeout else "execution_error"
-                logger.info(f"Async execution failed: {fail_type}, elapsed={elapsed:.1f}s")
-                return EnvResult(
-                    reward=0.0,
-                    observation=error_msg,
-                    is_valid=False,
-                    fail_type=fail_type,
-                    metadata={"timeout": is_timeout, "error": error_msg, "elapsed": elapsed},
-                )
-            
-            # Verify and compute reward (same logic as sync version)
-            try:
-                raw_score = self._evaluate(output)
-                
-                # Check for invalid results
-                if self.problem_type == "ac1" and raw_score == np.inf:
-                    return EnvResult(
-                        reward=0.0,
-                        observation="Invalid solution",
-                        is_valid=False,
-                        fail_type="execution_error",
-                        metadata={"error": "Invalid solution", "elapsed": elapsed},
-                    )
-                elif self.problem_type == "ac2" and raw_score == -np.inf:
-                    return EnvResult(
-                        reward=0.0,
-                        observation="Invalid solution",
-                        is_valid=False,
-                        fail_type="execution_error",
-                        metadata={"error": "Invalid solution", "elapsed": elapsed},
-                    )
-                
-                # Convert to reward (higher = better)
-                if self.problem_type == "ac1":
-                    reward = 1.0 / (1e-8 + raw_score)  # Reciprocal for minimization
-                else:
-                    reward = raw_score
-                
-                logger.info(f"Async execution success: reward={reward:.4f}, elapsed={elapsed:.1f}s")
-                return EnvResult(
-                    reward=reward,
-                    observation="Success",
-                    is_valid=True,
-                    metadata={
-                        "construction": output,
-                        "raw_score": raw_score,
-                        "elapsed": elapsed,
-                    },
-                )
-                
-            except Exception as e:
-                logger.warning(f"Async evaluation failed: {e}")
-                return EnvResult(
-                    reward=0.0,
-                    observation=str(e),
-                    is_valid=False,
-                    fail_type="execution_error",
-                    metadata={"error": str(e), "elapsed": elapsed},
-                )
-                
-        except asyncio.TimeoutError:
-            elapsed = time.time() - start_time
-            logger.warning(f"Async execution timeout after {elapsed:.1f}s")
-            return EnvResult(
-                reward=0.0,
-                observation=f"Timeout (>{self.eval_timeout}s)",
-                is_valid=False,
-                fail_type="async_timeout",
-                metadata={"timeout": True, "elapsed": elapsed},
-            )
-        except Exception as e:
-            elapsed = time.time() - start_time
-            logger.warning(f"Async execution exception: {e}")
-            return EnvResult(
-                reward=0.0,
-                observation=str(e),
-                is_valid=False,
-                fail_type="execution_error",
-                metadata={"error": str(e), "elapsed": elapsed},
-            )
     
     def execute(self, code: str, state: InequalitiesState) -> EnvResult:
         """Execute the generated code and compute reward (synchronous version)."""
