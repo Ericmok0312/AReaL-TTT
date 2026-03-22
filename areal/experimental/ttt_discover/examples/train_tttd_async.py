@@ -660,20 +660,28 @@ class TTTDPPOTrainer(PPOTrainer):
                     f"Entropy: {metrics['train/entropy']:.4f}, GradNorm: {metrics['train/grad_norm']:.4f}, LR: {metrics['train/lr']:.6f}"
                 )
             
+            logger.info(f"[DEBUG][Step {global_step}] Before save_checkpoint, is_dp_head={is_dp_head}")
             # Save Training History Checkpoint
             if is_dp_head:
                 checkpoint_path = self.history_logger.save_checkpoint()
                 if checkpoint_path:
                     logger.debug(f"[TTTLogger] Saved checkpoint to {checkpoint_path}")
+            logger.info(f"[DEBUG][Step {global_step}] After save_checkpoint")
             
             # Update weights and save (all part of training phase)
+            logger.info(f"[DEBUG][Step {global_step}] Before rollout.pause")
             self.rollout.pause()
+            logger.info(f"[DEBUG][Step {global_step}] After rollout.pause")
             self.actor.update_weights(self.weight_update_meta)
             self.actor.set_version(global_step + 1)
             self.rollout.set_version(global_step + 1)
             
+            logger.info(f"[DEBUG][Step {global_step}] Before _save_hf")
             self._save_hf(epoch=epoch, epoch_step=step, global_step=global_step)
+            logger.info(f"[DEBUG][Step {global_step}] After _save_hf")
+            logger.info(f"[DEBUG][Step {global_step}] Before _save_recover_checkpoint")
             self._save_recover_checkpoint(epoch=epoch, epoch_step=step, global_step=global_step)
+            logger.info(f"[DEBUG][Step {global_step}] After _save_recover_checkpoint")
             
             logger.info(f"[DEBUG][Step {global_step}] Before dist.barrier")
             dist.barrier(group=self.actor.cpu_group)
