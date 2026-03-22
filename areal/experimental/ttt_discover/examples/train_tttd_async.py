@@ -768,6 +768,30 @@ class TTTDPPOTrainer(PPOTrainer):
                     f"    --benchmark_value 2.635983"
                 )
 
+    def _save_hf(self, epoch: int, epoch_step: int, global_step: int):
+        """
+        Override parent _save_hf to remove extra barrier.
+        
+        The parent implementation calls saver.save() (which has FSDP sync inside)
+        followed by an additional dist.barrier(). This can cause deadlock if
+        freq_ctl.check() returns inconsistent results across ranks.
+        
+        FIXME: This is a workaround. The real fix should ensure freq_ctl state
+        is consistent across all ranks.
+        """
+        self.saver.save(
+            self.actor,
+            epoch,
+            epoch_step,
+            global_step,
+            tokenizer=self.tokenizer,
+            processor=getattr(self, 'processor', None),
+        )
+        # NOTE: Intentionally NOT calling dist.barrier() here.
+        # The saver.save() -> engine.save() -> _save_model_to_hf() 
+        # already includes FSDP collective operations and a barrier.
+        # Adding another barrier here can cause deadlock.
+
     def close(self):
         """Cleanup resources. Overrides parent to handle missing eval_rollout."""
         self.stats_logger.close()
