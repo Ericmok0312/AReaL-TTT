@@ -61,8 +61,14 @@ class _StateSamplerIterableDataset(IterableDataset):
             local_states = states[start_idx:end_idx]
             
             # Yield individual samples for collation
-            for state in local_states:
-                yield {
+            # Get PUCT stats if available (for Q-value estimation error analysis)
+            puct_stats = None
+            if hasattr(self.state_sampler, '_last_puct_stats'):
+                # _last_puct_stats: list of (n, Q, P, bonus, score) for sampled states
+                puct_stats = self.state_sampler._last_puct_stats
+            
+            for i, state in enumerate(local_states):
+                sample = {
                     "prompt": self.state_to_prompt_fn(state),
                     "state_id": state.id,
                     "state_value": state.value,
@@ -71,6 +77,20 @@ class _StateSamplerIterableDataset(IterableDataset):
                     "parents": state.parents,
                     "_state_obj": state,
                 }
+                
+                # Record PUCT selection stats if available
+                # This enables analysis of: "what was the PUCT score at selection time"
+                if puct_stats and i < len(puct_stats):
+                    n_visits, q_value, prior, bonus, score = puct_stats[i]
+                    sample['_puct_selection'] = {
+                        'n_visits': n_visits,
+                        'q_value': q_value,      # _m or parent_value
+                        'prior': prior,          # P (prior probability)
+                        'bonus': bonus,          # Exploration bonus
+                        'score': score,          # Final PUCT score (Q + bonus)
+                    }
+                
+                yield sample
                 self._iteration_count += 1
                 
     def state_dict(self) -> dict:

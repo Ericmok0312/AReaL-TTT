@@ -159,6 +159,8 @@ class TTTTrainingLogger:
         rewards: list[float],
         best_solution: Optional[dict] = None,
         additional_metrics: Optional[dict] = None,
+        rollout_metadata: Optional[list[dict]] = None,
+        puct_analysis_data: Optional[dict] = None,
     ) -> bool:
         """
         记录单个 step 的数据
@@ -168,6 +170,8 @@ class TTTTrainingLogger:
             rewards: 当前 step 的所有 rollout rewards（当前 rank）
             best_solution: 当前 step 的最佳解（可选字典，包含 code, value, observation, construction 等）
             additional_metrics: 额外指标（可选）
+            rollout_metadata: 每个 rollout 的详细元数据（parent_id, exec_time_ms, staleness 等）
+            puct_analysis_data: PUCT 行为分析数据（用于计算三个核心指标）
             
         Returns:
             是否成功记录了 snapshot（只有指定的 save_steps 才会记录）
@@ -209,6 +213,14 @@ class TTTTrainingLogger:
         if additional_metrics:
             snapshot["metrics"] = additional_metrics
         
+        # 添加 rollout 元数据（用于分析 parent complexity vs execution time）
+        if rollout_metadata:
+            snapshot["rollout_metadata"] = rollout_metadata
+        
+        # 添加 PUCT 分析数据（用于后续计算三个核心指标）
+        if puct_analysis_data:
+            snapshot["puct_analysis"] = puct_analysis_data
+        
         self.history[key] = snapshot
         
         if self.is_dp_head:
@@ -217,6 +229,10 @@ class TTTTrainingLogger:
                 f"  - Rollouts: {len(aggregated_rewards)}\n"
                 f"  - Reward: mean={mean_reward:.4f}, max={max_reward:.4f}, std={std_reward:.4f}"
             )
+            if rollout_metadata:
+                n_with_meta = len(rollout_metadata)
+                avg_staleness = sum(m['staleness'] for m in rollout_metadata) / n_with_meta if n_with_meta > 0 else 0
+                logger.info(f"  - Metadata: {n_with_meta} rollouts with staleness avg={avg_staleness:.2f}")
         
         return True
     

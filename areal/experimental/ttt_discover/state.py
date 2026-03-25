@@ -25,14 +25,16 @@ class State(ABC):
     parent_values: list[float]  # list of ancestor values (most recent first) for terminal value estimation
     parents: list[dict]  # list of parent refs [{"id": ..., "timestep": ...}, ...] (most recent first)
     observation: str  # stdout/logs from the code that created this state
+    exec_time_ms: float  # execution time (ms) when this state was created as a child
 
-    def __init__(self, timestep: int, value: float = None, parent_values: list[float] = None, parents: list[dict] = None, id: str = None, observation: str = ""):
+    def __init__(self, timestep: int, value: float = None, parent_values: list[float] = None, parents: list[dict] = None, id: str = None, observation: str = "", exec_time_ms: float = None):
         self.id = id if id is not None else str(uuid.uuid4())
         self.timestep = timestep
         self.value = value
         self.parent_values = parent_values if parent_values is not None else []
         self.parents = parents if parents is not None else []
         self.observation = observation
+        self.exec_time_ms = exec_time_ms
 
     def estimate_value(self, experiences_from_state: list) -> float:
         """Estimate state value from experiences starting from this state."""
@@ -71,13 +73,14 @@ class InequalitiesState(State):
             "parent_values": self.parent_values,
             "parents": self.parents,
             "observation": self.observation,
+            "exec_time_ms": self.exec_time_ms,
             "construction": to_json_serializable(self.construction),
             "code": self.code,
         }
     
     @classmethod
     def from_dict(cls, d: dict) -> InequalitiesState:
-        return cls(
+        state = cls(
             timestep=d["timestep"],
             construction=d["construction"],
             code=d["code"],
@@ -87,6 +90,8 @@ class InequalitiesState(State):
             id=d.get("id"),
             observation=d.get("observation", ""),
         )
+        state.exec_time_ms = d.get("exec_time_ms")
+        return state
 
 
 def _to_tuple_of_tuples(obj):
@@ -117,13 +122,14 @@ class CirclePackingState(State):
             "parent_values": self.parent_values,
             "parents": self.parents,
             "observation": self.observation,
+            "exec_time_ms": self.exec_time_ms,
             "construction": to_json_serializable(self.construction) if self.construction is not None else None,
             "code": self.code,
         }
     
     @classmethod
     def from_dict(cls, d: dict) -> CirclePackingState:
-        return cls(
+        state = cls(
             timestep=d["timestep"],
             construction=_to_tuple_of_tuples(d.get("construction")),
             code=d["code"],
@@ -133,6 +139,8 @@ class CirclePackingState(State):
             id=d.get("id"),
             observation=d.get("observation", ""),
         )
+        state.exec_time_ms = d.get("exec_time_ms")
+        return state
 
 
 class GpuModeState(State):
@@ -152,12 +160,13 @@ class GpuModeState(State):
             "parent_values": self.parent_values,
             "parents": self.parents,
             "observation": self.observation,
+            "exec_time_ms": self.exec_time_ms,
             "code": self.code,
         }
     
     @classmethod
     def from_dict(cls, d: dict) -> GpuModeState:
-        return cls(
+        state = cls(
             timestep=d["timestep"],
             code=d["code"],
             value=d.get("value"),
@@ -166,6 +175,8 @@ class GpuModeState(State):
             id=d.get("id"),
             observation=d.get("observation", ""),
         )
+        state.exec_time_ms = d.get("exec_time_ms")
+        return state
 
 
 class AleBenchState(State):
@@ -184,12 +195,13 @@ class AleBenchState(State):
             "value": self.value,
             "parent_values": self.parent_values,
             "parents": self.parents,
+            "exec_time_ms": self.exec_time_ms,
             "code": self.code,
         }
     
     @classmethod
     def from_dict(cls, d: dict) -> AleBenchState:
-        return cls(
+        state = cls(
             timestep=d["timestep"],
             code=d["code"],
             value=d.get("value"),
@@ -197,6 +209,8 @@ class AleBenchState(State):
             parents=d.get("parents", []),
             id=d.get("id"),
         )
+        state.exec_time_ms = d.get("exec_time_ms")
+        return state
 
 
 class ErdosState(State):
@@ -220,6 +234,7 @@ class ErdosState(State):
             "parent_values": self.parent_values,
             "parents": self.parents,
             "observation": self.observation,
+            "exec_time_ms": self.exec_time_ms,
             "code": self.code,
             "c5_bound": self.c5_bound,
             "construction": to_json_serializable(self.construction) if self.construction is not None else None,
@@ -227,7 +242,7 @@ class ErdosState(State):
     
     @classmethod
     def from_dict(cls, d: dict) -> "ErdosState":
-        return cls(
+        state = cls(
             timestep=d["timestep"],
             code=d["code"],
             value=d.get("value"),
@@ -238,6 +253,8 @@ class ErdosState(State):
             id=d.get("id"),
             observation=d.get("observation", ""),
         )
+        state.exec_time_ms = d.get("exec_time_ms")
+        return state
 
 
 class DenoisingState(State):
@@ -260,6 +277,7 @@ class DenoisingState(State):
             "parent_values": self.parent_values,
             "parents": self.parents,
             "observation": self.observation,
+            "exec_time_ms": self.exec_time_ms,
             "code": self.code,
             "mse": self.mse,
             "poisson": self.poisson,
@@ -267,7 +285,7 @@ class DenoisingState(State):
     
     @classmethod
     def from_dict(cls, d: dict) -> "DenoisingState":
-        return cls(
+        state = cls(
             timestep=d["timestep"],
             code=d["code"],
             value=d.get("value"),
@@ -278,6 +296,8 @@ class DenoisingState(State):
             id=d.get("id"),
             observation=d.get("observation", ""),
         )
+        state.exec_time_ms = d.get("exec_time_ms")
+        return state
 
 
 # Registry for state types

@@ -463,6 +463,9 @@ def main(args):
             steps_per_epoch=max_steps,
         )
         
+        # Set current version for staleness calculation
+        workflow.set_current_version(global_step)
+        
         # Reset workflow buffers (clears any stale pending updates)
         workflow.reset()
         
@@ -481,8 +484,38 @@ def main(args):
         # NOTE: This is a collective operation that MUST be called by ALL ranks.
         # It performs: 1) Gather updates -> 2) Rank 0 applies -> 3) Broadcast to all
         with stats_tracker.record_timing("sampler_update"):
-            # Get local updates from this rank (children, parents, and failed parents)
-            local_children, local_parents, local_failed = workflow.get_pending_updates(clear=True)
+            # Get local updates from this rank (children, parents, and failed parents) + metadata
+            # Pass current_step for strict PUCT update mode to prevent cross-batch contamination
+            puct_update_result = workflow.get_pending_updates(clear=True, current_step=global_step)
+            
+            # Handle both old (4-tuple) and new (5-tuple) return formats
+            if len(puct_update_result) == 5:
+                local_children, local_parents, local_failed, rollout_metadata, cross_batch_info = puct_update_result
+            else:
+                local_children, local_parents, local_failed, rollout_metadata = puct_update_result
+                cross_batch_info = {}
+            
+            # Log cross-batch contamination prevention (strict mode)
+            if cross_batch_info.get('mode') == 'strict' and cross_batch_info.get('n_delayed', 0) > 0:
+                logger.info(f"[Step {global_step}] STRICT_PUCT: Prevented cross-batch contamination. "
+                           f"This batch: {cross_batch_info['n_this_batch']}, "
+                           f"Delayed: {cross_batch_info['n_delayed']}")
+            
+            # Calculate staleness statistics from metadata
+            if rollout_metadata:
+                staleness_values = [m['staleness'] for m in rollout_metadata]
+                exec_times = [m.get('exec_time_ms', 0) for m in rollout_metadata if m.get('exec_time_ms', 0) > 0]
+                
+                avg_staleness = sum(staleness_values) / len(staleness_values) if staleness_values else 0
+                max_staleness = max(staleness_values) if staleness_values else 0
+                min_staleness = min(staleness_values) if staleness_values else 0
+                
+                if is_dp_head:
+                    logger.info(f"[Step {global_step}] STALENESS_BATCH: n={len(staleness_values)}, "
+                               f"avg={avg_staleness:.2f}, min={min_staleness}, max={max_staleness}")
+                    if exec_times:
+                        avg_exec_time = sum(exec_times) / len(exec_times)
+                        logger.info(f"[Step {global_step}] EXEC_TIME: n={len(exec_times)}, avg={avg_exec_time:.2f}ms")
             
             # Optional: Log local update counts (high-level)
             logger.info(f"[Step {global_step}][Rank {actor.dp_rank}] Local updates: "
@@ -496,6 +529,35 @@ def main(args):
                 local_failed=local_failed,
                 step=global_step
             )
+            
+            # Record PUCT update events for three-core-metrics analysis
+            if hasattr(workflow, 'log_puct_update') and hasattr(sampler, '_m'):
+                for parent in local_parents:
+                    pid = parent.id
+                    if pid in sampler._m:
+                        m_value = sampler._m[pid]
+                        n_visits = sampler._n.get(pid, 0)
+                        
+                        # Get children rewards for this parent
+                        children_rewards = [
+                            c.value for c in local_children
+                            if any(p.get('id') == pid for p in (c.parents or []))
+                            and c.value is not None
+                        ]
+                        
+                        score = m_value  # Q-value component
+                        
+                        try:
+                            workflow.log_puct_update(
+                                parent_id=pid,
+                                update_step=global_step,
+                                n_visits=n_visits,
+                                m_value=m_value,
+                                score=score,
+                                children_rewards=children_rewards,
+                            )
+                        except Exception as e:
+                            logger.debug(f"[PUCT_TRACK] Failed to log update for {pid[:8]}: {e}")
             
             # Optional: Post-sync verification (lightweight checksum)
             # Note: Detailed logging is now handled inside actor.sync_sampler()
@@ -566,11 +628,88 @@ def main(args):
             'step_mean_reward': step_mean_reward,
         }
         
+        # Add staleness statistics if available
+        if rollout_metadata:
+            staleness_values = [m['staleness'] for m in rollout_metadata]
+            exec_times = [m.get('exec_time_ms', 0) for m in rollout_metadata if m.get('exec_time_ms', 0) > 0]
+            step_metrics['avg_staleness'] = sum(staleness_values) / len(staleness_values) if staleness_values else 0
+            step_metrics['max_staleness'] = max(staleness_values) if staleness_values else 0
+            if exec_times:
+                step_metrics['avg_exec_time_ms'] = sum(exec_times) / len(exec_times)
+        
+        # ============================================================
+        # Distributed Data Aggregation (Sync version)
+        # Synchronize rollout_metadata and puct_analysis across ranks
+        # ============================================================
+        if dist.is_initialized() and actor.data_parallel_world_size > 1:
+            world_size = actor.data_parallel_world_size
+            
+            # 1. Sync rollout_metadata (all_gather_object)
+            if rollout_metadata:
+                all_metadata = [[] for _ in range(world_size)]
+                dist.all_gather_object(all_metadata, rollout_metadata)
+                # Flatten list of lists
+                global_rollout_metadata = []
+                for rank_metadata in all_metadata:
+                    global_rollout_metadata.extend(rank_metadata)
+            else:
+                global_rollout_metadata = []
+            
+            # 2. Sync puct_analysis (merge across ranks)
+            puct_analysis_data = None
+            if hasattr(workflow, 'get_puct_analysis_data'):
+                try:
+                    local_puct_data = workflow.get_puct_analysis_data(clear=False)
+                    if local_puct_data:
+                        all_puct_data = [None] * world_size
+                        dist.all_gather_object(all_puct_data, local_puct_data)
+                        # Merge: combine parent_episodes and puct_updates from all ranks
+                        global_puct_data = {
+                            'parent_episodes': {},
+                            'puct_updates': [],
+                        }
+                        for rank_data in all_puct_data:
+                            if rank_data:
+                                global_puct_data['parent_episodes'].update(
+                                    rank_data.get('parent_episodes', {})
+                                )
+                                global_puct_data['puct_updates'].extend(
+                                    rank_data.get('puct_updates', [])
+                                )
+                        puct_analysis_data = global_puct_data
+                except Exception as e:
+                    logger.debug(f"[PUCT_TRACK] Failed to get analysis data: {e}")
+                    puct_analysis_data = None
+            
+            # 3. Update step_metrics staleness stats based on global data
+            if global_rollout_metadata:
+                global_staleness = [m['staleness'] for m in global_rollout_metadata]
+                global_exec_times = [m.get('child_exec_time_ms', 0) 
+                                    for m in global_rollout_metadata 
+                                    if m.get('child_exec_time_ms', 0) > 0]
+                
+                step_metrics['avg_staleness'] = sum(global_staleness) / len(global_staleness) if global_staleness else 0
+                step_metrics['max_staleness'] = max(global_staleness) if global_staleness else 0
+                if global_exec_times:
+                    step_metrics['avg_exec_time_ms'] = sum(global_exec_times) / len(global_exec_times)
+        else:
+            # Single rank: use local data directly
+            global_rollout_metadata = rollout_metadata if rollout_metadata else []
+            puct_analysis_data = None
+            if hasattr(workflow, 'get_puct_analysis_data'):
+                try:
+                    puct_analysis_data = workflow.get_puct_analysis_data(clear=False)
+                except Exception as e:
+                    logger.debug(f"[PUCT_TRACK] Failed to get analysis data: {e}")
+        
+        # Record to history logger with synchronized global data
         history_logger.record_step(
             step=global_step,
             rewards=local_step_rewards,
             best_solution=current_best_solution,
-            additional_metrics=step_metrics
+            additional_metrics=step_metrics,
+            rollout_metadata=global_rollout_metadata if global_rollout_metadata else None,
+            puct_analysis_data=puct_analysis_data,
         )
         
         logger.info(f"[Rank {actor.dp_rank}][Step {global_step}] Rollouts: {local_rollouts} (global: {global_rollouts}), "

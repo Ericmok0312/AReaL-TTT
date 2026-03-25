@@ -289,7 +289,7 @@ class TTTDPPOTrainer(PPOTrainer):
     
     def _clear_stale_state_after_recovery(self):
         """Clear stale state after recovery - same logic as original train_tttd_vllm_v2.py"""
-        is_dp_head = self.actor.is_data_parallel_head() if hasattr(self.actor, 'is_data_parallel_head') else (int(__import__('os').getenv("RANK", "0")) == 0)
+        is_dp_head = self.actor.rank == 0  # Global rank 0 is the unique head for logging/saving
         
         if self.recover_info:
             start_step = self.recover_info.last_step_info.next().global_step
@@ -378,7 +378,7 @@ class TTTDPPOTrainer(PPOTrainer):
         all_save_steps = getattr(config, 'save_steps', list(range(0, max_steps)))
         future_save_steps = [s for s in all_save_steps if start_step <= s < max_steps]
         
-        is_dp_head = self.actor.is_data_parallel_head() if hasattr(self.actor, 'is_data_parallel_head') else (int(__import__('os').getenv("RANK", "0")) == 0)
+        is_dp_head = self.actor.rank == 0  # Global rank 0 is the unique head for logging/saving
         
         self.history_logger = TTTTrainingLogger(
             save_steps=future_save_steps,
@@ -420,7 +420,7 @@ class TTTDPPOTrainer(PPOTrainer):
         # TTT-Discover: Use max_steps directly (not steps_per_epoch * epochs)
         max_steps = getattr(config, 'max_steps', config.total_train_epochs)
         
-        is_dp_head = self.actor.is_data_parallel_head() if hasattr(self.actor, 'is_data_parallel_head') else (int(__import__('os').getenv("RANK", "0")) == 0)
+        is_dp_head = self.actor.rank == 0  # Global rank 0 is the unique head for logging/saving
         batch_size = config.sampler.batch_size
         group_size = config.gconfig.n_samples
         best_reward = float('-inf')
@@ -490,7 +490,37 @@ class TTTDPPOTrainer(PPOTrainer):
                     timing_stats = workflow.get_timing_stats(clear=False)  # Don't clear, already cleared above
             
             # === Sampler Synchronization (part of training phase) ===
-            local_children, local_parents, local_failed = workflow.get_pending_updates(clear=True)
+            # Pass current_step for strict PUCT update mode to prevent cross-batch contamination
+            puct_update_result = workflow.get_pending_updates(clear=True, current_step=global_step)
+            
+            # Handle both old (4-tuple) and new (5-tuple) return formats
+            if len(puct_update_result) == 5:
+                local_children, local_parents, local_failed, rollout_metadata, cross_batch_info = puct_update_result
+            else:
+                local_children, local_parents, local_failed, rollout_metadata = puct_update_result
+                cross_batch_info = {}
+            
+            # Log cross-batch contamination prevention (strict mode)
+            if cross_batch_info.get('mode') == 'strict' and cross_batch_info.get('n_delayed', 0) > 0:
+                logger.info(f"[Step {global_step}] STRICT_PUCT: Prevented cross-batch contamination. "
+                           f"This batch: {cross_batch_info['n_this_batch']}, "
+                           f"Delayed: {cross_batch_info['n_delayed']}")
+            
+            # Calculate staleness statistics from metadata
+            if rollout_metadata:
+                staleness_values = [m['staleness'] for m in rollout_metadata]
+                exec_times = [m.get('exec_time_ms', 0) for m in rollout_metadata if m.get('exec_time_ms', 0) > 0]
+                
+                avg_staleness = sum(staleness_values) / len(staleness_values) if staleness_values else 0
+                max_staleness = max(staleness_values) if staleness_values else 0
+                min_staleness = min(staleness_values) if staleness_values else 0
+                
+                if is_dp_head:
+                    logger.info(f"[Step {global_step}] STALENESS_BATCH: n={len(staleness_values)}, "
+                               f"avg={avg_staleness:.2f}, min={min_staleness}, max={max_staleness}")
+                    if exec_times:
+                        avg_exec_time = sum(exec_times) / len(exec_times)
+                        logger.info(f"[Step {global_step}] EXEC_TIME: n={len(exec_times)}, avg={avg_exec_time:.2f}ms")
             
             # Async monitoring: track expected vs actual rollouts for research analysis
             expected_per_rank = (batch_size * group_size) // self.actor.data_parallel_world_size
@@ -507,6 +537,22 @@ class TTTDPPOTrainer(PPOTrainer):
                 'actual_total': actual_total,
                 'async_overhead': async_overhead,
             }
+            
+            # Add staleness statistics if available
+            if rollout_metadata:
+                staleness_values = [m['staleness'] for m in rollout_metadata]
+                exec_times = [m.get('exec_time_ms', 0) for m in rollout_metadata if m.get('exec_time_ms', 0) > 0]
+                async_metrics['staleness'] = {
+                    'n': len(staleness_values),
+                    'avg': sum(staleness_values) / len(staleness_values) if staleness_values else 0,
+                    'min': min(staleness_values) if staleness_values else 0,
+                    'max': max(staleness_values) if staleness_values else 0,
+                }
+                if exec_times:
+                    async_metrics['exec_time_ms'] = {
+                        'n': len(exec_times),
+                        'avg': sum(exec_times) / len(exec_times),
+                    }
             
             if async_overhead != 0:
                 logger.info(f"[Async Monitor][Step {global_step}][Rank {self.actor.dp_rank}] "
@@ -536,12 +582,52 @@ class TTTDPPOTrainer(PPOTrainer):
                     logger.info(f"[PARENT_CHILD_MAP] step={global_step} rank={self.actor.dp_rank} "
                                f"parent_id={pid[:8]}... children_count={count}")
             
+            # Pre-sync: record _m values before update (for Q-value change analysis)
+            prev_m_values = {}
+            if hasattr(workflow, 'log_puct_update') and hasattr(self.sampler, '_m'):
+                for parent in local_parents:
+                    pid = parent.id
+                    if pid in self.sampler._m:
+                        prev_m_values[pid] = self.sampler._m[pid]
+            
             self.actor.sync_sampler(
                 local_children=local_children,
                 local_parents=local_parents,
                 local_failed=local_failed,
                 step=global_step
             )
+            
+            # Record PUCT update events for three-core-metrics analysis
+            # This captures _m and _n values after sync_sampler updates them
+            if hasattr(workflow, 'log_puct_update') and hasattr(self.sampler, '_m'):
+                for parent in local_parents:
+                    pid = parent.id
+                    if pid in self.sampler._m:
+                        m_value = self.sampler._m[pid]
+                        n_visits = self.sampler._n.get(pid, 0)
+                        
+                        # Get children rewards for this parent from local_children
+                        children_rewards = [
+                            c.value for c in local_children
+                            if any(p.get('id') == pid for p in (c.parents or []))
+                            and c.value is not None
+                        ]
+                        
+                        # Calculate score (simplified, without scale/prior)
+                        score = m_value  # Q-value is the main component
+                        
+                        try:
+                            workflow.log_puct_update(
+                                parent_id=pid,
+                                update_step=global_step,
+                                n_visits=n_visits,
+                                m_value=m_value,
+                                score=score,
+                                children_rewards=children_rewards,
+                                prev_m_value=prev_m_values.get(pid),  # Record change
+                            )
+                        except Exception as e:
+                            logger.debug(f"[PUCT_TRACK] Failed to log update for {pid[:8]}: {e}")
             
             # Post-sync verification (lightweight checksum)
             if dist.is_initialized() and self.actor.data_parallel_world_size > 1:
@@ -621,6 +707,40 @@ class TTTDPPOTrainer(PPOTrainer):
                         'n_parents': len(staleness_values),
                         'current_version': current_version,
                     }
+            
+            # Add execution time stats for research analysis
+            if hasattr(workflow, 'get_exec_time_stats'):
+                exec_time_stats = workflow.get_exec_time_stats()
+                if exec_time_stats:
+                    # Aggregate exec time stats across all parents
+                    all_exec_times = []
+                    parent_exec_stats = []
+                    for pid, stats in exec_time_stats.items():
+                        all_exec_times.extend(stats['exec_times_ms'])
+                        parent_exec_stats.append({
+                            'parent_id': pid[:8],  # Short ID for readability
+                            'avg_ms': stats['avg_exec_time_ms'],
+                            'total_ms': stats['total_exec_time_ms'],
+                            'n_children': stats['n_children'],
+                            'parent_timestep': stats['parent_timestep'],
+                        })
+                    
+                    step_metrics['exec_times'] = {
+                        'n_parents': len(exec_time_stats),
+                        'total_rollouts': len(all_exec_times),
+                        'avg_ms': sum(all_exec_times) / len(all_exec_times) if all_exec_times else 0,
+                        'min_ms': min(all_exec_times) if all_exec_times else 0,
+                        'max_ms': max(all_exec_times) if all_exec_times else 0,
+                        'parent_details': parent_exec_stats[:10],  # Limit to first 10 for brevity
+                    }
+                    
+                    # Log for easy regex extraction
+                    logger.info(f"[EXEC_TIME_STATS] step={global_step} "
+                               f"n_parents={len(exec_time_stats)} "
+                               f"total_rollouts={len(all_exec_times)} "
+                               f"avg_ms={step_metrics['exec_times']['avg_ms']:.2f} "
+                               f"min_ms={step_metrics['exec_times']['min_ms']:.2f} "
+                               f"max_ms={step_metrics['exec_times']['max_ms']:.2f}")
             
             logger.info(f"[Rank {self.actor.dp_rank}][Step {global_step}] Rollouts: {local_rollouts} (global: {global_rollouts}), "
                        f"batch parents: {batch_size}, group_size: {group_size}")
@@ -750,12 +870,88 @@ class TTTDPPOTrainer(PPOTrainer):
             # Add async metrics for research analysis
             step_metrics['async'] = async_metrics
             
-            # Record to history logger (now includes timing)
+            # Get PUCT analysis data for three-core-metrics analysis
+            puct_analysis_data = None
+            if hasattr(workflow, 'get_puct_analysis_data'):
+                try:
+                    puct_analysis_data = workflow.get_puct_analysis_data(clear=False)
+                except Exception as e:
+                    logger.warning(f"[PUCT_TRACK] Failed to get analysis data: {e}")
+            
+            # ============================================================
+            # Distributed Data Aggregation
+            # Synchronize rollout_metadata and puct_analysis across ranks
+            # NOTE: best_solution is already consistent across ranks after sync_sampler()
+            # ============================================================
+            if dist.is_initialized() and self.actor.data_parallel_world_size > 1:
+                world_size = self.actor.data_parallel_world_size
+                
+                # 1. Sync rollout_metadata (all_gather_object)
+                if rollout_metadata:
+                    all_metadata = [[] for _ in range(world_size)]
+                    dist.all_gather_object(all_metadata, rollout_metadata)
+                    # Flatten list of lists
+                    global_rollout_metadata = []
+                    for rank_metadata in all_metadata:
+                        global_rollout_metadata.extend(rank_metadata)
+                else:
+                    global_rollout_metadata = []
+                
+                # 2. Sync puct_analysis (merge across ranks)
+                if puct_analysis_data:
+                    all_puct_data = [None] * world_size
+                    dist.all_gather_object(all_puct_data, puct_analysis_data)
+                    # Merge: combine parent_episodes and puct_updates from all ranks
+                    global_puct_data = {
+                        'parent_episodes': {},
+                        'puct_updates': [],
+                    }
+                    for rank_data in all_puct_data:
+                        if rank_data:
+                            global_puct_data['parent_episodes'].update(
+                                rank_data.get('parent_episodes', {})
+                            )
+                            global_puct_data['puct_updates'].extend(
+                                rank_data.get('puct_updates', [])
+                            )
+                else:
+                    global_puct_data = None
+                
+                # 3. Update step_metrics async stats based on global rollout_metadata
+                if global_rollout_metadata:
+                    global_staleness = [m['staleness'] for m in global_rollout_metadata]
+                    global_exec_times = [m.get('child_exec_time_ms', 0) 
+                                        for m in global_rollout_metadata 
+                                        if m.get('child_exec_time_ms', 0) > 0]
+                    
+                    step_metrics['async']['staleness'] = {
+                        'n': len(global_staleness),
+                        'avg': sum(global_staleness) / len(global_staleness) if global_staleness else 0,
+                        'min': min(global_staleness) if global_staleness else 0,
+                        'max': max(global_staleness) if global_staleness else 0,
+                    }
+                    if global_exec_times:
+                        step_metrics['async']['exec_time_ms'] = {
+                            'n': len(global_exec_times),
+                            'avg': sum(global_exec_times) / len(global_exec_times),
+                        }
+                    # Update total rollouts count
+                    step_metrics['async']['actual_total'] = len(global_rollout_metadata)
+                
+            else:
+                # Single rank: use local data directly
+                global_rollout_metadata = rollout_metadata if rollout_metadata else []
+                global_puct_data = puct_analysis_data
+            
+            # Record to history logger with synchronized global data
+            # NOTE: best_solution is consistent across ranks (synced via sync_sampler)
             self.history_logger.record_step(
                 step=global_step,
                 rewards=local_step_rewards,
-                best_solution=current_best_solution,
-                additional_metrics=step_metrics
+                best_solution=current_best_solution,  # Already consistent after sync_sampler
+                additional_metrics=step_metrics,
+                rollout_metadata=global_rollout_metadata if global_rollout_metadata else None,
+                puct_analysis_data=global_puct_data,
             )
             
             if is_dp_head:

@@ -31,9 +31,9 @@ def tttd_reward_fn(
     prompt_ids: list[int],
     completion_ids: list[int],
     **data,
-) -> tuple[float, Any, str]:
+) -> tuple[float, Any, str, float]:
     """
-    TTT-Discover reward function returning full execution result.
+    TTT-Discover reward function returning full execution result with timing.
     
     This is an extended version of AReaL's standard reward function that returns
     additional metadata to avoid re-executing code in the workflow.
@@ -48,13 +48,14 @@ def tttd_reward_fn(
             - _state: State instance for the current task.
     
     Returns:
-        tuple: (reward, EnvResult, code)
+        tuple: (reward, EnvResult, code, exec_time_ms)
             - reward: float, the computed reward (higher is better)
             - result: EnvResult, full execution result with metadata
             - code: str, extracted code string
+            - exec_time_ms: float, pure execution time in milliseconds (excluding wait time)
             
     Example:
-        >>> reward, result, code = tttd_reward_fn(
+        >>> reward, result, code, exec_time_ms = tttd_reward_fn(
         ...     prompt="Solve AC1...",
         ...     completions="```python\ndef propose_candidate(): ...",
         ...     prompt_ids=[1, 2, 3],
@@ -77,6 +78,8 @@ def tttd_reward_fn(
         return 0.0, result, ""
     
     try:
+        import time
+        
         # Extract code from completion
         code = env.extract_code(completions)
         
@@ -86,13 +89,15 @@ def tttd_reward_fn(
                 state=state,
                 fail_type="code_extraction_failed",
             )
-            return 0.0, result, ""
+            return 0.0, result, "", 0.0
         
-        # Execute code in environment
+        # Execute code in environment (measure pure execution time)
+        exec_start = time.perf_counter()
         result = env.execute(code, state)
+        exec_time_ms = (time.perf_counter() - exec_start) * 1000
         
         # Return full tuple to avoid re-execution in workflow
-        return float(result.reward), result, code
+        return float(result.reward), result, code, exec_time_ms
         
     except Exception as e:
         logger.warning(f"Exception in tttd_reward_fn: {e}", exc_info=True)
@@ -101,7 +106,7 @@ def tttd_reward_fn(
             fail_type="execution_error",
             error_msg=str(e),
         )
-        return 0.0, result, ""
+        return 0.0, result, "", 0.0
 
 
 def tttd_reward_fn_with_validation(

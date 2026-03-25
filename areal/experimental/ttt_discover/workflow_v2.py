@@ -22,6 +22,7 @@ Usage:
 
 import asyncio
 import os
+import time
 import uuid
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -70,6 +71,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         strict_sync_mode: bool = False,
         batch_size: int | None = None,
         group_size: int | None = None,
+        puct_update_mode: str = "eager",
     ):
         """
         Initialize TTT-Discover Workflow V2.
@@ -91,6 +93,11 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 parent-child matching. If False (default), process all pending updates.
             batch_size: Number of parent states per step (required if strict_sync_mode=True)
             group_size: Number of rollouts per parent (required if strict_sync_mode=True)
+            puct_update_mode: Controls how PUCTSampler is updated to prevent cross-batch contamination:
+                - "eager" (default): Use all completed children to update PUCT immediately (async behavior)
+                - "strict": Only use children from parents sampled in current step to update PUCT.
+                  This prevents cross-batch contamination by delaying PUCT updates for late children.
+                  Use this mode to isolate staleness effects on policy training from PUCT update effects.
         """
         self.env = env
         self.auto_flush = auto_flush
@@ -106,6 +113,23 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 raise ValueError("batch_size and group_size must be provided when strict_sync_mode=True")
             self.expected_rollouts_per_step = batch_size * group_size
             logger.info(f"TTTDiscoverWorkflowV2: Strict sync mode enabled, expected_rollouts_per_step={self.expected_rollouts_per_step}")
+            
+        
+        # PUCT update mode for controlling cross-batch contamination
+        self.puct_update_mode = puct_update_mode
+        if puct_update_mode not in ["eager", "strict"]:
+            raise ValueError(f"puct_update_mode must be 'eager' or 'strict', got {puct_update_mode}")
+        
+        if puct_update_mode == "strict":
+            logger.info(f"TTTDiscoverWorkflowV2: STRICT PUCT update mode enabled. "
+                       f"Cross-batch contamination will be prevented.")
+            raise ValueError("Strict sync mode is not fully implemented yet.")
+            # Buffer for delayed PUCT updates (children that arrived late)
+            self._delayed_puct_children: list[Any] = []
+            self._delayed_puct_parents: list[Any] = []
+            self._delayed_rollout_metadata: list[dict] = []
+            # Track which step each parent was sampled
+            self._parent_sample_step: dict[str, int] = {}
         
         # Initialize tokenizer
         if isinstance(tokenizer, str):
@@ -147,6 +171,15 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         # Key: parent_state.id, Value: list of child rewards
         self._parent_stats: dict[str, list[float]] = {}
         
+        # Store detailed rollout metadata for history logger
+        # Each entry contains parent-child relationship and execution times for analysis:
+        # {
+        #   'parent_id': str, 'parent_timestep': int, 'parent_exec_time_ms': float|None,
+        #   'child_id': str|None, 'child_timestep': int, 'child_exec_time_ms': float,
+        #   'reward': float, 'staleness': int, 'failed': bool (optional)
+        # }
+        self._rollout_metadata: list[dict] = []
+        
         # Cache failed rollouts for delayed update (synced across ranks in distributed training)
         self._failed_parents: list[Any] = []
         
@@ -155,15 +188,26 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         self._rollout_timing_pairs: list[tuple[float, float]] = []
         
         # Staleness tracking for research analysis
-        # Key: parent_id, Value: {
+        # Key: (parent_id, sampled_step), Value: {
         #   'sample_version': int,          # Model version when parent was sampled
-        #   'children_completed': int, 
+        #   'children_completed': int,
         #   'total_expected': int,
-        #   'parent_timestep': int
+        #   'parent_timestep': int,
+        #   'exec_times_ms': list[float],   # Execution times for each child
         # }
         # Staleness = current_version - sample_version
-        self._staleness_tracker: dict[str, dict] = {}
+        # NOTE: Uses composite key to handle same parent sampled in multiple steps
+        self._staleness_tracker: dict[tuple[str, int], dict] = {}
         self._current_version: int = 0  # Current model version, set externally
+        
+        # PUCT behavior tracking for three core metrics:
+        # 1. Q-value estimation error
+        # 2. Selection switching due to information delay
+        # 3. Q-value convergence delay
+        self._puct_update_log: list[dict] = []  # Each PUCT update event
+        # Key: (parent_id, sampled_step), Value: episode dict
+        # Using composite key to handle same parent sampled in multiple steps
+        self._parent_episodes: dict[tuple[str, int], dict] = {}
 
     def get_execute_tail_latency(self, clear: bool = True) -> float:
         """
@@ -273,12 +317,12 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         resp: ModelResponse,
         task_data: dict[str, Any],
         gpu_done_time: float | None = None,
-    ) -> tuple[float, EnvResult, str]:
+    ) -> tuple[float, EnvResult, str, float]:
         """Compute reward by executing code using AsyncRewardWrapper.
         
         This method uses AsyncRewardWrapper with tttd_reward_fn to run env.execute 
         in a ProcessPoolExecutor, enabling true process-level parallelism for code 
-        verification. The reward function returns (reward, EnvResult, code) tuple
+        verification. The reward function returns (reward, EnvResult, code, exec_time_ms) tuple
         to avoid re-executing code.
         
         Args:
@@ -287,7 +331,8 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             gpu_done_time: Timestamp when GPU inference completed (for tail latency measurement)
             
         Returns:
-            tuple: (reward_value, EnvResult, extracted_code)
+            tuple: (reward_value, EnvResult, extracted_code, exec_time_ms)
+                - exec_time_ms: Pure execution time in milliseconds (excluding wait time)
         """
         import time
         start_time = time.time()
@@ -304,14 +349,15 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             )
             if gpu_done_time is not None:
                 self._rollout_timing_pairs.append((gpu_done_time, time.perf_counter()))
-            return result.reward, result, ""
+            return result.reward, result, "", 0.0
         
+        exec_time_ms = 0.0
         try:
             # Use AsyncRewardWrapper with tttd_reward_fn
-            # tttd_reward_fn returns (reward, EnvResult, code) tuple
+            # tttd_reward_fn returns (reward, EnvResult, code, exec_time_ms) tuple
             prompt_str = self.tokenizer.decode(resp.input_tokens)
             
-            reward, result, extracted_code = await self.async_reward_fn(
+            reward, result, extracted_code, exec_time_ms = await self.async_reward_fn(
                 prompt_str,
                 completion_str,
                 resp.input_tokens,
@@ -322,7 +368,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             
             elapsed = time.time() - start_time
             fail_type_info = f", fail_type={result.fail_type}" if result.fail_type else ""
-            logger.info(f"reward={result.reward:.4f}, valid={result.is_valid}, elapsed={elapsed:.1f}s{fail_type_info}")
+            logger.info(f"reward={result.reward:.4f}, valid={result.is_valid}, exec_time={exec_time_ms:.1f}ms, elapsed={elapsed:.1f}s{fail_type_info}")
             
         except Exception as e:
             logger.warning(f"Execution failed: {e}")
@@ -336,12 +382,13 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         stats_tracker.get("rollout").scalar(
             reward=result.reward,
             is_valid=float(result.is_valid),
+            exec_time_ms=exec_time_ms,
         )
         
         if gpu_done_time is not None:
             self._rollout_timing_pairs.append((gpu_done_time, time.perf_counter()))
         
-        return result.reward, result, extracted_code
+        return result.reward, result, extracted_code, exec_time_ms
 
     @trace_session("arun_episode")
     async def arun_episode(
@@ -370,6 +417,51 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 input_ids=[0],
                 fail_type="missing_state",
             )
+        
+        # Track new parent episode for PUCT analysis
+        # This is called when parent is sampled and rollout begins
+        # NOTE: Use lock to prevent race condition when multiple children
+        # of the same parent are processed concurrently
+        try:
+            current_step = self._current_step if hasattr(self, '_current_step') else 0
+            expected_children = self.gconfig.n_samples if hasattr(self.gconfig, 'n_samples') else None
+            
+            async with self._pending_lock:
+                # Initialize parent episode tracking (for PUCT analysis)
+                # Use composite key (parent_id, sampled_step) to handle same parent in multiple steps
+                episode_key = (state.id, current_step)
+                if episode_key not in self._parent_episodes:
+                    # Extract PUCT selection info if available (from dataloader)
+                    selection_info = data.get('_puct_selection')
+                    
+                    self.start_parent_episode(
+                        parent_id=state.id,
+                        sampled_step=current_step,
+                        parent_value=state.value if hasattr(state, 'value') else None,
+                        expected_children=expected_children,
+                        selection_info=selection_info,
+                    )
+                    logger.debug(f"[PUCT_TRACK] Started new parent episode for {state.id[:8]}... "
+                               f"step={current_step}, value={state.value}, expected_children={expected_children}")
+                
+                # FIX: Initialize staleness tracker at parent sampling time (not first child completion)
+                # This ensures staleness = current_version - sample_version correctly measures
+                # how many model versions have passed since parent was selected
+                # NOTE: Use composite key (parent_id, step) to handle same parent in multiple steps
+                staleness_key = (state.id, current_step)
+                if staleness_key not in self._staleness_tracker:
+                    self._staleness_tracker[staleness_key] = {
+                        'sample_version': self._current_version,  # Version when parent was SELECTED
+                        'children_completed': 0,  # Will be incremented when each child completes
+                        'total_expected': expected_children,
+                        'parent_timestep': state.timestep,
+                        'exec_times_ms': [],
+                    }
+                    logger.debug(f"[STALENESS_INIT] parent_id={state.id} step={current_step} "
+                               f"sample_version={self._current_version} "
+                               f"parent_timestep={state.timestep}")
+        except Exception as e:
+            logger.warning(f"[PUCT_TRACK] Failed to start parent episode: {e}")
         
         try:
             # Generate - Phase 1: Normal thinking
@@ -444,7 +536,8 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             gpu_done_time = time.perf_counter()
             
             # Compute reward on final response (pass gpu_done_time for timing measurement)
-            reward, result, code = await self._compute_reward(resp, data, gpu_done_time)
+            # Returns: (reward, result, code, exec_time_ms) where exec_time_ms is pure execution time
+            reward, result, code, exec_time_ms = await self._compute_reward(resp, data, gpu_done_time)
             
             # Log validation failure (concise)
             if not result.is_valid:
@@ -474,6 +567,9 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                         result=result,
                         timestep=state.timestep + 1,
                     )
+                    # Store execution time for this child state
+                    child.exec_time_ms = exec_time_ms
+                    
                     async with self._pending_lock:
                         self._pending_children.append(child)
                         self._pending_parents.append(state)
@@ -484,47 +580,56 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                             self._parent_stats[pid] = []
                         self._parent_stats[pid].append(reward)
                         
-                        # Staleness tracking: record model version when parent was sampled
-                        # Staleness = current_version - sample_version
+                        # Staleness tracking: staleness = current_version - sample_version
+                        # where sample_version is recorded when parent was SELECTED (in arun_episode)
                         try:
                             current_version = engine.get_version()
                         except Exception:
                             current_version = -1  # Fallback if engine doesn't support versioning
                         
-                        is_new_parent = pid not in self._staleness_tracker
+                        # Use composite key (parent_id, step) to handle same parent in multiple steps
+                        staleness_key = (pid, current_step)
                         
-                        if is_new_parent:
-                            self._staleness_tracker[pid] = {
-                                'sample_version': current_version,  # Version when first child completed
-                                'children_completed': 1,
+                        # Parent should already be in tracker (initialized in arun_episode)
+                        # But handle fallback case for safety
+                        if staleness_key not in self._staleness_tracker:
+                            # Fallback: initialize with current version (staleness will be 0)
+                            logger.warning(f"[STALENESS_FALLBACK] parent_id={pid} step={current_step} not initialized, "
+                                         f"using current_version={current_version} as sample_version")
+                            self._staleness_tracker[staleness_key] = {
+                                'sample_version': current_version,
+                                'children_completed': 0,
                                 'total_expected': self.gconfig.n_samples if hasattr(self.gconfig, 'n_samples') else None,
                                 'parent_timestep': state.timestep,
+                                'exec_times_ms': [],
                             }
-                            logger.info(f"[STALENESS_NEW] parent_id={pid} "
-                                       f"sample_version={current_version} "
-                                       f"parent_timestep={state.timestep} "
-                                       f"total_expected={self._staleness_tracker[pid]['total_expected']}")
-                        else:
-                            self._staleness_tracker[pid]['children_completed'] += 1
-                            tracker = self._staleness_tracker[pid]
-                            # Staleness is version difference: current - sample_version
-                            staleness = current_version - tracker['sample_version']
-                            logger.info(f"[STALENESS_CONT] parent_id={pid} "
-                                       f"child_num={tracker['children_completed']}/{tracker['total_expected']} "
-                                       f"sample_version={tracker['sample_version']} "
-                                       f"current_version={current_version} "
-                                       f"staleness={staleness}")
                         
-                        # Log staleness info for research analysis (regex-friendly format)
-                        tracker = self._staleness_tracker[pid]
-                        staleness = current_version - tracker['sample_version'] if current_version >= 0 else -1
-                        logger.info(f"[STALENESS] parent_id={pid} "
+                        tracker = self._staleness_tracker[staleness_key]
+                        tracker['children_completed'] += 1
+                        tracker['exec_times_ms'].append(exec_time_ms)
+                        # Staleness = current_version - sample_version (when parent was selected)
+                        staleness = current_version - tracker['sample_version']
+                        
+                        logger.info(f"[STALENESS] parent_id={pid} step={current_step} "
                                    f"child_num={tracker['children_completed']}/{tracker['total_expected']} "
                                    f"sample_version={tracker['sample_version']} "
                                    f"current_version={current_version} "
                                    f"staleness={staleness} "
-                                   f"is_new={is_new_parent} "
-                                   f"parent_timestep={tracker['parent_timestep']}")
+                                   f"parent_timestep={tracker['parent_timestep']} "
+                                   f"exec_time_ms={exec_time_ms:.2f}")
+                        
+                        # Record rollout metadata for history logger
+                        # Includes child_id and parent_exec_time_ms for parent-child execution time analysis
+                        self._rollout_metadata.append({
+                            'parent_id': pid,
+                            'parent_timestep': tracker['parent_timestep'],
+                            'parent_exec_time_ms': getattr(state, 'exec_time_ms', None),
+                            'child_id': child.id,
+                            'child_timestep': child.timestep,
+                            'child_exec_time_ms': float(exec_time_ms),
+                            'reward': float(reward),
+                            'staleness': int(staleness),
+                        })
                         
                 except Exception as e:
                     logger.warning(f"Failed to create child state: {e}")
@@ -533,6 +638,22 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 try:
                     async with self._pending_lock:
                         self._failed_parents.append(state)
+                        # Record failed rollout metadata
+                        current_version = self._current_version
+                        # Use composite key (parent_id, step) for staleness lookup
+                        staleness_key = (state.id, current_step)
+                        staleness = current_version - self._staleness_tracker.get(staleness_key, {}).get('sample_version', current_version)
+                        self._rollout_metadata.append({
+                            'parent_id': state.id,
+                            'parent_timestep': state.timestep,
+                            'parent_exec_time_ms': getattr(state, 'exec_time_ms', None),
+                            'child_id': None,  # Failed rollouts don't create child states
+                            'child_timestep': state.timestep + 1,
+                            'child_exec_time_ms': float(exec_time_ms),
+                            'reward': float(result.reward),
+                            'staleness': int(staleness),
+                            'failed': True,
+                        })
                         logger.debug(f"Cached failed rollout for parent {state.id}")
                 except Exception as e:
                     logger.warning(f"Failed to cache failed rollout: {e}")
@@ -570,6 +691,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         self._pending_parents.clear()
         self._failed_parents.clear()
         self._parent_stats.clear()
+        self._rollout_metadata.clear()
 
     def set_current_version(self, version: int):
         """Set the current model version for staleness calculation.
@@ -580,14 +702,88 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         self._current_version = version
         logger.debug(f"[WORKFLOW] Set current version to {version}")
     
-    def get_pending_updates(self, clear: bool = True) -> tuple[list, list, list]:
-        """Return the buffered pending updates (children, parents, failed_parents) for this batch."""
-        children = self._pending_children.copy()
-        parents = self._pending_parents.copy()
-        failed = self._failed_parents.copy()
+    def get_pending_updates(self, clear: bool = True, current_step: int | None = None) -> tuple:
+        """Return the buffered pending updates (children, parents, failed_parents, rollout_metadata) for this batch.
+        
+        Args:
+            clear: Whether to clear internal buffers after retrieval
+            current_step: Current training step. Required for strict PUCT update mode to prevent
+                cross-batch contamination. If None, uses self._current_version.
+        
+        Returns:
+            Tuple of (children, parents, failed_parents, rollout_metadata, cross_batch_info)
+            where cross_batch_info is a dict with delayed children info (only in strict mode)
+        """
+        # Determine current step
+        if current_step is None:
+            current_step = self._current_version
+        
+        # Get all pending updates
+        all_children = self._pending_children.copy()
+        all_parents = self._pending_parents.copy()
+        all_failed = self._failed_parents.copy()
+        all_metadata = self._rollout_metadata.copy()
+        
+        # CROSS-BATCH TRACKING (for both modes, for analysis)
+        cross_batch_info = {
+            'mode': self.puct_update_mode,
+            'current_step': current_step,
+            'n_this_batch': len(all_children),
+            'n_delayed': 0,
+            'delayed_children_ids': [],
+        }
+        
+        # Determine which children to use for PUCT update
+        if self.puct_update_mode == "strict" and current_step is not None:
+            # STRICT MODE (方案 1): Only include children from parents sampled in current_step
+            filtered_children = []
+            filtered_parents = []
+            filtered_metadata = []
+            
+            for child, parent, meta in zip(all_children, all_parents, all_metadata):
+                pid = parent.id
+                parent_sampled_step = self._parent_sample_step.get(pid)
+                
+                if parent_sampled_step == current_step:
+                    # This parent was sampled in current step
+                    filtered_children.append(child)
+                    filtered_parents.append(parent)
+                    filtered_metadata.append(meta)
+                else:
+                    # Cross-batch child - track for analysis
+                    cross_batch_info['delayed_children_ids'].append(pid)
+            
+            cross_batch_info['n_this_batch'] = len(filtered_children)
+            cross_batch_info['n_delayed'] = len(cross_batch_info['delayed_children_ids'])
+            
+            # Log cross-batch prevention
+            if cross_batch_info['n_delayed'] > 0:
+                logger.info(f"[STRICT_PUCT] Step {current_step}: "
+                           f"{len(filtered_children)} children this batch, "
+                           f"{cross_batch_info['n_delayed']} delayed (cross-batch)")
+        else:
+            # EAGER MODE (方案 2 - 默认): Use all children for PUCT update
+            # This enables Streaming PUCT across batches
+            filtered_children = all_children
+            filtered_parents = all_parents
+            filtered_metadata = all_metadata
+            
+            # Track cross-batch for analysis (but don't prevent)
+            if current_step is not None:
+                for child, parent in zip(all_children, all_parents):
+                    pid = parent.id
+                    parent_sampled_step = self._parent_sample_step.get(pid)
+                    if parent_sampled_step != current_step:
+                        cross_batch_info['delayed_children_ids'].append(pid)
+                cross_batch_info['n_delayed'] = len(cross_batch_info['delayed_children_ids'])
+                
+                if cross_batch_info['n_delayed'] > 0:
+                    logger.debug(f"[STREAMING_PUCT] Step {current_step}: "
+                                f"Updating PUCT with {cross_batch_info['n_delayed']} "
+                                f"cross-batch children (Streaming mode)")
         
         # Calculate staleness statistics for research analysis
-        if self._staleness_tracker and children:
+        if self._staleness_tracker and all_children:
             current_version = self._current_version
             staleness_list = []
             incomplete_parents = 0
@@ -595,7 +791,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             # Track parents that have all children completed (for cleanup later)
             parents_to_cleanup = set()
             
-            for pid, tracker in self._staleness_tracker.items():
+            for (pid, step), tracker in self._staleness_tracker.items():
                 # Staleness = current_version - sample_version
                 staleness = current_version - tracker['sample_version']
                 staleness_list.append(staleness)
@@ -607,13 +803,13 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 if not is_complete:
                     incomplete_parents += 1
                     # Log incomplete parent for tracking (regex-friendly)
-                    logger.info(f"[STALENESS_INCOMPLETE] parent_id={pid} "
+                    logger.info(f"[STALENESS_INCOMPLETE] parent_id={pid} step={step} "
                                f"completed={tracker['children_completed']}/{total_expected} "
                                f"sample_version={tracker['sample_version']} "
                                f"current_version={current_version} "
                                f"staleness={staleness}")
                 else:
-                    parents_to_cleanup.add(pid)
+                    parents_to_cleanup.add((pid, step))
             
             if staleness_list:
                 avg_staleness = sum(staleness_list) / len(staleness_list)
@@ -624,23 +820,270 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                            f"current_version={current_version} "
                            f"incomplete={incomplete_parents} "
                            f"complete={len(parents_to_cleanup)} "
-                           f"total_children={len(children)}")
+                           f"total_children={len(all_children)}")
         
         if clear:
             self._pending_children.clear()
             self._pending_parents.clear()
             self._failed_parents.clear()
             self._parent_stats.clear()
+            self._rollout_metadata.clear()
             # CRITICAL FIX: Only cleanup staleness tracker entries for parents that are COMPLETE
             # Incomplete parents must retain their first_child_time for accurate staleness tracking
+            # NOTE: parents_to_cleanup contains tuples (parent_id, step) due to composite key
             if 'parents_to_cleanup' in locals():
-                for pid in parents_to_cleanup:
-                    if pid in self._staleness_tracker:
-                        logger.debug(f"[STALENESS_CLEANUP] Removing complete parent {pid} from tracker")
-                        del self._staleness_tracker[pid]
+                for key in parents_to_cleanup:
+                    if key in self._staleness_tracker:
+                        pid, step = key
+                        logger.debug(f"[STALENESS_CLEANUP] Removing complete parent {pid} step={step} from tracker")
+                        del self._staleness_tracker[key]
         
-        return children, parents, failed
+        # Record PUCT update timestamp for convergence delay analysis
+        # In strict mode, only record for children from current batch
+        parents_to_record = filtered_parents if self.puct_update_mode == "strict" else all_parents
+        children_to_record = filtered_children if self.puct_update_mode == "strict" else all_children
+        
+        for parent in parents_to_record:
+            pid = parent.id
+            episode = self._get_active_episode(pid)
+            if episode:
+                # Record that update happened at this step
+                n_children_in_update = len([c for c in children_to_record 
+                                           if any(p.get('id') == pid 
+                                                 for p in (c.parents or []))])
+                if n_children_in_update > 0:  # Only record if actually updating
+                    episode.setdefault('puct_update_steps', []).append({
+                        'step': current_step,
+                        'timestamp': time.time(),
+                        'n_children_in_update': n_children_in_update,
+                        'is_strict_mode': self.puct_update_mode == "strict",
+                    })
+                    
+                    # Check if episode is now complete (all children received)
+                    total_children = len(episode['children_completed'])
+                    expected = episode.get('expected_children')
+                    if expected and total_children >= expected:
+                        episode['completed'] = True
+                        episode['completed_step'] = current_step
+                        logger.debug(f"[PUCT_TRACK] Episode {episode['episode_id']} for parent {pid[:8]}... "
+                                   f"completed with {total_children} children")
+        
+        # Return all children for training, but with cross_batch_info for analysis
+        # In strict mode, caller should use filtered_* for PUCT update
+        if self.puct_update_mode == "strict":
+            # Return filtered lists + cross_batch_info
+            # Trainer should use filtered_parents for sync_sampler, but all_children for training
+            return (
+                filtered_children,  # For PUCT update (strict)
+                filtered_parents,   # For PUCT update (strict)
+                all_failed,         # Failed parents (no change)
+                filtered_metadata,  # Metadata for filtered children
+                cross_batch_info,   # Info about delayed children
+            )
+        else:
+            # EAGER mode: return all as before
+            return all_children, all_parents, all_failed, all_metadata, cross_batch_info
 
+    def get_exec_time_stats(self) -> dict[str, dict]:
+        """
+        Get execution time statistics for all tracked parents.
+        
+        Returns a dictionary mapping parent_id to stats including:
+        - exec_times_ms: list of execution times for each child
+        - avg_exec_time_ms: average execution time
+        - total_exec_time_ms: sum of all execution times
+        - parent_timestep: timestep of the parent state
+        
+        This is used for history_logger to analyze relationship between
+        parent/child complexity and execution time.
+        """
+        stats = {}
+        for (pid, step), tracker in self._staleness_tracker.items():
+            exec_times = tracker.get('exec_times_ms', [])
+            if exec_times:
+                stats[pid] = {
+                    'exec_times_ms': exec_times.copy(),
+                    'avg_exec_time_ms': sum(exec_times) / len(exec_times),
+                    'total_exec_time_ms': sum(exec_times),
+                    'min_exec_time_ms': min(exec_times),
+                    'max_exec_time_ms': max(exec_times),
+                    'n_children': len(exec_times),
+                    'parent_timestep': tracker.get('parent_timestep', -1),
+                    'sample_version': tracker.get('sample_version', -1),
+                    'sampled_step': step,  # Include the step for reference
+                }
+        return stats
+    
+    # ============================================================
+    # PUCT Behavior Tracking for Three Core Metrics
+    # ============================================================
+    
+    def start_parent_episode(self, parent_id: str, sampled_step: int,
+                             parent_value: float, expected_children: int,
+                             selection_info: dict = None):
+        """Start tracking a new parent episode for PUCT analysis.
+        
+        This should be called when a parent is sampled by PUCTSampler.
+        Each time a parent is sampled (even if sampled before in a different step), 
+        a new episode is created using composite key (parent_id, sampled_step).
+        
+        Args:
+            parent_id: Parent state ID
+            sampled_step: Training step when parent was sampled
+            parent_value: Parent state's value
+            expected_children: Expected number of children for this parent
+            selection_info: Optional dict with selection-time info for Q-value analysis:
+                - 'q_value': Q-value (m_value) at selection time
+                - 'n_visits': Visit count at selection time  
+                - 'puct_score': PUCT score at selection time
+                - 'candidates': List of candidate parents at selection time
+        """
+        # Use composite key (parent_id, sampled_step) to handle same parent in multiple steps
+        key = (parent_id, sampled_step)
+        
+        # Count how many times this parent has been sampled before (for episode_id)
+        existing_episodes = [ep for ep in self._parent_episodes.values() 
+                            if ep['parent_id'] == parent_id]
+        episode_id = len(existing_episodes)
+        
+        new_episode = {
+            'episode_id': episode_id,
+            'parent_id': parent_id,
+            'sampled_step': sampled_step,
+            'parent_value': parent_value,
+            'expected_children': expected_children,
+            'children_completed': [],  # List of completed child info
+            'puct_updates': [],        # List of PUCT update events
+            'completed': False,        # Whether all children are done
+        }
+        
+        # Add selection-time info if provided (for Q-value estimation error analysis)
+        if selection_info is not None:
+            new_episode['selection_info'] = selection_info.copy()
+        
+        self._parent_episodes[key] = new_episode
+        
+        # Record sample step for strict PUCT update mode
+        if self.puct_update_mode == "strict":
+            self._parent_sample_step[parent_id] = sampled_step
+        
+        logger.debug(f"[PUCT_TRACK] Started episode {episode_id} for parent {parent_id[:8]}... "
+                   f"step={sampled_step}, value={parent_value}")
+    
+    def _get_active_episode(self, parent_id: str) -> dict | None:
+        """Get the most recent active episode for a parent.
+        
+        Active = not yet completed (children still being generated).
+        Returns None if no active episode found.
+        """
+        # Search all episodes with matching parent_id
+        episodes = [ep for key, ep in self._parent_episodes.items() 
+                   if key[0] == parent_id]
+        
+        if not episodes:
+            return None
+        
+        # Sort by sampled_step to find most recent
+        episodes.sort(key=lambda e: e['sampled_step'], reverse=True)
+        
+        # Find the most recent episode that is not completed
+        for episode in episodes:
+            if not episode.get('completed', False):
+                return episode
+        return None
+    
+    def _get_episode(self, parent_id: str, sampled_step: int) -> dict | None:
+        """Get a specific episode by (parent_id, sampled_step).
+        
+        Returns None if episode not found.
+        """
+        key = (parent_id, sampled_step)
+        return self._parent_episodes.get(key)
+    
+    def log_child_completion(self, parent_id: str, child_reward: float, 
+                             complete_step: int, exec_time_ms: float):
+        """Log when a child rollout completes (before PUCT update).
+        
+        Associates the child with the most recent active episode for this parent.
+        """
+        episode = self._get_active_episode(parent_id)
+        if episode:
+            episode['children_completed'].append({
+                'reward': child_reward,
+                'complete_step': complete_step,
+                'exec_time_ms': exec_time_ms,
+            })
+    
+    def log_puct_update(self, parent_id: str, update_step: int,
+                        n_visits: int, m_value: float, score: float,
+                        children_rewards: list[float],
+                        prev_m_value: float = None):
+        """Log a PUCT update event for Q-value tracking.
+        
+        Args:
+            parent_id: Parent state ID
+            update_step: Step when update occurred
+            n_visits: _n[parent] after update
+            m_value: _m[parent] after update (this is the Q-value)
+            score: PUCT score after update
+            children_rewards: Rewards of children included in this update
+            prev_m_value: _m[parent] before update (for measuring Q-value change)
+        """
+        # Record in the most recent active episode
+        episode = self._get_active_episode(parent_id)
+        if episode:
+            update_record = {
+                'update_step': update_step,
+                'n_visits': n_visits,
+                'm_value': m_value,
+                'score': score,
+                'children_rewards': children_rewards.copy(),
+            }
+            if prev_m_value is not None:
+                update_record['prev_m_value'] = prev_m_value
+                update_record['m_value_change'] = m_value - prev_m_value
+            episode['puct_updates'].append(update_record)
+        
+        # Also record in global log for cross-parent analysis
+        global_record = {
+            'parent_id': parent_id,
+            'update_step': update_step,
+            'n_visits': n_visits,
+            'm_value': m_value,
+            'score': score,
+            'children_rewards': children_rewards.copy(),
+        }
+        if prev_m_value is not None:
+            global_record['prev_m_value'] = prev_m_value
+            global_record['m_value_change'] = m_value - prev_m_value
+        self._puct_update_log.append(global_record)
+    
+    def get_puct_analysis_data(self, clear: bool = True) -> dict:
+        """Get data for computing the three core PUCT metrics.
+        
+        Returns data structure for analyzing:
+        1. Q-value estimation error
+        2. Selection switching due to information delay  
+        3. Q-value convergence delay
+        
+        Args:
+            clear: Whether to clear internal buffers after retrieval
+            
+        Returns:
+            Dictionary with:
+            - 'parent_episodes': Detailed episode data for each parent
+            - 'puct_updates': All PUCT update events
+        """
+        data = {
+            'parent_episodes': self._parent_episodes.copy(),
+            'puct_updates': self._puct_update_log.copy(),
+        }
+        
+        if clear:
+            self._puct_update_log.clear()
+            # Keep parent_episodes for ongoing tracking
+            
+        return data
     
     def shutdown(self):
         """Cleanup resources.
