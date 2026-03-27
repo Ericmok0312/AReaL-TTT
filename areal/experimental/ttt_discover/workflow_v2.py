@@ -120,6 +120,9 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         if puct_update_mode not in ["eager", "strict"]:
             raise ValueError(f"puct_update_mode must be 'eager' or 'strict', got {puct_update_mode}")
         
+        # Track which step each parent was sampled (needed for cross-batch analysis in all modes)
+        self._parent_sample_step: dict[str, int] = {}
+        
         if puct_update_mode == "strict":
             logger.info(f"TTTDiscoverWorkflowV2: STRICT PUCT update mode enabled. "
                        f"Cross-batch contamination will be prevented.")
@@ -128,8 +131,6 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             self._delayed_puct_children: list[Any] = []
             self._delayed_puct_parents: list[Any] = []
             self._delayed_rollout_metadata: list[dict] = []
-            # Track which step each parent was sampled
-            self._parent_sample_step: dict[str, int] = {}
         
         # Initialize tokenizer
         if isinstance(tokenizer, str):
