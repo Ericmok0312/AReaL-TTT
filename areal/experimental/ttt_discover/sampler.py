@@ -200,6 +200,9 @@ class GreedySampler(StateSampler):
         self._top_states: list[State] = []
         self._lock = threading.Lock()
         self._current_step = resume_step if resume_step is not None else 0
+        # Internal sample counter: increments every time sample_states is called
+        # This ensures unique sampling steps for staleness tracking
+        self._sample_counter = 0
         if resume_step is not None:
             self._load(resume_step)
 
@@ -222,6 +225,10 @@ class GreedySampler(StateSampler):
             _atomic_write_json(save_path, store)
 
     def sample_states(self, num_states: int) -> list[State]:
+        with self._lock:
+            self._sample_counter += 1
+            current_sample_step = self._sample_counter
+        
         if not self._top_states:
             return [create_initial_state(self.env_type, self.initial_exp_type, self.budget_s) 
                     for _ in range(num_states)]
@@ -284,6 +291,8 @@ class GreedySampler(StateSampler):
         with self._lock:
             self._top_states = []
             self._current_step = step
+            # Restore sample counter to match the step we're resuming from
+            self._sample_counter = step
             self._load(step)
 
     def get_best_solution(self) -> dict | None:
@@ -370,6 +379,9 @@ class PUCTSampler(StateSampler):
         self._last_sampled_indices: list[int] = []
         self._lock = threading.Lock()
         self._current_step = resume_step if resume_step is not None else 0
+        # Internal sample counter: increments every time sample_states is called
+        # This ensures unique sampling steps for staleness tracking
+        self._sample_counter = 0
         
         # PUCT stats
         self._n: dict[str, int] = {} # Number of times state (or its descendants) has been expanded
@@ -478,6 +490,9 @@ class PUCTSampler(StateSampler):
         return lineage
 
     def sample_states(self, num_states: int) -> list[State]:
+        with self._lock:
+            self._sample_counter += 1
+        
         initial_ids = {s.id for s in self._initial_states}
         candidates = list(self._states)
 
@@ -663,6 +678,9 @@ class PUCTSampler(StateSampler):
             self._states = []
             self._initial_states = []
             self._current_step = step
+            # Restore sample counter to match the step we're resuming from
+            # This ensures staleness tracking continuity
+            self._sample_counter = step
             self._load(step)
             if not self._states:
                 for _ in range(self.batch_size):
