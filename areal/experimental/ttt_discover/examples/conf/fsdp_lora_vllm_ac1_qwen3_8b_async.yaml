@@ -9,7 +9,7 @@ is_tttd_config: true
 # Scheme 1: Sync-like PUCT update (complete batch)
 # true = wait for complete batch before PUCT update (slower, more accurate)
 # false = use available data immediately (faster, default)
-use_scheme_1: true
+use_scheme_1: false
 
 seed: 1
 enable_offload: false

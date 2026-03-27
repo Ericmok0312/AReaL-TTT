@@ -359,8 +359,118 @@ class TTTDPPOTrainer(PPOTrainer):
                 if is_dp_head:
                     logger.info("[Resume] Cleared data generator cache")
             
+            # 6. Clear workflow internal state (Scheme 1, staleness tracker, etc.)
+            self._clear_workflow_state_after_recovery(start_step)
+            
             if is_dp_head:
                 logger.info(f"[Resume] Ready to start from step {start_step}")
+    
+    def _clear_workflow_state_after_recovery(self, start_step: int):
+        """Clear workflow internal state after recovery.
+        
+        This clears all transient state that should not persist across resumes:
+        - Scheme 1 batch tracking
+        - Staleness tracker (incomplete rollouts from old version)
+        - Pending updates
+        - Failed parents cache
+        - Rollout metadata
+        
+        Args:
+            start_step: The step to resume from (used to reset version)
+        """
+        is_dp_head = self.actor.rank == 0
+        
+        # Get workflow from rollout
+        workflow_executor = self._get_workflow_executor()
+        if workflow_executor is None:
+            return
+        
+        workflow = None
+        if hasattr(workflow_executor, 'workflow'):
+            workflow = workflow_executor.workflow
+        elif hasattr(workflow_executor, '_workflow'):
+            workflow = workflow_executor._workflow
+        
+        if workflow is None:
+            return
+        
+        cleared_items = []
+        
+        # Clear Scheme 1 batch tracking
+        if hasattr(workflow, '_current_batch_parent_ids'):
+            stale_count = len(workflow._current_batch_parent_ids)
+            if stale_count > 0:
+                workflow._current_batch_parent_ids.clear()
+                workflow._expected_batch_size = 0
+                workflow._expected_n_samples = 0
+                cleared_items.append(f"scheme1_batch({stale_count})")
+        
+        # Clear staleness tracker (incomplete rollouts from old model version)
+        if hasattr(workflow, '_staleness_tracker'):
+            stale_count = len(workflow._staleness_tracker)
+            if stale_count > 0:
+                workflow._staleness_tracker.clear()
+                cleared_items.append(f"staleness_tracker({stale_count})")
+        
+        # Clear parent episodes
+        if hasattr(workflow, '_parent_episodes'):
+            stale_count = len(workflow._parent_episodes)
+            if stale_count > 0:
+                workflow._parent_episodes.clear()
+                cleared_items.append(f"parent_episodes({stale_count})")
+        
+        # Clear pending updates (async buffer)
+        if hasattr(workflow, '_pending_children'):
+            stale_count = len(workflow._pending_children)
+            if stale_count > 0:
+                workflow._pending_children.clear()
+                workflow._pending_parents.clear()
+                cleared_items.append(f"pending_updates({stale_count})")
+        
+        # Clear failed parents cache
+        if hasattr(workflow, '_failed_parents'):
+            stale_count = len(workflow._failed_parents)
+            if stale_count > 0:
+                workflow._failed_parents.clear()
+                cleared_items.append(f"failed_parents({stale_count})")
+        
+        # Clear rollout metadata
+        if hasattr(workflow, '_rollout_metadata'):
+            stale_count = len(workflow._rollout_metadata)
+            if stale_count > 0:
+                workflow._rollout_metadata.clear()
+                cleared_items.append(f"rollout_metadata({stale_count})")
+        
+        # Clear PUCT update log
+        if hasattr(workflow, '_puct_update_log'):
+            stale_count = len(workflow._puct_update_log)
+            if stale_count > 0:
+                workflow._puct_update_log.clear()
+                cleared_items.append(f"puct_log({stale_count})")
+        
+        # Clear parent stats
+        if hasattr(workflow, '_parent_stats'):
+            stale_count = len(workflow._parent_stats)
+            if stale_count > 0:
+                workflow._parent_stats.clear()
+                cleared_items.append(f"parent_stats({stale_count})")
+        
+        # Clear rollout timing pairs
+        if hasattr(workflow, '_rollout_timing_pairs'):
+            stale_count = len(workflow._rollout_timing_pairs)
+            if stale_count > 0:
+                workflow._rollout_timing_pairs.clear()
+                cleared_items.append(f"timing_pairs({stale_count})")
+        
+        # Reset current version to match resumed step
+        if hasattr(workflow, '_current_version'):
+            old_version = workflow._current_version
+            workflow._current_version = start_step
+            if old_version != start_step and is_dp_head:
+                cleared_items.append(f"version({old_version}->{start_step})")
+        
+        if cleared_items and is_dp_head:
+            logger.info(f"[Resume] Cleared workflow state: {', '.join(cleared_items)}")
     
     def _init_training_history_logger(self):
         """Initialize TTTTrainingLogger for visualization."""
