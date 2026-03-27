@@ -573,7 +573,8 @@ class TTTDPPOTrainer(PPOTrainer):
             # including those from previous steps that finished late.
             # get_pending_updates(clear=True) handles cleanup automatically.
             
-            # Set current version for staleness tracking (version = global_step)
+            # Set current version for staleness tracking
+            # Staleness = current training step - sampled_step
             if hasattr(workflow, 'set_current_version'):
                 workflow.set_current_version(global_step)
             

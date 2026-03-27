@@ -203,6 +203,7 @@ class GreedySampler(StateSampler):
         # Internal sample counter: increments every time sample_states is called
         # This ensures unique sampling steps for staleness tracking
         self._sample_counter = 0
+        self._last_sampled_step = 0  # Last sampled step (for dataloader to read)
         if resume_step is not None:
             self._load(resume_step)
 
@@ -226,8 +227,11 @@ class GreedySampler(StateSampler):
 
     def sample_states(self, num_states: int) -> list[State]:
         with self._lock:
-            self._sample_counter += 1
+            # Get current counter value as this sample's step, THEN increment
+            # This ensures first sample has sampled_step=0, matching training step 0
             current_sample_step = self._sample_counter
+            self._sample_counter += 1
+            self._last_sampled_step = current_sample_step
         
         if not self._top_states:
             return [create_initial_state(self.env_type, self.initial_exp_type, self.budget_s) 
@@ -293,6 +297,7 @@ class GreedySampler(StateSampler):
             self._current_step = step
             # Restore sample counter to match the step we're resuming from
             self._sample_counter = step
+            self._last_sampled_step = step
             self._load(step)
 
     def get_best_solution(self) -> dict | None:
@@ -382,6 +387,7 @@ class PUCTSampler(StateSampler):
         # Internal sample counter: increments every time sample_states is called
         # This ensures unique sampling steps for staleness tracking
         self._sample_counter = 0
+        self._last_sampled_step = 0  # Last sampled step (for dataloader to read)
         
         # PUCT stats
         self._n: dict[str, int] = {} # Number of times state (or its descendants) has been expanded
@@ -491,7 +497,11 @@ class PUCTSampler(StateSampler):
 
     def sample_states(self, num_states: int) -> list[State]:
         with self._lock:
+            # Get current counter value as this sample's step, THEN increment
+            # This ensures first sample has sampled_step=0, matching training step 0
+            current_sample_step = self._sample_counter
             self._sample_counter += 1
+            self._last_sampled_step = current_sample_step
         
         initial_ids = {s.id for s in self._initial_states}
         candidates = list(self._states)
@@ -681,6 +691,7 @@ class PUCTSampler(StateSampler):
             # Restore sample counter to match the step we're resuming from
             # This ensures staleness tracking continuity
             self._sample_counter = step
+            self._last_sampled_step = step
             self._load(step)
             if not self._states:
                 for _ in range(self.batch_size):

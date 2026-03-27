@@ -750,6 +750,9 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         Staleness measures how many training steps have passed since a parent
         was sampled until its rollouts are used for PUCT update.
         
+        When get_pending_updates() is called, the returned states will be used
+        for PUCT update immediately, so staleness = current_version - sampled_step.
+        
         In sync mode: staleness = 0 (sample and update in same step)
         In async mode: staleness > 0 (delayed update)
         
@@ -757,7 +760,6 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             version: Current training step (global_step)
         """
         self._current_version = version
-        # Also set _current_step for composite key consistency
         self._current_step = version
         logger.debug(f"[WORKFLOW] Set current step to {version}")
     
@@ -1191,6 +1193,14 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                         pid, step = key
                         logger.debug(f"[STALENESS_CLEANUP] Removing complete parent {pid} step={step} from tracker")
                         del self._staleness_tracker[key]
+            
+            # CRITICAL: After returning states for PUCT update, increment _current_step
+            # This ensures that any states completed after this point will have
+            # staleness measured from the NEXT PUCT update cycle
+            old_step = self._current_step
+            self._current_step += 1
+            logger.debug(f"[WORKFLOW] Incremented current step: {old_step} -> {self._current_step} "
+                        f"(after get_pending_updates)")
         
         # Record PUCT update timestamp for convergence delay analysis
         # In strict mode, only record for children from current batch

@@ -69,8 +69,8 @@ class _StateSamplerIterableDataset(IterableDataset):
             
             # Track sampled step for staleness tracking
             # This is the step when the parent was sampled, used for composite key
-            # Use _sample_counter if available (internal sampler counter), fallback to _current_step
-            sampled_step = getattr(self.state_sampler, '_sample_counter', 
+            # Use _last_sampled_step (set by sample_states), fallback to _current_step
+            sampled_step = getattr(self.state_sampler, '_last_sampled_step', 
                                    getattr(self.state_sampler, '_current_step', 0))
             
             for i, state in enumerate(local_states):
