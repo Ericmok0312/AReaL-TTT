@@ -190,16 +190,19 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         
         # Staleness tracking for research analysis
         # Key: (parent_id, sampled_step), Value: {
-        #   'sample_version': int,          # Model version when parent was sampled
+        #   'sampled_step': int,            # Step when parent was sampled (sampler counter)
         #   'children_completed': int,
         #   'total_expected': int,
         #   'parent_timestep': int,
         #   'exec_times_ms': list[float],   # Execution times for each child
         # }
-        # Staleness = current_version - sample_version
+        # Staleness = current_step - sampled_step
+        # Measures how many training steps delayed from sampling to PUCT update
+        # In sync mode: staleness = 0 (immediate update)
+        # In async mode: staleness > 0 (delayed update)
         # NOTE: Uses composite key to handle same parent sampled in multiple steps
         self._staleness_tracker: dict[tuple[str, int], dict] = {}
-        self._current_version: int = 0  # Current model version, set externally
+        self._current_version: int = 0  # Current training step, set externally
         
         # Scheme 1 (Sync-like) batch tracking
         # Enables waiting for all parents in a batch to complete before PUCT update
@@ -455,21 +458,22 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                     logger.debug(f"[PUCT_TRACK] Started new parent episode for {state.id[:8]}... "
                                f"sampled_step={sampled_step}, value={state.value}, expected_children={expected_children}")
                 
-                # FIX: Initialize staleness tracker at parent sampling time (not first child completion)
-                # This ensures staleness = current_version - sample_version correctly measures
-                # how many model versions have passed since parent was selected
+                # FIX: Initialize staleness tracker at parent sampling time
+                # Staleness = current_step - sampled_step
+                # Measures how many training steps delayed from sampling to PUCT update
                 # NOTE: Use composite key (parent_id, sampled_step) to handle same parent in multiple steps
                 staleness_key = (state.id, sampled_step)
                 if staleness_key not in self._staleness_tracker:
                     self._staleness_tracker[staleness_key] = {
-                        'sample_version': self._current_version,  # Version when parent was SELECTED
-                        'children_completed': 0,  # Will be incremented when each child completes
+                        'sampled_step': sampled_step,  # Step when parent was sampled
+                        'sample_version': self._current_version,  # For backward compatibility
+                        'children_completed': 0,
                         'total_expected': expected_children,
                         'parent_timestep': state.timestep,
                         'exec_times_ms': [],
                     }
                     logger.debug(f"[STALENESS_INIT] parent_id={state.id} sampled_step={sampled_step} "
-                               f"sample_version={self._current_version} "
+                               f"current_step={self._current_step} "
                                f"parent_timestep={state.timestep}")
                 
                 # SCHEME 1: Track parent ID for batch completion waiting
@@ -640,13 +644,15 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                         tracker = self._staleness_tracker[staleness_key]
                         tracker['children_completed'] += 1
                         tracker['exec_times_ms'].append(exec_time_ms)
-                        # Staleness = current_version - sample_version (when parent was selected)
-                        staleness = current_version - tracker['sample_version']
+                        # Staleness = current_step - sampled_step
+                        # Measures how many training steps delayed from sampling to PUCT update
+                        current_step = self._current_step
+                        sampled_step_at_init = tracker['sampled_step']
+                        staleness = current_step - sampled_step_at_init
                         
-                        logger.info(f"[STALENESS] parent_id={pid} sampled_step={sampled_step} "
+                        logger.info(f"[STALENESS] parent_id={pid} sampled_step={sampled_step_at_init} "
                                    f"child_num={tracker['children_completed']}/{tracker['total_expected']} "
-                                   f"sample_version={tracker['sample_version']} "
-                                   f"current_version={current_version} "
+                                   f"current_step={current_step} "
                                    f"staleness={staleness} "
                                    f"parent_timestep={tracker['parent_timestep']} "
                                    f"exec_time_ms={exec_time_ms:.2f}")
@@ -683,8 +689,11 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                                         f"completed={tracker['children_completed']}/{tracker['total_expected']}")
                         
                         # Record failed rollout metadata
-                        current_version = self._current_version
-                        staleness = current_version - self._staleness_tracker.get(staleness_key, {}).get('sample_version', current_version)
+                        # Staleness = current_step - sampled_step
+                        current_step = self._current_step
+                        tracker_data = self._staleness_tracker.get(staleness_key, {})
+                        sampled_step_at_init = tracker_data.get('sampled_step', current_step)
+                        staleness = current_step - sampled_step_at_init
                         self._rollout_metadata.append({
                             'parent_id': state.id,
                             'parent_timestep': state.timestep,
@@ -736,16 +745,21 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         self._rollout_metadata.clear()
 
     def set_current_version(self, version: int):
-        """Set the current model version for staleness calculation.
+        """Set the current training step for staleness calculation.
         
-        Should be called at the beginning of each training step with the
-        current actor version, so staleness = current_version - sample_version.
+        Staleness measures how many training steps have passed since a parent
+        was sampled until its rollouts are used for PUCT update.
+        
+        In sync mode: staleness = 0 (sample and update in same step)
+        In async mode: staleness > 0 (delayed update)
+        
+        Args:
+            version: Current training step (global_step)
         """
         self._current_version = version
         # Also set _current_step for composite key consistency
-        # This ensures staleness tracker and parent episodes use correct step
         self._current_step = version
-        logger.debug(f"[WORKFLOW] Set current version to {version}, step to {version}")
+        logger.debug(f"[WORKFLOW] Set current step to {version}")
     
     # =========================================================================
     # Scheme 1 (Sync-like) Methods
@@ -1124,16 +1138,17 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         
         # Calculate staleness statistics for research analysis
         if self._staleness_tracker and all_children:
-            current_version = self._current_version
+            current_step = self._current_step
             staleness_list = []
             incomplete_parents = 0
             
             # Track parents that have all children completed (for cleanup later)
             parents_to_cleanup = set()
             
-            for (pid, step), tracker in self._staleness_tracker.items():
-                # Staleness = current_version - sample_version
-                staleness = current_version - tracker['sample_version']
+            for (pid, sampled_step), tracker in self._staleness_tracker.items():
+                # Staleness = current_step - sampled_step
+                # Measures how many training steps delayed from sampling to PUCT update
+                staleness = current_step - tracker['sampled_step']
                 staleness_list.append(staleness)
                 
                 # Check if this parent has all expected children
@@ -1143,21 +1158,20 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 if not is_complete:
                     incomplete_parents += 1
                     # Log incomplete parent for tracking (regex-friendly)
-                    logger.info(f"[STALENESS_INCOMPLETE] parent_id={pid} step={step} "
+                    logger.info(f"[STALENESS_INCOMPLETE] parent_id={pid} sampled_step={sampled_step} "
                                f"completed={tracker['children_completed']}/{total_expected} "
-                               f"sample_version={tracker['sample_version']} "
-                               f"current_version={current_version} "
+                               f"current_step={current_step} "
                                f"staleness={staleness}")
                 else:
-                    parents_to_cleanup.add((pid, step))
+                    parents_to_cleanup.add((pid, sampled_step))
             
             if staleness_list:
                 avg_staleness = sum(staleness_list) / len(staleness_list)
                 max_staleness = max(staleness_list)
-                # Regex-friendly format for post-processing (version-based staleness)
+                # Regex-friendly format for post-processing
                 logger.info(f"[STALENESS_BATCH] n_parents={len(staleness_list)} "
                            f"avg_staleness={avg_staleness:.2f} max_staleness={max_staleness} "
-                           f"current_version={current_version} "
+                           f"current_step={current_step} "
                            f"incomplete={incomplete_parents} "
                            f"complete={len(parents_to_cleanup)} "
                            f"total_children={len(all_children)}")
