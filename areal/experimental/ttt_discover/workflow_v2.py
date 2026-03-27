@@ -610,12 +610,25 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                         # Use composite key (parent_id, sampled_step) to handle same parent in multiple steps
                         staleness_key = (pid, sampled_step)
                         
+                        # DEBUG: Log all available keys in staleness_tracker
+                        available_keys = list(self._staleness_tracker.keys())[:5]  # Limit to first 5
+                        logger.debug(f"[STALENESS_DEBUG] Looking for key=({pid[:8]}..., {sampled_step}), "
+                                    f"available={[(p[:8], s) for p, s in available_keys]}, "
+                                    f"tracker_size={len(self._staleness_tracker)}")
+                        
                         # Parent should already be in tracker (initialized in arun_episode)
                         # But handle fallback case for safety
                         if staleness_key not in self._staleness_tracker:
                             # Fallback: initialize with current version (staleness will be 0)
-                            logger.warning(f"[STALENESS_FALLBACK] parent_id={pid} sampled_step={sampled_step} not initialized, "
-                                         f"using current_version={current_version} as sample_version")
+                            # DEBUG: Check if parent exists with different sampled_step
+                            parent_keys = [(p, s) for p, s in self._staleness_tracker.keys() if p == pid]
+                            if parent_keys:
+                                logger.warning(f"[STALENESS_FALLBACK] parent_id={pid} sampled_step={sampled_step} not initialized, "
+                                             f"but found with different steps: {parent_keys}. "
+                                             f"This may indicate cross-step contamination.")
+                            else:
+                                logger.warning(f"[STALENESS_FALLBACK] parent_id={pid} sampled_step={sampled_step} not initialized, "
+                                             f"using current_version={current_version} as sample_version")
                             self._staleness_tracker[staleness_key] = {
                                 'sample_version': current_version,
                                 'children_completed': 0,
@@ -1398,11 +1411,18 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             
         Returns:
             Dictionary with:
-            - 'parent_episodes': Detailed episode data for each parent
+            - 'parent_episodes': Detailed episode data for each parent (JSON-safe keys)
             - 'puct_updates': All PUCT update events
         """
+        # Convert tuple keys to JSON-safe string keys for serialization
+        # Original key format: (parent_id, sampled_step) -> "parent_id:step:sampled_step"
+        parent_episodes_json_safe = {}
+        for (parent_id, sampled_step), episode in self._parent_episodes.items():
+            key = f"{parent_id}:step:{sampled_step}"
+            parent_episodes_json_safe[key] = episode
+        
         data = {
-            'parent_episodes': self._parent_episodes.copy(),
+            'parent_episodes': parent_episodes_json_safe,
             'puct_updates': self._puct_update_log.copy(),
         }
         
