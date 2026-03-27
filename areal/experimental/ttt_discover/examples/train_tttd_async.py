@@ -833,22 +833,9 @@ class TTTDPPOTrainer(PPOTrainer):
                 'step_mean_reward': step_mean_reward,
             }
             
-            # Add staleness metrics if available from workflow (version-based staleness)
-            if hasattr(workflow, '_staleness_tracker') and workflow._staleness_tracker:
-                current_version = global_step
-                staleness_values = []
-                for pid, tracker in workflow._staleness_tracker.items():
-                    staleness = current_version - tracker['sample_version']
-                    staleness_values.append(staleness)
-                
-                if staleness_values:
-                    step_metrics['staleness'] = {
-                        'avg': sum(staleness_values) / len(staleness_values),
-                        'max': max(staleness_values),
-                        'min': min(staleness_values),
-                        'n_parents': len(staleness_values),
-                        'current_version': current_version,
-                    }
+            # NOTE: Staleness metrics are now collected from rollout_metadata in async_metrics
+            # The _staleness_tracker is cleared by get_pending_updates(), so we can't use it here
+            # Staleness data will be in step_metrics['async']['staleness'] after distributed sync
             
             # Add execution time stats for research analysis
             if hasattr(workflow, 'get_exec_time_stats'):
