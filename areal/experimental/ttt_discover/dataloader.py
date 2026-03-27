@@ -67,6 +67,10 @@ class _StateSamplerIterableDataset(IterableDataset):
                 # _last_puct_stats: list of (n, Q, P, bonus, score) for sampled states
                 puct_stats = self.state_sampler._last_puct_stats
             
+            # Track sampled step for staleness tracking
+            # This is the step when the parent was sampled, used for composite key
+            sampled_step = getattr(self.state_sampler, '_current_step', 0)
+            
             for i, state in enumerate(local_states):
                 sample = {
                     "prompt": self.state_to_prompt_fn(state),
@@ -76,6 +80,7 @@ class _StateSamplerIterableDataset(IterableDataset):
                     "parent_values": state.parent_values,
                     "parents": state.parents,
                     "_state_obj": state,
+                    "_sampled_step": sampled_step,  # Record when this parent was sampled
                 }
                 
                 # Record PUCT selection stats if available

@@ -467,6 +467,18 @@ class TTTDPPOTrainer(PPOTrainer):
             if hasattr(workflow, 'set_current_version'):
                 workflow.set_current_version(global_step)
             
+            # Scheme 1: Enable batch tracking for sync-like PUCT update
+            # Scheme 1 = wait for complete batch before PUCT update (slower, more accurate)
+            # Scheme 2 = use available data immediately (faster, default)
+            use_scheme_1 = getattr(config, 'use_scheme_1', False)
+            if use_scheme_1 and hasattr(workflow, 'set_current_batch_tracking'):
+                workflow.set_current_batch_tracking(
+                    step=global_step,
+                    batch_size=batch_size,
+                    n_samples=group_size
+                )
+                logger.info(f"[SCHEME1][Step {global_step}] Enabled batch tracking")
+            
             # === Rollout with async prepare_batch ===
             rollout_start = time.perf_counter()
             with stats_tracker.record_timing("rollout"):
@@ -481,17 +493,33 @@ class TTTDPPOTrainer(PPOTrainer):
             rollout_time = time.perf_counter() - rollout_start
             
             # Get execute tail latency from workflow if available
-            # Tail latency = time from last GPU done to last execute done
             execute_tail = 0.0
             timing_stats = {}
             if hasattr(workflow, 'get_execute_tail_latency'):
                 execute_tail = workflow.get_execute_tail_latency(clear=True)
                 if hasattr(workflow, 'get_timing_stats'):
-                    timing_stats = workflow.get_timing_stats(clear=False)  # Don't clear, already cleared above
+                    timing_stats = workflow.get_timing_stats(clear=False)
+            
+            # Scheme 1: Wait for batch completion before getting updates
+            scheme_1_wait_time = 0.0
+            if use_scheme_1 and hasattr(workflow, 'wait_for_batch_completion'):
+                logger.info(f"[SCHEME1][Step {global_step}] Waiting for batch completion...")
+                scheme_1_wait_time = workflow.wait_for_batch_completion(batch_step=global_step)
+                logger.info(f"[SCHEME1][Step {global_step}] Waited {scheme_1_wait_time:.2f}s")
             
             # === Sampler Synchronization (part of training phase) ===
-            # Pass current_step for strict PUCT update mode to prevent cross-batch contamination
-            puct_update_result = workflow.get_pending_updates(clear=True, current_step=global_step)
+            # Scheme 1: Use parent_ids filter to get complete batch
+            if use_scheme_1 and hasattr(workflow, 'get_current_batch_parent_ids'):
+                batch_parent_ids = workflow.get_current_batch_parent_ids()
+                puct_update_result = workflow.get_pending_updates(
+                    clear=True,
+                    current_step=global_step,
+                    parent_ids=batch_parent_ids
+                )
+                workflow.clear_current_batch_tracking()
+            else:
+                # Scheme 2: Use all available data (default)
+                puct_update_result = workflow.get_pending_updates(clear=True, current_step=global_step)
             
             # Handle both old (4-tuple) and new (5-tuple) return formats
             if len(puct_update_result) == 5:
@@ -537,6 +565,10 @@ class TTTDPPOTrainer(PPOTrainer):
                 'actual_total': actual_total,
                 'async_overhead': async_overhead,
             }
+            
+            # Add Scheme 1 wait time if applicable
+            if use_scheme_1 and scheme_1_wait_time > 0:
+                async_metrics['scheme_1_wait_time_s'] = scheme_1_wait_time
             
             # Add staleness statistics if available
             if rollout_metadata:

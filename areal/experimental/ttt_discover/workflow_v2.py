@@ -200,6 +200,13 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         self._staleness_tracker: dict[tuple[str, int], dict] = {}
         self._current_version: int = 0  # Current model version, set externally
         
+        # Scheme 1 (Sync-like) batch tracking
+        # Enables waiting for all parents in a batch to complete before PUCT update
+        self._current_batch_step: int = 0
+        self._current_batch_parent_ids: set[str] = set()
+        self._expected_batch_size: int = 0
+        self._expected_n_samples: int = 0
+        
         # PUCT behavior tracking for three core metrics:
         # 1. Q-value estimation error
         # 2. Selection switching due to information delay
@@ -418,37 +425,40 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 fail_type="missing_state",
             )
         
+        # Get the step when this parent was sampled (from dataloader)
+        # This is CRITICAL for staleness tracking with composite key
+        sampled_step = data.get('_sampled_step', self._current_version if hasattr(self, '_current_version') else 0)
+        
         # Track new parent episode for PUCT analysis
         # This is called when parent is sampled and rollout begins
         # NOTE: Use lock to prevent race condition when multiple children
         # of the same parent are processed concurrently
         try:
-            current_step = self._current_step if hasattr(self, '_current_step') else 0
             expected_children = self.gconfig.n_samples if hasattr(self.gconfig, 'n_samples') else None
             
             async with self._pending_lock:
                 # Initialize parent episode tracking (for PUCT analysis)
                 # Use composite key (parent_id, sampled_step) to handle same parent in multiple steps
-                episode_key = (state.id, current_step)
+                episode_key = (state.id, sampled_step)
                 if episode_key not in self._parent_episodes:
                     # Extract PUCT selection info if available (from dataloader)
                     selection_info = data.get('_puct_selection')
                     
                     self.start_parent_episode(
                         parent_id=state.id,
-                        sampled_step=current_step,
+                        sampled_step=sampled_step,
                         parent_value=state.value if hasattr(state, 'value') else None,
                         expected_children=expected_children,
                         selection_info=selection_info,
                     )
                     logger.debug(f"[PUCT_TRACK] Started new parent episode for {state.id[:8]}... "
-                               f"step={current_step}, value={state.value}, expected_children={expected_children}")
+                               f"sampled_step={sampled_step}, value={state.value}, expected_children={expected_children}")
                 
                 # FIX: Initialize staleness tracker at parent sampling time (not first child completion)
                 # This ensures staleness = current_version - sample_version correctly measures
                 # how many model versions have passed since parent was selected
-                # NOTE: Use composite key (parent_id, step) to handle same parent in multiple steps
-                staleness_key = (state.id, current_step)
+                # NOTE: Use composite key (parent_id, sampled_step) to handle same parent in multiple steps
+                staleness_key = (state.id, sampled_step)
                 if staleness_key not in self._staleness_tracker:
                     self._staleness_tracker[staleness_key] = {
                         'sample_version': self._current_version,  # Version when parent was SELECTED
@@ -457,9 +467,16 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                         'parent_timestep': state.timestep,
                         'exec_times_ms': [],
                     }
-                    logger.debug(f"[STALENESS_INIT] parent_id={state.id} step={current_step} "
+                    logger.debug(f"[STALENESS_INIT] parent_id={state.id} sampled_step={sampled_step} "
                                f"sample_version={self._current_version} "
                                f"parent_timestep={state.timestep}")
+                
+                # SCHEME 1: Track parent ID for batch completion waiting
+                if hasattr(self, '_current_batch_parent_ids') and sampled_step == self._current_batch_step:
+                    self._current_batch_parent_ids.add(state.id)
+                    logger.debug(f"[SCHEME1_BATCH][Step {sampled_step}] REGISTER | "
+                                f"parent={state.id[:8]}... "
+                                f"total={len(self._current_batch_parent_ids)}")
         except Exception as e:
             logger.warning(f"[PUCT_TRACK] Failed to start parent episode: {e}")
         
@@ -569,6 +586,8 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                     )
                     # Store execution time for this child state
                     child.exec_time_ms = exec_time_ms
+                    # Store sampled_step for Scheme 1 batch tracking
+                    child.sampled_step = sampled_step
                     
                     async with self._pending_lock:
                         self._pending_children.append(child)
@@ -587,14 +606,14 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                         except Exception:
                             current_version = -1  # Fallback if engine doesn't support versioning
                         
-                        # Use composite key (parent_id, step) to handle same parent in multiple steps
-                        staleness_key = (pid, current_step)
+                        # Use composite key (parent_id, sampled_step) to handle same parent in multiple steps
+                        staleness_key = (pid, sampled_step)
                         
                         # Parent should already be in tracker (initialized in arun_episode)
                         # But handle fallback case for safety
                         if staleness_key not in self._staleness_tracker:
                             # Fallback: initialize with current version (staleness will be 0)
-                            logger.warning(f"[STALENESS_FALLBACK] parent_id={pid} step={current_step} not initialized, "
+                            logger.warning(f"[STALENESS_FALLBACK] parent_id={pid} sampled_step={sampled_step} not initialized, "
                                          f"using current_version={current_version} as sample_version")
                             self._staleness_tracker[staleness_key] = {
                                 'sample_version': current_version,
@@ -610,7 +629,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                         # Staleness = current_version - sample_version (when parent was selected)
                         staleness = current_version - tracker['sample_version']
                         
-                        logger.info(f"[STALENESS] parent_id={pid} step={current_step} "
+                        logger.info(f"[STALENESS] parent_id={pid} sampled_step={sampled_step} "
                                    f"child_num={tracker['children_completed']}/{tracker['total_expected']} "
                                    f"sample_version={tracker['sample_version']} "
                                    f"current_version={current_version} "
@@ -638,10 +657,19 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 try:
                     async with self._pending_lock:
                         self._failed_parents.append(state)
+                        
+                        # FIX: Increment staleness tracker for failed rollouts too
+                        # This ensures wait_for_batch_completion doesn't wait forever
+                        staleness_key = (state.id, sampled_step)
+                        if staleness_key in self._staleness_tracker:
+                            tracker = self._staleness_tracker[staleness_key]
+                            tracker['children_completed'] += 1
+                            tracker['exec_times_ms'].append(exec_time_ms)
+                            logger.debug(f"[STALENESS_FAIL] parent_id={state.id} sampled_step={sampled_step} "
+                                        f"completed={tracker['children_completed']}/{tracker['total_expected']}")
+                        
                         # Record failed rollout metadata
                         current_version = self._current_version
-                        # Use composite key (parent_id, step) for staleness lookup
-                        staleness_key = (state.id, current_step)
                         staleness = current_version - self._staleness_tracker.get(staleness_key, {}).get('sample_version', current_version)
                         self._rollout_metadata.append({
                             'parent_id': state.id,
@@ -700,9 +728,149 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         current actor version, so staleness = current_version - sample_version.
         """
         self._current_version = version
-        logger.debug(f"[WORKFLOW] Set current version to {version}")
+        # Also set _current_step for composite key consistency
+        # This ensures staleness tracker and parent episodes use correct step
+        self._current_step = version
+        logger.debug(f"[WORKFLOW] Set current version to {version}, step to {version}")
     
-    def get_pending_updates(self, clear: bool = True, current_step: int | None = None) -> tuple:
+    # =========================================================================
+    # Scheme 1 (Sync-like) Methods
+    # =========================================================================
+    
+    def set_current_batch_tracking(self, step: int, batch_size: int, n_samples: int):
+        """Start tracking a new batch for Scheme 1 (sync-like) mode.
+        
+        This enables waiting for all parents in a batch to complete before
+        updating PUCTSampler, ensuring complete batch updates like sync mode.
+        
+        Args:
+            step: Current training step
+            batch_size: Number of parents in this batch
+            n_samples: Expected number of children per parent
+        """
+        # Check if previous batch was cleared properly
+        if hasattr(self, '_current_batch_parent_ids') and len(self._current_batch_parent_ids) > 0:
+            logger.warning(f"[SCHEME1_BATCH][Step {step}] PREVIOUS_BATCH_NOT_CLEARED | "
+                          f"previous_step={self._current_batch_step} "
+                          f"remaining_parents={len(self._current_batch_parent_ids)}")
+        
+        self._current_batch_step = step
+        self._current_step = step  # Also set _current_step for staleness tracking
+        self._current_batch_parent_ids = set()
+        self._expected_batch_size = batch_size
+        self._expected_n_samples = n_samples
+        logger.info(f"[SCHEME1_BATCH][Step {step}] START | "
+                   f"expected_parents={batch_size} "
+                   f"expected_children_per_parent={n_samples}")
+    
+    def get_current_batch_parent_ids(self) -> set[str]:
+        """Get the set of parent IDs recorded for current batch."""
+        return self._current_batch_parent_ids.copy()
+    
+    def wait_for_batch_completion(
+        self, 
+        batch_step: int,
+        poll_interval: float = 0.1
+    ) -> float:
+        """Wait for all parents in the specified batch to complete.
+        
+        This blocks until all children for all parents in the batch have been
+        generated, ensuring complete batch updates for PUCTSampler.
+        
+        Args:
+            batch_step: The step number of the batch to wait for
+            poll_interval: Polling interval in seconds
+            
+        Returns:
+            float: Time waited in seconds
+        """
+        import time
+        start_time = time.time()
+        
+        parent_ids = self._current_batch_parent_ids
+        expected_per_parent = self._expected_n_samples
+        total_expected_children = len(parent_ids) * expected_per_parent
+        
+        logger.info(f"[SCHEME1_WAIT][Step {batch_step}] START | "
+                   f"parents={len(parent_ids)} "
+                   f"expected_children={total_expected_children} "
+                   f"mode=BLOCKING")
+        
+        last_completed = 0
+        last_log_time = start_time
+        
+        while True:
+            # Check completion status for all parents in this batch
+            all_complete = True
+            n_completed = 0
+            incomplete_parents = []
+            
+            for pid in parent_ids:
+                key = (pid, batch_step)
+                tracker = self._staleness_tracker.get(key)
+                
+                if tracker:
+                    completed = tracker.get('children_completed', 0)
+                    expected = tracker.get('total_expected', expected_per_parent)
+                    n_completed += completed
+                    
+                    if completed < expected:
+                        all_complete = False
+                        incomplete_parents.append((pid, completed, expected))
+                else:
+                    # Parent not yet tracked (rollout hasn't started)
+                    all_complete = False
+                    incomplete_parents.append((pid, 0, expected_per_parent))
+            
+            total_expected = len(parent_ids) * expected_per_parent
+            
+            # Log progress every 5 seconds
+            current_time = time.time()
+            if current_time - last_log_time >= 5.0:
+                elapsed = current_time - start_time
+                # Detailed breakdown of incomplete parents
+                not_started = sum(1 for _, c, _ in incomplete_parents if c == 0)
+                partial = sum(1 for _, c, e in incomplete_parents if 0 < c < e)
+                
+                logger.info(f"[SCHEME1_WAIT][Step {batch_step}] PROGRESS | "
+                           f"elapsed={elapsed:.1f}s "
+                           f"completed={n_completed}/{total_expected} "
+                           f"incomplete={len(incomplete_parents)} "
+                           f"(not_started={not_started}, partial={partial})")
+                
+                # Log first few incomplete parents for debugging
+                if incomplete_parents:
+                    sample = incomplete_parents[:3]
+                    logger.debug(f"[SCHEME1_WAIT][Step {batch_step}] INCOMPLETE_SAMPLE | "
+                                f"{[(pid[:8], c, e) for pid, c, e in sample]}")
+                
+                last_log_time = current_time
+            
+            if all_complete:
+                elapsed = time.time() - start_time
+                logger.info(f"[SCHEME1_WAIT][Step {batch_step}] SUCCESS | "
+                           f"duration={elapsed:.2f}s "
+                           f"total_completed={n_completed}")
+                return elapsed
+            
+            time.sleep(poll_interval)
+    
+    def clear_current_batch_tracking(self):
+        """Clear the current batch tracking state."""
+        self._current_batch_parent_ids.clear()
+        self._expected_batch_size = 0
+        self._expected_n_samples = 0
+    
+    # =========================================================================
+    # End Scheme 1 Methods
+    # =========================================================================
+    
+    def get_pending_updates(
+        self, 
+        clear: bool = True, 
+        current_step: int | None = None,
+        parent_ids: set[str] | None = None
+    ) -> tuple:
         """Return the buffered pending updates (children, parents, failed_parents, rollout_metadata) for this batch.
         
         Args:
@@ -781,6 +949,164 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                     logger.debug(f"[STREAMING_PUCT] Step {current_step}: "
                                 f"Updating PUCT with {cross_batch_info['n_delayed']} "
                                 f"cross-batch children (Streaming mode)")
+        
+        # SCHEME 1: Filter by parent_ids if specified
+        # This is used to get only the updates for a specific batch of parents
+        if parent_ids is not None:
+            logger.info(f"[SCHEME1_FILTER][Step {current_step}] BEFORE | "
+                       f"total_children={len(filtered_children)} "
+                       f"total_parents={len(filtered_parents)} "
+                       f"total_failed={len(all_failed)} "
+                       f"total_metadata={len(filtered_metadata)}")
+            
+            # Validate parent_ids (only warn if explicitly passed but empty)
+            if len(parent_ids) == 0:
+                logger.warning("[SCHEME1_FILTER] Empty parent_ids filter! No parents will be returned.")
+            
+            # Filter children and parents (maintaining 1:1 correspondence)
+            scheme1_children = []
+            scheme1_parents = []
+            
+            for child, parent in zip(filtered_children, filtered_parents):
+                if parent.id in parent_ids:
+                    scheme1_children.append(child)
+                    scheme1_parents.append(parent)
+            
+            # Filter failed_parents (these are parent objects that failed)
+            scheme1_failed = [p for p in all_failed if p.id in parent_ids]
+            
+            # Filter metadata by parent_id field
+            scheme1_metadata = [
+                m for m in filtered_metadata 
+                if m.get('parent_id') in parent_ids
+            ]
+            
+            # Validation: Check counts and consistency
+            n_parents_unique = len(set(p.id for p in scheme1_parents))
+            n_children = len(scheme1_children)
+            n_parents_total = len(scheme1_parents)
+            expected_children = len(parent_ids) * self._expected_n_samples if self._expected_n_samples else n_children
+            
+            # [CHECK 1] Data integrity: children and parents must have 1:1 correspondence
+            # Note: This checks internal data consistency, not completion status
+            if n_children != n_parents_total:
+                logger.error(
+                    f"[SCHEME1_CHECK][Step {current_step}] DATA_CORRUPTION | "
+                    f"children={n_children} parents={n_parents_total} "
+                    f"expected_1-to-1_correspondence - THIS SHOULD NOT HAPPEN!"
+                )
+            
+            # [CHECK 2] All filtered parents should be in the filter set
+            orphan_parents = [p for p in scheme1_parents if p.id not in parent_ids]
+            if orphan_parents:
+                logger.error(
+                    f"[SCHEME1_CHECK][Step {current_step}] ORPHAN_PARENTS | "
+                    f"count={len(orphan_parents)} "
+                    f"ids={[p.id[:8] for p in orphan_parents[:3]]}..."
+                )
+            
+            # [CHECK 3] Batch completion status (including failed trajectories)
+            total_completed = n_children + len(scheme1_failed)  # Total finished (success + failed)
+            if total_completed < expected_children:
+                logger.warning(
+                    f"[SCHEME1_CHECK][Step {current_step}] INCOMPLETE_BATCH | "
+                    f"success={n_children} failed={len(scheme1_failed)} "
+                    f"total_completed={total_completed} expected={expected_children} "
+                    f"missing={expected_children - total_completed}"
+                )
+            elif n_children < expected_children:
+                # Some failed, but batch is complete
+                logger.info(
+                    f"[SCHEME1_CHECK][Step {current_step}] PARTIAL_FAILURE | "
+                    f"success={n_children} failed={len(scheme1_failed)} "
+                    f"total={total_completed} expected={expected_children} "
+                    f"failure_rate={len(scheme1_failed)/expected_children:.1%}"
+                )
+            elif n_children > expected_children:
+                logger.warning(
+                    f"[SCHEME1_CHECK][Step {current_step}] EXCESS_CHILDREN | "
+                    f"success={n_children} failed={len(scheme1_failed)} "
+                    f"expected={expected_children} excess={n_children - expected_children}"
+                )
+            
+            # [CHECK 4] Verify metadata count matches children + failed
+            expected_metadata = n_children + len(scheme1_failed)
+            actual_metadata = len(scheme1_metadata)
+            if actual_metadata != expected_metadata:
+                logger.warning(
+                    f"[SCHEME1_CHECK][Step {current_step}] METADATA_MISMATCH | "
+                    f"metadata={actual_metadata} expected={expected_metadata} "
+                    f"(children={n_children} + failed={len(scheme1_failed)})"
+                )
+            
+            # [CHECK 5] Verify staleness_tracker state for each parent in batch
+            # This detects parents that were supposed to be sampled but have no tracker entry
+            missing_trackers = []
+            incomplete_trackers = []
+            for pid in parent_ids:
+                key = (pid, current_step)
+                tracker = self._staleness_tracker.get(key)
+                if not tracker:
+                    missing_trackers.append(pid)
+                else:
+                    completed = tracker.get('children_completed', 0)
+                    expected = tracker.get('total_expected', self._expected_n_samples or 1)
+                    if completed < expected:
+                        incomplete_trackers.append((pid, completed, expected))
+            
+            if missing_trackers:
+                logger.error(
+                    f"[SCHEME1_CHECK][Step {current_step}] MISSING_TRACKERS | "
+                    f"count={len(missing_trackers)} "
+                    f"ids={[p[:8] for p in missing_trackers[:3]]}... "
+                    f"These parents were in batch but have no staleness record!"
+                )
+            
+            if incomplete_trackers:
+                logger.warning(
+                    f"[SCHEME1_CHECK][Step {current_step}] INCOMPLETE_TRACKERS | "
+                    f"count={len(incomplete_trackers)} "
+                    f"details={[(p[:8], c, e) for p, c, e in incomplete_trackers[:3]]}..."
+                )
+            
+            # [CHECK 6] Cross-validate: actual children count vs staleness_tracker
+            # Count children per parent from actual returned data
+            children_per_parent: dict[str, int] = {}
+            for parent in scheme1_parents:
+                pid = parent.id
+                children_per_parent[pid] = children_per_parent.get(pid, 0) + 1
+            
+            # Compare with tracker
+            tracker_mismatches = []
+            for pid in parent_ids:
+                key = (pid, current_step)
+                tracker = self._staleness_tracker.get(key)
+                if tracker:
+                    actual_count = children_per_parent.get(pid, 0)
+                    tracker_count = tracker.get('children_completed', 0)
+                    if actual_count != tracker_count:
+                        tracker_mismatches.append((pid, actual_count, tracker_count))
+            
+            if tracker_mismatches:
+                logger.error(
+                    f"[SCHEME1_CHECK][Step {current_step}] TRACKER_MISMATCH | "
+                    f"count={len(tracker_mismatches)} "
+                    f"details={[(p[:8], a, t) for p, a, t in tracker_mismatches[:3]]}... "
+                    f"(format: parent_id, actual_children, tracker_children)"
+                )
+            
+            # Replace filtered results with Scheme 1 filtered results
+            filtered_children = scheme1_children
+            filtered_parents = scheme1_parents
+            all_failed = scheme1_failed  # Replace for return
+            filtered_metadata = scheme1_metadata
+            
+            logger.info(f"[SCHEME1_FILTER][Step {current_step}] AFTER | "
+                       f"children={len(filtered_children)} "
+                       f"parents(unique)={n_parents_unique} "
+                       f"parents(total)={n_parents_total} "
+                       f"failed={len(all_failed)} "
+                       f"metadata={len(filtered_metadata)}")
         
         # Calculate staleness statistics for research analysis
         if self._staleness_tracker and all_children:
