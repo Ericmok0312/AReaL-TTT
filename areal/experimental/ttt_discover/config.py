@@ -313,6 +313,14 @@ class TTTDPPOActorConfig(PPOActorConfig):
         metadata={"help": "Enable dynamic batch sizing for async training (skip slow rollouts)"}
     )
     
+    # Scheme 1 (sync-like) mode for async training
+    use_scheme_1: bool = field(
+        default=False,
+        metadata={"help": "Enable Scheme 1 (sync-like) mode: wait for complete batch before PUCT update. "
+                         "This ensures complete batch updates like sync mode but allows async rollout. "
+                         "Default is False (Scheme 2: streaming/async mode)"}
+    )
+    
     def __post_init__(self):
         """Validate configuration consistency and convert nested dicts to objects"""
         # Convert actor from dict to PPOActorConfig if needed
