@@ -490,13 +490,16 @@ class TTTDPPOTrainer(PPOTrainer):
         
         is_dp_head = self.actor.rank == 0  # Global rank 0 is the unique head for logging/saving
         
+        # Each rank saves its own data independently - no distributed aggregation
+        # This avoids all_gather_object timeout issues with large metadata
+        rank_suffix = f"_rank{self.actor.dp_rank}" if self.actor.data_parallel_world_size > 1 else ""
         self.history_logger = TTTTrainingLogger(
             save_steps=future_save_steps,
             output_dir=config.saver.fileroot,
-            is_dp_head=is_dp_head,
-            filename='training_history.pkl',
-            checkpoint_filename='training_history_checkpoint.pkl',
-            aggregate_distributed=True,
+            is_dp_head=True,  # Every rank is its own "head" for saving
+            filename=f'training_history{rank_suffix}.pkl',
+            checkpoint_filename=f'training_history_checkpoint{rank_suffix}.pkl',
+            aggregate_distributed=False,  # No aggregation - each rank keeps its own data
         )
         
         if is_dp_head:
@@ -1008,80 +1011,16 @@ class TTTDPPOTrainer(PPOTrainer):
                 except Exception as e:
                     logger.warning(f"[PUCT_TRACK] Failed to get analysis data: {e}")
             
-            # ============================================================
-            # Distributed Data Aggregation
-            # Synchronize rollout_metadata and puct_analysis across ranks
-            # NOTE: best_solution is already consistent across ranks after sync_sampler()
-            # ============================================================
-            if dist.is_initialized() and self.actor.data_parallel_world_size > 1:
-                world_size = self.actor.data_parallel_world_size
-                
-                # 1. Sync rollout_metadata (all_gather_object)
-                if rollout_metadata:
-                    all_metadata = [[] for _ in range(world_size)]
-                    dist.all_gather_object(all_metadata, rollout_metadata)
-                    # Flatten list of lists
-                    global_rollout_metadata = []
-                    for rank_metadata in all_metadata:
-                        global_rollout_metadata.extend(rank_metadata)
-                else:
-                    global_rollout_metadata = []
-                
-                # 2. Sync puct_analysis (merge across ranks)
-                if puct_analysis_data:
-                    all_puct_data = [None] * world_size
-                    dist.all_gather_object(all_puct_data, puct_analysis_data)
-                    # Merge: combine parent_episodes and puct_updates from all ranks
-                    global_puct_data = {
-                        'parent_episodes': {},
-                        'puct_updates': [],
-                    }
-                    for rank_data in all_puct_data:
-                        if rank_data:
-                            global_puct_data['parent_episodes'].update(
-                                rank_data.get('parent_episodes', {})
-                            )
-                            global_puct_data['puct_updates'].extend(
-                                rank_data.get('puct_updates', [])
-                            )
-                else:
-                    global_puct_data = None
-                
-                # 3. Update step_metrics async stats based on global rollout_metadata
-                if global_rollout_metadata:
-                    global_staleness = [m['staleness'] for m in global_rollout_metadata]
-                    global_exec_times = [m.get('child_exec_time_ms', 0) 
-                                        for m in global_rollout_metadata 
-                                        if m.get('child_exec_time_ms', 0) > 0]
-                    
-                    step_metrics['async']['staleness'] = {
-                        'n': len(global_staleness),
-                        'avg': sum(global_staleness) / len(global_staleness) if global_staleness else 0,
-                        'min': min(global_staleness) if global_staleness else 0,
-                        'max': max(global_staleness) if global_staleness else 0,
-                    }
-                    if global_exec_times:
-                        step_metrics['async']['exec_time_ms'] = {
-                            'n': len(global_exec_times),
-                            'avg': sum(global_exec_times) / len(global_exec_times),
-                        }
-                    # Update total rollouts count
-                    step_metrics['async']['actual_total'] = len(global_rollout_metadata)
-                
-            else:
-                # Single rank: use local data directly
-                global_rollout_metadata = rollout_metadata if rollout_metadata else []
-                global_puct_data = puct_analysis_data
-            
-            # Record to history logger with synchronized global data
-            # NOTE: best_solution is consistent across ranks (synced via sync_sampler)
+            # Each rank records its own local data independently
+            # No distributed aggregation to avoid all_gather_object timeout with large metadata
+            # For cross-rank analysis, load and merge per-rank files post-training
             self.history_logger.record_step(
                 step=global_step,
                 rewards=local_step_rewards,
-                best_solution=current_best_solution,  # Already consistent after sync_sampler
+                best_solution=current_best_solution,
                 additional_metrics=step_metrics,
-                rollout_metadata=global_rollout_metadata if global_rollout_metadata else None,
-                puct_analysis_data=global_puct_data,
+                rollout_metadata=rollout_metadata if rollout_metadata else None,
+                puct_analysis_data=puct_analysis_data,
             )
             
             if is_dp_head:
@@ -1113,25 +1052,32 @@ class TTTDPPOTrainer(PPOTrainer):
         logger.info(f"[DEBUG] Loop ended after {loop_count} iterations. global_step={global_step if 'global_step' in locals() else 'N/A'}")
         
         # === Save Final Training History ===
-        if is_dp_head:
-            history_path = self.history_logger.save(also_save_json=True)
-            if history_path:
-                logger.info(f"[TTTLogger] Final training history saved to {history_path}")
-                
-                summary = self.history_logger.get_summary()
-                logger.info(
-                    f"[TTTLogger] Training Summary:\n"
-                    f"  - Recorded snapshots: {summary['num_snapshots']}\n"
-                    f"  - Recorded steps: {summary['recorded_steps']}\n"
-                    f"  - Overall best reward: {summary['overall_best_reward']:.4f} (step {summary['overall_best_step']})\n"
-                    f"  - Has Best-of-N baseline: {summary['has_best_of_n']}"
-                )
-                
+        # Each rank saves its own data (files are suffixed with rank id)
+        history_path = self.history_logger.save(also_save_json=True)
+        if history_path:
+            logger.info(f"[TTTLogger][Rank {self.actor.dp_rank}] Final training history saved to {history_path}")
+            
+            summary = self.history_logger.get_summary()
+            logger.info(
+                f"[TTTLogger][Rank {self.actor.dp_rank}] Training Summary:\n"
+                f"  - Recorded snapshots: {summary['num_snapshots']}\n"
+                f"  - Recorded steps: {summary['recorded_steps']}\n"
+                f"  - Overall best reward: {summary['overall_best_reward']:.4f} (step {summary['overall_best_step']})\n"
+                f"  - Has Best-of-N baseline: {summary['has_best_of_n']}"
+            )
+            
+            # Only rank 0 shows the visualization command (to avoid log spam)
+            if self.actor.dp_rank == 0:
                 logger.info(
                     f"\n[TTTLogger] To generate visualization, run:\n"
                     f"  python areal/experimental/ttt_discover/generate_plot.py \\\n"
                     f"    --history_path {history_path} \\\n"
-                    f"    --benchmark_value 2.635983"
+                    f"    --benchmark_value 2.635983\n"
+                    f"\n[TTTLogger] Note: For multi-rank analysis, process each rank's file separately:\n"
+                    f"  for f in {self.config.saver.fileroot}/training_history_rank*.pkl; do\n"
+                    f"    python areal/experimental/ttt_discover/generate_plot.py \\\n"
+                    f"      --history_path $f --benchmark_value 2.635983\n"
+                    f"  done"
                 )
 
     def _save_hf(self, epoch: int, epoch_step: int, global_step: int):
