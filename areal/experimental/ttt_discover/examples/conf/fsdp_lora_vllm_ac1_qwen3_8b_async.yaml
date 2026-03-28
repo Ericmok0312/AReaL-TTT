@@ -115,7 +115,7 @@ scheduler:
 rollout:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  max_concurrent_rollouts: 512
+  max_concurrent_rollouts: 256
   queue_size: null
   consumer_batch_size: ${sampler.batch_size}  # 与 sampler batch_size 一致
   max_head_offpolicyness: 4
@@ -162,7 +162,7 @@ vllm:
   model: ${path}
   seed: ${seed}
   skip_tokenizer_init: false
-  max_num_seqs: 256
+  max_num_seqs: 128
   dtype: ${dtype}
   max_model_len: 32768       # 必须与 mb_spec 一致
   gpu_memory_utilization: 0.9  # H20 96GB，留点余量更安全
