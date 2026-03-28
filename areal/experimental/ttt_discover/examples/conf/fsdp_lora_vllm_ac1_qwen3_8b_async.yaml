@@ -115,7 +115,7 @@ scheduler:
 rollout:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  max_concurrent_rollouts: 8
+  max_concurrent_rollouts: 16
   queue_size: 4
   consumer_batch_size: ${sampler.batch_size}  # 与 sampler batch_size 一致
   max_head_offpolicyness: 4
