@@ -148,15 +148,23 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         # Configure parallel code execution with AsyncRewardWrapper
         # Follows AReaL best practice: wrap reward_fn once during initialization
         if max_reward_workers is None:
-            max_reward_workers = int(os.environ.get('TTTD_MAX_CODE_WORKERS', '16'))
+            max_reward_workers = int(os.environ.get('TTTD_MAX_CODE_WORKERS', '64'))  # Increased from 16
         
-        logger.info(f"TTTDiscoverWorkflowV2: max_reward_workers={max_reward_workers}")
+        # IMPORTANT: AsyncRewardWrapper timeout includes queue waiting time in ProcessPoolExecutor.
+        # To give env.execute() the full eval_timeout budget for actual execution:
+        # - wrapper_timeout >> eval_timeout (multiple times to account for queue wait)
+        # - actual execution timeout is enforced inside env.execute() by subprocess
+        eval_timeout = getattr(env, 'eval_timeout', 60)
+        wrapper_timeout = eval_timeout * 10 + 600  # 10x + 10min buffer for queue wait (very generous)
+        
+        logger.info(f"TTTDiscoverWorkflowV2: max_reward_workers={max_reward_workers}, "
+                   f"eval_timeout={eval_timeout}s, wrapper_timeout={wrapper_timeout}s (includes queue wait)")
         
         # Wrap reward function with AsyncRewardWrapper (AReaL standard pattern)
         # This dispatches reward computation to a dedicated process pool
         self.async_reward_fn = AsyncRewardWrapper(
             reward_fn=reward_fn,
-            timeout_seconds=getattr(env, 'eval_timeout', 60) + 10,
+            timeout_seconds=wrapper_timeout,  # Very generous buffer for queue + execution
             max_workers=max_reward_workers,
             max_retries=1,
         )
@@ -365,10 +373,11 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         exec_time_ms = 0.0
         try:
             # Use AsyncRewardWrapper with tttd_reward_fn
-            # tttd_reward_fn returns (reward, EnvResult, code, exec_time_ms) tuple
+            # tttd_reward_fn normally returns (reward, EnvResult, code, exec_time_ms) tuple
+            # but AsyncRewardWrapper returns 0 (int) on timeout
             prompt_str = self.tokenizer.decode(resp.input_tokens)
             
-            reward, result, extracted_code, exec_time_ms = await self.async_reward_fn(
+            reward_result = await self.async_reward_fn(
                 prompt_str,
                 completion_str,
                 resp.input_tokens,
@@ -376,6 +385,23 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 _env=self.env,
                 _state=state,
             )
+            
+            # Handle both timeout (int) and normal (tuple) return values
+            # This handles the AsyncRewardWrapper timeout behavior without modifying AReaL core
+            if isinstance(reward_result, int):
+                # Timeout case: AsyncRewardWrapper returned 0
+                logger.warning(f"Reward computation timeout for state {state.id[:8] if state else 'None'}...")
+                result = self.env.get_failure_result(
+                    state=state,
+                    fail_type="timeout",
+                    error_msg="Reward computation timed out",
+                )
+                reward = float(reward_result)  # Should be 0
+                extracted_code = ""
+                exec_time_ms = 0.0
+            else:
+                # Normal case: unpack tuple
+                reward, result, extracted_code, exec_time_ms = reward_result
             
             elapsed = time.time() - start_time
             fail_type_info = f", fail_type={result.fail_type}" if result.fail_type else ""

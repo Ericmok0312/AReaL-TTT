@@ -165,7 +165,7 @@ vllm:
   max_num_seqs: 512
   dtype: ${dtype}
   max_model_len: 32768       # 必须与 mb_spec 一致
-  gpu_memory_utilization: 0.85  # H20 96GB，留点余量更安全
+  gpu_memory_utilization: 0.9  # H20 96GB，留点余量更安全
   enforce_eager: false        # 如果需要性能可设为 false，但 true 更稳定
   enable_lora: ${use_lora}
   max_lora_rank: 32
