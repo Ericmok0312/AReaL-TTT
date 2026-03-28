@@ -115,8 +115,8 @@ scheduler:
 rollout:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  max_concurrent_rollouts: 256
-  queue_size: null
+  max_concurrent_rollouts: 8
+  queue_size: 2
   consumer_batch_size: ${sampler.batch_size}  # 与 sampler batch_size 一致
   max_head_offpolicyness: 4
   enable_rollout_tracing: false
@@ -128,7 +128,7 @@ rollout:
   use_lora: ${use_lora}
 
 gconfig:
-  n_samples: 64
+  n_samples: 2
   min_new_tokens: 0
   max_new_tokens: 32768      # 生成长度限制（与 max_tokens 一致，实际可用 = 32768 - prompt_length）
   max_tokens: 32768          # 总长度限制（prompt + response）

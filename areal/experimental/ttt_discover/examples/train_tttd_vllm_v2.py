@@ -783,10 +783,10 @@ def main(args):
             )
         
         # Save Training History Checkpoint
-        if is_dp_head:
-            checkpoint_path = history_logger.save_checkpoint()
-            if checkpoint_path:
-                logger.debug(f"[TTTLogger] Saved checkpoint to {checkpoint_path}")
+        # Each rank saves its own checkpoint (logger configured with rank-specific filename)
+        checkpoint_path = history_logger.save_checkpoint()
+        if checkpoint_path:
+            logger.debug(f"[TTTLogger] Saved checkpoint to {checkpoint_path}")
                 
         rollout.pause()
         

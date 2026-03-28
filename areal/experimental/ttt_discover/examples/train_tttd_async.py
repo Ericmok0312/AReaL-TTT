@@ -953,12 +953,12 @@ class TTTDPPOTrainer(PPOTrainer):
                     f"Entropy: {metrics['train/entropy']:.4f}, GradNorm: {metrics['train/grad_norm']:.4f}, LR: {metrics['train/lr']:.6f}"
                 )
             
-            logger.info(f"[DEBUG][Step {global_step}] Before save_checkpoint, is_dp_head={is_dp_head}")
+            logger.info(f"[DEBUG][Step {global_step}] Before save_checkpoint")
             # Save Training History Checkpoint
-            if is_dp_head:
-                checkpoint_path = self.history_logger.save_checkpoint()
-                if checkpoint_path:
-                    logger.debug(f"[TTTLogger] Saved checkpoint to {checkpoint_path}")
+            # Each rank saves its own checkpoint (logger configured with rank-specific filename)
+            checkpoint_path = self.history_logger.save_checkpoint()
+            if checkpoint_path:
+                logger.debug(f"[TTTLogger] Saved checkpoint to {checkpoint_path}")
             logger.info(f"[DEBUG][Step {global_step}] After save_checkpoint")
             
             # Update weights and save (all part of training phase)
@@ -1011,12 +1011,30 @@ class TTTDPPOTrainer(PPOTrainer):
                 except Exception as e:
                     logger.warning(f"[PUCT_TRACK] Failed to get analysis data: {e}")
             
-            # Each rank records its own local data independently
-            # No distributed aggregation to avoid all_gather_object timeout with large metadata
-            # For cross-rank analysis, load and merge per-rank files post-training
+            # All-gather rewards across ranks for complete distribution (lightweight)
+            # Metadata remains per-rank to avoid all_gather_object timeout
+            if dist.is_initialized() and self.actor.data_parallel_world_size > 1:
+                world_size = self.actor.data_parallel_world_size
+                all_rewards_list = [None] * world_size
+                dist.all_gather_object(all_rewards_list, local_step_rewards)
+                # Only rank0 uses aggregated rewards for complete distribution
+                if is_dp_head:
+                    aggregated_rewards = []
+                    for r in all_rewards_list:
+                        if r is not None:
+                            aggregated_rewards.extend(r)
+                    rewards_to_record = aggregated_rewards
+                else:
+                    rewards_to_record = local_step_rewards
+            else:
+                rewards_to_record = local_step_rewards
+            
+            # Each rank records its own data:
+            # - rank0: aggregated rewards (complete distribution) + local metadata
+            # - others: local rewards + local metadata
             self.history_logger.record_step(
                 step=global_step,
-                rewards=local_step_rewards,
+                rewards=rewards_to_record,
                 best_solution=current_best_solution,
                 additional_metrics=step_metrics,
                 rollout_metadata=rollout_metadata if rollout_metadata else None,
