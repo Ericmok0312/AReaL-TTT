@@ -96,9 +96,11 @@ class TTTDPPOTrainer(PPOTrainer):
         self._amend_xccl_weight_update_envvar()
         
         # Create sampler first (needed for dataloader)
+        # Note: create_sampler_from_config uses config.checkpoint_dir by default.
+        # Do NOT override log_path to ensure sampler checkpoints are saved to the
+        # configured directory (cluster.fileroot/experiment_name/trial_name/sampler/)
         self.sampler = create_sampler_from_config(
             config=config.sampler,
-            log_path=config.saver.fileroot,
             env_type=getattr(config.sampler, 'env_type', 'ac1'),
         )
         
