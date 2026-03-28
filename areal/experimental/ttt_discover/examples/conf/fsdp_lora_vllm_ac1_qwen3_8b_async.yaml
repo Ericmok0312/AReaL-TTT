@@ -118,7 +118,7 @@ rollout:
   max_concurrent_rollouts: 16
   queue_size: 4
   consumer_batch_size: ${sampler.batch_size}  # 与 sampler batch_size 一致
-  max_head_offpolicyness: 4
+  max_head_offpolicyness: 2
   enable_rollout_tracing: false
   pause_grace_period: 1.0 
   scheduling_spec: ${scheduling_spec}
