@@ -510,6 +510,25 @@ class TTTDPPOTrainer(PPOTrainer):
             logger.info(f"[TTTLogger] Future save_steps: {future_save_steps}")
             logger.info(f"[TTTLogger] Existing snapshots from checkpoint: {existing_snapshots}")
             logger.info(f"[TTTLogger] Output directory: {config.saver.fileroot}")
+        
+        # DEBUG: Print PUCTSampler state after recovery (all ranks)
+        if hasattr(self.sampler, '_states'):
+            logger.info(
+                f"[PUCT_RESUME][Rank {self.actor.dp_rank}] "
+                f"States: {len(self.sampler._states)}, "
+                f"T: {getattr(self.sampler, '_T', 'N/A')}, "
+                f"n: {len(getattr(self.sampler, '_n', {}))}, "
+                f"m: {len(getattr(self.sampler, '_m', {}))}, "
+                f"Step: {getattr(self.sampler, '_current_step', 'N/A')}"
+            )
+            if self.sampler._states:
+                values = [s.value for s in self.sampler._states if s.value is not None]
+                if values:
+                    logger.info(
+                        f"[PUCT_RESUME][Rank {self.actor.dp_rank}] "
+                        f"Buffer values: min={min(values):.4f}, max={max(values):.4f}, "
+                        f"mean={sum(values)/len(values):.4f}"
+                    )
     
     def train(
         self,

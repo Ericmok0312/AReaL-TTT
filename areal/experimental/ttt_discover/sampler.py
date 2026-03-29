@@ -407,6 +407,9 @@ class PUCTSampler(StateSampler):
 
     def _load(self, step: int):
         file_path = _sampler_file_for_step(self.file_path, step)
+        import logging
+        logger = logging.getLogger("PUCTSampler")
+        logger.info(f"[RESUME] Loading sampler state from {file_path}")
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"Cannot resume from step {step}: sampler file not found: {file_path}")
         with _file_lock(f"{file_path}.lock"):
@@ -418,6 +421,8 @@ class PUCTSampler(StateSampler):
         self._n = store.get("puct_n", {}) or {}
         self._m = store.get("puct_m", {}) or {}
         self._T = int(store.get("puct_T", 0) or 0)
+        logger.info(f"[RESUME] Loaded: {len(self._states)} states, T={self._T}, "
+                   f"n_entries={len(self._n)}, m_entries={len(self._m)}")
 
     def _save(self, step: int):
         save_path = _sampler_file_for_step(self.file_path, step)
