@@ -974,14 +974,6 @@ class TTTDPPOTrainer(PPOTrainer):
                     f"Entropy: {metrics['train/entropy']:.4f}, GradNorm: {metrics['train/grad_norm']:.4f}, LR: {metrics['train/lr']:.6f}"
                 )
             
-            logger.info(f"[DEBUG][Step {global_step}] Before save_checkpoint")
-            # Save Training History Checkpoint
-            # Each rank saves its own checkpoint (logger configured with rank-specific filename)
-            checkpoint_path = self.history_logger.save_checkpoint()
-            if checkpoint_path:
-                logger.debug(f"[TTTLogger] Saved checkpoint to {checkpoint_path}")
-            logger.info(f"[DEBUG][Step {global_step}] After save_checkpoint")
-            
             # Update weights and save (all part of training phase)
             logger.info(f"[DEBUG][Step {global_step}] Before rollout.pause")
             self.rollout.pause()
@@ -1083,6 +1075,14 @@ class TTTDPPOTrainer(PPOTrainer):
                         f"total={step_total:.2f}s | "
                         f"reward={step_max_reward:.4f}"
                     )
+            
+            # Save Training History Checkpoint AFTER recording step data
+            # This ensures the current step is included in the checkpoint
+            logger.info(f"[DEBUG][Step {global_step}] Before save_checkpoint")
+            checkpoint_path = self.history_logger.save_checkpoint()
+            if checkpoint_path:
+                logger.debug(f"[TTTLogger] Saved checkpoint to {checkpoint_path}")
+            logger.info(f"[DEBUG][Step {global_step}] After save_checkpoint")
             
             # DEBUG: End of loop iteration
             logger.info(f"[DEBUG] Loop #{loop_count} (global_step={global_step}) completed successfully")
