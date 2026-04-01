@@ -347,6 +347,11 @@ class TTTDActor(FSDPEngine):
         self._synchronize_state(state_package, step)
         self.logger.info(f"[Rank {self.dp_rank}][Step {step}] Phase 3: Sync complete")
         
+        # Phase 4: Save version snapshot for lazy PUCT sampling
+        if hasattr(self.sampler, 'save_version_snapshot') and step is not None:
+            self.sampler.save_version_snapshot(step)
+            self.logger.info(f"[Rank {self.dp_rank}][Step {step}] Phase 4: Saved PUCT snapshot")
+        
         self.logger.info(f"[Rank {self.dp_rank}][Step {step}] sync_sampler END")
 
 
@@ -363,6 +368,10 @@ class TTTDActor(FSDPEngine):
         if step is not None:
             self.sampler._current_step = step
             self.sampler._save(step)
+        
+        # Save version snapshot for lazy PUCT sampling (single-node case)
+        if hasattr(self.sampler, 'save_version_snapshot') and step is not None:
+            self.sampler.save_version_snapshot(step)
 
 
     def _gather_updates(self, local_children, local_parents, local_failed, step):

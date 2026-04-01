@@ -115,12 +115,22 @@ class TTTDPPOTrainer(PPOTrainer):
             # ref model only needs PPOActorConfig (no adv_estimator needed)
             self.ref = self._create_tttd_actor(config.ref)
         
+        # Configure AReaL for lazy sampling if enabled
+        if config.sampler.lazy_puct_sampling:
+            # Allow large concurrent rollouts - actual concurrency controlled by workflow semaphores
+            config.rollout.max_concurrent_rollouts = 1000
+            config.rollout.max_head_offpolicyness = max(10, config.rollout.max_head_offpolicyness or 10)
+            logger.info(f"[LAZY_CONFIG] Enabled lazy sampling: max_concurrent={config.rollout.max_concurrent_rollouts}, "
+                       f"vllm_concurrency={config.sampler.vllm_concurrency}, "
+                       f"execution_concurrency={config.sampler.execution_concurrency}")
+        
         # Create dataloaders using sampler (before engine init, only needs process group)
         self.train_dataloader = self._create_tttd_dataloader(
             sampler=self.sampler,
             rank=self.actor.data_parallel_rank,
             world_size=self.actor.data_parallel_world_size,
             batch_size=config.sampler.batch_size,
+            lazy_sampling=config.sampler.lazy_puct_sampling,
         )
         self.train_dataset = self.train_dataloader.dataset
         self.valid_dataloader = None
@@ -147,6 +157,9 @@ class TTTDPPOTrainer(PPOTrainer):
         
         # Initialize proxy workers flag
         self._proxy_started = False
+        
+        # Store workflow kwargs for later use (updated in train method)
+        self._workflow_kwargs = {}
     
     def _create_tttd_actor(self, actor_config: TTTDPPOActorConfig):
         """Create TTTDActor with custom compute_advantages."""
@@ -162,6 +175,7 @@ class TTTDPPOTrainer(PPOTrainer):
         rank: int,
         world_size: int,
         batch_size: int,
+        lazy_sampling: bool = False,
     ) -> StatefulDataLoader:
         """Create TTT-Discover dataloader with sampler."""
         return create_tttd_dataloader(
@@ -169,6 +183,7 @@ class TTTDPPOTrainer(PPOTrainer):
             rank=rank,
             world_size=world_size,
             batch_size=batch_size,
+            lazy_sampling=lazy_sampling,
         )
     
     def _initialize_engines(self):
@@ -545,6 +560,15 @@ class TTTDPPOTrainer(PPOTrainer):
         """
         config = self.config
         
+        # Update workflow kwargs with sampler and DP info
+        if workflow_kwargs is not None:
+            self._workflow_kwargs = workflow_kwargs.copy()
+            # Add sampler reference for lazy sampling
+            if config.sampler.lazy_puct_sampling and 'sampler' not in self._workflow_kwargs:
+                self._workflow_kwargs['sampler'] = self.sampler
+                self._workflow_kwargs['dp_rank'] = self.actor.dp_rank
+                self._workflow_kwargs['dp_world_size'] = self.actor.data_parallel_world_size
+        
         start_step = (
             self.recover_info.last_step_info.next().global_step
             if self.recover_info is not None
@@ -575,6 +599,10 @@ class TTTDPPOTrainer(PPOTrainer):
             if max_steps_limit is not None and global_step >= max_steps_limit:
                 logger.info(f"[DEBUG] Breaking loop at global_step={global_step}, max_steps_limit={max_steps_limit}")
                 break
+            
+            # Clean up old batch caches for lazy sampling
+            if config.sampler.lazy_puct_sampling and hasattr(workflow, 'cleanup_old_versions'):
+                workflow.cleanup_old_versions(global_step)
             
             # In TTT-Discover, each step is effectively an epoch
             # (we don't use traditional epochs since data comes from PUCTSampler)
@@ -1265,13 +1293,16 @@ def main(args):
         max_reward_workers=64
     )
     
-    # Workflow kwargs
+    # Workflow kwargs - will be updated with sampler reference after trainer init
     workflow_kwargs = dict(
         env=env,
         gconfig=config.gconfig,
         tokenizer=config.tokenizer_path,
         enable_thinking=config.enable_thinking,
         max_prompt_thinking_tokens=config.max_prompt_thinking_tokens,
+        lazy_sampling=config.sampler.lazy_puct_sampling,
+        vllm_concurrency=config.sampler.vllm_concurrency,
+        execution_concurrency=config.sampler.execution_concurrency,
     )
     
     # Run training

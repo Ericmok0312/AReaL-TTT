@@ -24,6 +24,7 @@ class _StateSamplerIterableDataset(IterableDataset):
         world_size: int,
         local_batch_size: int,
         state_to_prompt_fn: Callable[["State"], str] | None = None,
+        lazy_sampling: bool = False,
     ):
         super().__init__()
         self.state_sampler = state_sampler
@@ -32,6 +33,9 @@ class _StateSamplerIterableDataset(IterableDataset):
         self.local_batch_size = local_batch_size
         self.state_to_prompt_fn = state_to_prompt_fn or self._default_prompt_extractor
         self._iteration_count = 0
+        self.lazy_sampling = lazy_sampling
+        # Global batch counter for version tracking in lazy mode
+        self._global_batch_counter = 0
         
     # TODO: Change to return a Message content, or ensure state_to_prompt_fn is a function returns such pattern 
     def _default_prompt_extractor(self, state: "State") -> str:
@@ -52,53 +56,71 @@ class _StateSamplerIterableDataset(IterableDataset):
             )
 
         while True:
-            global_batch_size = self.local_batch_size * self.world_size
-            states = self.state_sampler.sample_states(global_batch_size)
-            
-            # Shard for current rank
-            start_idx = self.rank * self.local_batch_size
-            end_idx = start_idx + self.local_batch_size
-            local_states = states[start_idx:end_idx]
-            
-            # Yield individual samples for collation
-            # Get PUCT stats if available (for Q-value estimation error analysis)
-            puct_stats = None
-            if hasattr(self.state_sampler, '_last_puct_stats'):
-                # _last_puct_stats: list of (n, Q, P, bonus, score) for sampled states
-                puct_stats = self.state_sampler._last_puct_stats
-            
-            # Track sampled step for staleness tracking
-            # This is the step when the parent was sampled, used for composite key
-            # Use _last_sampled_step (set by sample_states), fallback to _current_step
-            sampled_step = getattr(self.state_sampler, '_last_sampled_step', 
-                                   getattr(self.state_sampler, '_current_step', 0))
-            
-            for i, state in enumerate(local_states):
-                sample = {
-                    "prompt": self.state_to_prompt_fn(state),
-                    "state_id": state.id,
-                    "state_value": state.value,
-                    "state_timestep": state.timestep,
-                    "parent_values": state.parent_values,
-                    "parents": state.parents,
-                    "_state_obj": state,
-                    "_sampled_step": sampled_step,  # Record when this parent was sampled
-                }
+            if self.lazy_sampling:
+                # Lazy mode: return placeholders with version marking
+                # Actual sampling happens in workflow.arun_episode when VLLM has capacity
+                batch_version = self._global_batch_counter
                 
-                # Record PUCT selection stats if available
-                # This enables analysis of: "what was the PUCT score at selection time"
-                if puct_stats and i < len(puct_stats):
-                    n_visits, q_value, prior, bonus, score = puct_stats[i]
-                    sample['_puct_selection'] = {
-                        'n_visits': n_visits,
-                        'q_value': q_value,      # _m or parent_value
-                        'prior': prior,          # P (prior probability)
-                        'bonus': bonus,          # Exploration bonus
-                        'score': score,          # Final PUCT score (Q + bonus)
+                for batch_idx in range(self.local_batch_size):
+                    yield {
+                        "prompt": "",  # Placeholder, will be filled in workflow
+                        "state_id": f"placeholder_{batch_version}_{batch_idx}",
+                        "_lazy_placeholder": True,
+                        "_batch_id": batch_version,  # Unique batch identifier
+                        "_batch_idx": batch_idx,  # Position in local batch (0-7)
+                        "_puct_version": batch_version,  # Target PUCT version for this batch
                     }
                 
-                yield sample
-                self._iteration_count += 1
+                self._global_batch_counter += 1
+            else:
+                # Eager mode: sample immediately (original behavior)
+                global_batch_size = self.local_batch_size * self.world_size
+                states = self.state_sampler.sample_states(global_batch_size)
+                
+                # Shard for current rank
+                start_idx = self.rank * self.local_batch_size
+                end_idx = start_idx + self.local_batch_size
+                local_states = states[start_idx:end_idx]
+                
+                # Yield individual samples for collation
+                # Get PUCT stats if available (for Q-value estimation error analysis)
+                puct_stats = None
+                if hasattr(self.state_sampler, '_last_puct_stats'):
+                    # _last_puct_stats: list of (n, Q, P, bonus, score) for sampled states
+                    puct_stats = self.state_sampler._last_puct_stats
+                
+                # Track sampled step for staleness tracking
+                # This is the step when the parent was sampled, used for composite key
+                # Use _last_sampled_step (set by sample_states), fallback to _current_step
+                sampled_step = getattr(self.state_sampler, '_last_sampled_step', 
+                                       getattr(self.state_sampler, '_current_step', 0))
+                
+                for i, state in enumerate(local_states):
+                    sample = {
+                        "prompt": self.state_to_prompt_fn(state),
+                        "state_id": state.id,
+                        "state_value": state.value,
+                        "state_timestep": state.timestep,
+                        "parent_values": state.parent_values,
+                        "parents": state.parents,
+                        "_state_obj": state,
+                        "_sampled_step": sampled_step,  # Record when this parent was sampled
+                    }
+                    
+                    # Record PUCT selection stats if available
+                    # This enables analysis of: "what was the PUCT score at selection time"
+                    if puct_stats and i < len(puct_stats):
+                        n_visits, q_value, prior, bonus, score = puct_stats[i]
+                        sample['_puct_selection'] = {
+                            'n_visits': n_visits,
+                            'q_value': q_value,      # _m or parent_value
+                            'prior': prior,          # P (prior probability)
+                            'bonus': bonus,          # Exploration bonus
+                            'score': score,          # Final PUCT score (Q + bonus)
+                        }
+                    
+                    yield sample
+                    self._iteration_count += 1
                 
     def state_dict(self) -> dict:
         return {"iteration_count": self._iteration_count}
@@ -136,11 +158,13 @@ class TTTDiscoverDataLoader(StatefulDataLoader):
         collate_fn: Callable | None = None,
         state_to_prompt_fn: Callable[["State"], str] | None = None,
         drop_last: bool = True,
+        lazy_sampling: bool = False,
         **kwargs
     ):
         self.sampler = state_sampler  # Expose for update_states, flush, etc.
         self._rank = rank
         self._world_size = world_size
+        self._lazy_sampling = lazy_sampling
 
         # Batch size is the number of groups (parent states) per step across all ranks. 
         # We can simply treat number of groups as batch size, and perform standard DP sharding.
@@ -158,6 +182,7 @@ class TTTDiscoverDataLoader(StatefulDataLoader):
             world_size=world_size,
             local_batch_size=local_batch_size,
             state_to_prompt_fn=state_to_prompt_fn,
+            lazy_sampling=lazy_sampling,
         )
         
         # Initialize parent StatefulDataLoader
@@ -228,6 +253,7 @@ def create_tttd_dataloader(
     batch_size: int,
     collate_fn: Callable | None = None,
     drop_last: bool = True,
+    lazy_sampling: bool = False,
     **kwargs
 ) -> TTTDiscoverDataLoader:
     """
@@ -244,6 +270,7 @@ def create_tttd_dataloader(
         batch_size: Total batch size (number of parent states per step)
         collate_fn: Optional custom collation function
         drop_last: Whether to drop last incomplete batch
+        lazy_sampling: If True, defer sampling until workflow.arun_episode (VLLM has capacity)
         **kwargs: Additional args passed to StatefulDataLoader
         
     Returns:
@@ -268,6 +295,7 @@ def create_tttd_dataloader(
         batch_size=batch_size,
         collate_fn=collate_fn,
         drop_last=drop_last,
+        lazy_sampling=lazy_sampling,
         **kwargs
     )
 

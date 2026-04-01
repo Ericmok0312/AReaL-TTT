@@ -110,6 +110,24 @@ class SamplerConfig:
         default=2,
         metadata={"help": "Number of CPUs per task for code execution"}
     )
+    
+    # Lazy PUCT Sampling configuration
+    lazy_puct_sampling: bool = field(
+        default=True,
+        metadata={"help": "Enable lazy PUCT sampling: defer sampling until VLLM has capacity"}
+    )
+    vllm_concurrency: int = field(
+        default=8,
+        metadata={"help": "Global VLLM concurrency limit for lazy sampling (across all ranks)"}
+    )
+    execution_concurrency: int = field(
+        default=64,
+        metadata={"help": "Global solution execution concurrency limit (across all ranks)"}
+    )
+    max_puct_version_history: int = field(
+        default=5,
+        metadata={"help": "Maximum number of PUCT version snapshots to keep in memory"}
+    )
 
 
 @dataclass

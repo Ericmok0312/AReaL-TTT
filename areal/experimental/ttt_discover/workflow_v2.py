@@ -63,6 +63,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         env: BaseEnv,
         gconfig: GenerationHyperparameters,
         tokenizer: PreTrainedTokenizerFast | str,
+        sampler: "StateSampler" | None = None,
         reward_fn: Callable = tttd_reward_fn,
         enable_thinking: bool = False,
         auto_flush: bool = True,
@@ -72,6 +73,11 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         batch_size: int | None = None,
         group_size: int | None = None,
         puct_update_mode: str = "eager",
+        lazy_sampling: bool = False,
+        vllm_concurrency: int = 8,
+        execution_concurrency: int = 64,
+        dp_rank: int = 0,
+        dp_world_size: int = 1,
     ):
         """
         Initialize TTT-Discover Workflow V2.
@@ -80,6 +86,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             env: Environment instance (e.g., InequalitiesEnv, CirclePackingEnv)
             gconfig: Generation hyperparameters
             tokenizer: Tokenizer or path to tokenizer
+            sampler: PUCTSampler instance (required for lazy_sampling=True)
             reward_fn: Reward function following AReaL convention:
                 fn(prompt, completions, prompt_ids, completion_ids, **data) -> float
                 Default is tttd_reward_fn which requires _env and _state in data.
@@ -98,22 +105,46 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 - "strict": Only use children from parents sampled in current step to update PUCT.
                   This prevents cross-batch contamination by delaying PUCT updates for late children.
                   Use this mode to isolate staleness effects on policy training from PUCT update effects.
+            lazy_sampling: If True, defer PUCT sampling until VLLM has capacity (minimizes staleness)
+            vllm_concurrency: Max concurrent VLLM generations (for lazy mode, controls sampling frequency)
+            execution_concurrency: Max concurrent solution executions (for lazy mode, separate from VLLM)
+            dp_rank: Data parallel rank for distributed training
+            dp_world_size: Total number of data parallel ranks
         """
         self.env = env
+        self.sampler = sampler  # PUCTSampler reference for lazy sampling
         self.auto_flush = auto_flush
         self.max_prompt_thinking_tokens = max_prompt_thinking_tokens
         
         # Mode configuration
         self.strict_sync_mode = strict_sync_mode
-        self.batch_size = batch_size
-        self.group_size = group_size
+        self.batch_size = batch_size or 8
+        self.group_size = group_size or 64
         
         if strict_sync_mode:
             if batch_size is None or group_size is None:
                 raise ValueError("batch_size and group_size must be provided when strict_sync_mode=True")
             self.expected_rollouts_per_step = batch_size * group_size
             logger.info(f"TTTDiscoverWorkflowV2: Strict sync mode enabled, expected_rollouts_per_step={self.expected_rollouts_per_step}")
-            
+        
+        # Lazy PUCT sampling configuration
+        self.lazy_sampling = lazy_sampling
+        self.dp_rank = dp_rank
+        self.dp_world_size = dp_world_size
+        
+        if lazy_sampling:
+            if sampler is None:
+                raise ValueError("sampler must be provided when lazy_sampling=True")
+            # Calculate per-rank concurrency
+            self._vllm_sem = asyncio.Semaphore(max(1, vllm_concurrency // dp_world_size))
+            self._exec_sem = asyncio.Semaphore(max(1, execution_concurrency // dp_world_size))
+            # Batch-level version fixing
+            self._batch_fixed_versions: dict[int, int] = {}
+            self._batch_parents: dict[int, list] = {}
+            self._cache_lock = asyncio.Lock()
+            logger.info(f"TTTDiscoverWorkflowV2: Lazy sampling enabled, "
+                       f"vllm_sem={max(1, vllm_concurrency // dp_world_size)}, "
+                       f"exec_sem={max(1, execution_concurrency // dp_world_size)}")
         
         # PUCT update mode for controlling cross-batch contamination
         self.puct_update_mode = puct_update_mode
@@ -427,6 +458,72 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         
         return result.reward, result, extracted_code, exec_time_ms
 
+    async def _do_lazy_sampling(self, data: dict[str, Any]) -> "State":
+        """
+        Perform lazy PUCT sampling when VLLM has capacity.
+        This is called within the VLLM semaphore to ensure sampling happens
+        as close to VLLM execution as possible.
+        
+        Args:
+            data: The placeholder data from dataloader
+            
+        Returns:
+            The sampled State object
+        """
+        batch_id = data["_batch_id"]
+        batch_idx = data["_batch_idx"]
+        target_version = data["_puct_version"]
+        
+        async with self._cache_lock:
+            # First time for this batch: determine the actual PUCT version
+            if batch_id not in self._batch_fixed_versions:
+                # Use the sampler's version resolution (with fallback)
+                # This ensures all ranks use the same version for the same batch
+                
+                # Pre-check: trigger version resolution
+                _ = self.sampler.sample_states_for_version(1, target_version)
+                actual_version = self.sampler._version_mapping.get(target_version, target_version)
+                
+                self._batch_fixed_versions[batch_id] = actual_version
+                
+                logger.info(
+                    f"[LAZY_VERSION] batch_id={batch_id} rank={self.dp_rank} "
+                    f"target_v={target_version} actual_v={actual_version}"
+                )
+            
+            fixed_version = self._batch_fixed_versions[batch_id]
+            
+            # Sample parents (only once per batch)
+            if batch_id not in self._batch_parents:
+                global_batch = self.batch_size * self.dp_world_size
+                all_parents = self.sampler.sample_states_for_version(
+                    num_states=global_batch,
+                    target_version=fixed_version
+                )
+                
+                # Take this rank's slice
+                start_idx = self.dp_rank * self.batch_size
+                my_parents = all_parents[start_idx:start_idx + self.batch_size]
+                self._batch_parents[batch_id] = my_parents
+                
+                logger.info(
+                    f"[LAZY_SAMPLE] batch_id={batch_id} rank={self.dp_rank} "
+                    f"version={fixed_version} "
+                    f"parents={[p.id[:8] for p in my_parents]}"
+                )
+            
+            return self._batch_parents[batch_id][batch_idx]
+    
+    def cleanup_old_versions(self, current_step: int):
+        """Clean up old batch caches to manage memory."""
+        to_remove = [bid for bid in list(self._batch_fixed_versions.keys()) if bid < current_step - 2]
+        for bid in to_remove:
+            self._batch_fixed_versions.pop(bid, None)
+            self._batch_parents.pop(bid, None)
+        
+        if to_remove:
+            logger.debug(f"[LAZY_CLEANUP] Removed {len(to_remove)} old batch caches")
+
     @trace_session("arun_episode")
     async def arun_episode(
         self,
@@ -446,6 +543,21 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         """
         import time
         
+        # === LAZY SAMPLING MODE ===
+        if self.lazy_sampling and data.get("_lazy_placeholder"):
+            # Wait for VLLM capacity, then sample (ensures fresh PUCT state)
+            async with self._vllm_sem:
+                # Set sampled_step from batch version for staleness tracking
+                # _puct_version is the batch_id which corresponds to the training step
+                data['_sampled_step'] = data.get('_puct_version', 0)
+                
+                # Now VLLM has capacity - sample immediately
+                state = await self._do_lazy_sampling(data)
+                
+                # Execute VLLM generation immediately after sampling
+                return await self._execute_rollout(engine, state, data)
+        
+        # === EAGER MODE (original behavior) ===
         state = data.get("_state_obj")
         if state is None:
             logger.error("Missing '_state_obj' in data")
@@ -454,6 +566,18 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 input_ids=[0],
                 fail_type="missing_state",
             )
+        
+        return await self._execute_rollout(engine, state, data)
+    
+    async def _execute_rollout(
+        self,
+        engine: InferenceEngine,
+        state: "State",
+        data: dict[str, Any],
+    ) -> dict[str, torch.Tensor] | None:
+        """Execute the actual rollout (VLLM + Execution)."""
+        # Ensure state is available in data for _compute_reward
+        data["_state_obj"] = state
         
         # Get the step when this parent was sampled (from dataloader)
         # This is CRITICAL for staleness tracking with composite key
@@ -585,7 +709,12 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             
             # Compute reward on final response (pass gpu_done_time for timing measurement)
             # Returns: (reward, result, code, exec_time_ms) where exec_time_ms is pure execution time
-            reward, result, code, exec_time_ms = await self._compute_reward(resp, data, gpu_done_time)
+            # Use execution semaphore for lazy mode (separate from VLLM concurrency)
+            if self.lazy_sampling:
+                async with self._exec_sem:
+                    reward, result, code, exec_time_ms = await self._compute_reward(resp, data, gpu_done_time)
+            else:
+                reward, result, code, exec_time_ms = await self._compute_reward(resp, data, gpu_done_time)
             
             # Log validation failure (concise)
             if not result.is_valid:

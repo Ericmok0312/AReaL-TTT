@@ -1,8 +1,10 @@
 """Centralized sampler creation for all environments."""
 from __future__ import annotations
 from abc import ABC, abstractmethod
+import copy
 import os
 import threading
+import time
 
 import numpy as np
 
@@ -366,6 +368,7 @@ class PUCTSampler(StateSampler):
         puct_c: float = 1.0,
         topk_children: int = 2,
         group_size: int = 64,
+        max_version_history: int = 5,
         **kwargs,
     ):
         self.file_path = file_path
@@ -377,6 +380,7 @@ class PUCTSampler(StateSampler):
         self.topk_children = topk_children
         self.puct_c = float(puct_c)
         self.group_size = int(group_size)
+        self._max_version_history = max_version_history
     
         self._states: list[State] = []
         self._initial_states: list[State] = []
@@ -395,6 +399,14 @@ class PUCTSampler(StateSampler):
         self._T: int = 0 # Total number of expansions across all states
         self._last_scale: float = 1.0
         self._last_puct_stats: list[tuple[int, float, float, float, float]] = [] # n, Q, P, bonus, score
+        
+        # Versioned sampling support for lazy PUCT
+        # version -> snapshot of PUCT state at that version
+        self._version_snapshots: dict[int, dict] = {}
+        # target_version -> actual_version used (for fallback tracking)
+        self._version_mapping: dict[int, int] = {}
+        # Snapshot lock for thread safety
+        self._snapshot_lock = threading.RLock()
 
         if resume_step is not None:
             self._load(resume_step)
@@ -421,8 +433,30 @@ class PUCTSampler(StateSampler):
         self._n = store.get("puct_n", {}) or {}
         self._m = store.get("puct_m", {}) or {}
         self._T = int(store.get("puct_T", 0) or 0)
+        
+        # Restore version snapshots (meta only, states will be rebuilt from current _states)
+        self._version_snapshots = {}
+        for v_str, snap_meta in store.get("version_snapshots_meta", {}).items():
+            v = int(v_str)
+            # For resumed snapshots, we use current states but with old statistics
+            # This is an approximation - the states list may have changed
+            self._version_snapshots[v] = {
+                '_n': snap_meta['_n'],
+                '_m': snap_meta['_m'],
+                '_T': snap_meta['_T'],
+                '_states': list(self._states),  # Use current states as approximation
+                'timestamp': snap_meta.get('timestamp', 0),
+            }
+        
+        # Restore version mapping
+        self._version_mapping = {}
+        for k_str, v in store.get("version_mapping", {}).items():
+            self._version_mapping[int(k_str)] = v
+        
         logger.info(f"[RESUME] Loaded: {len(self._states)} states, T={self._T}, "
-                   f"n_entries={len(self._n)}, m_entries={len(self._m)}")
+                   f"n_entries={len(self._n)}, m_entries={len(self._m)}, "
+                   f"version_snapshots={len(self._version_snapshots)}, "
+                   f"version_mappings={len(self._version_mapping)}")
 
     def _save(self, step: int):
         save_path = _sampler_file_for_step(self.file_path, step)
@@ -433,6 +467,19 @@ class PUCTSampler(StateSampler):
             "puct_n": self._n,
             "puct_m": self._m,
             "puct_T": self._T,
+            # Save version snapshots (lightweight: only statistics, not full states)
+            "version_snapshots_meta": {
+                str(v): {
+                    '_n': snap['_n'],
+                    '_m': snap['_m'],
+                    '_T': snap['_T'],
+                    'num_states': len(snap['_states']),
+                    'timestamp': snap.get('timestamp', 0),
+                }
+                for v, snap in self._version_snapshots.items()
+            },
+            # Save version mapping for consistency
+            "version_mapping": {str(k): v for k, v in self._version_mapping.items()},
         }
         with _file_lock(f"{save_path}.lock"):
             _atomic_write_json(save_path, store)
@@ -564,6 +611,193 @@ class PUCTSampler(StateSampler):
                 self._refresh_random_construction(s)
 
         return picked
+
+    def save_version_snapshot(self, version: int):
+        """
+        Save current PUCT state as a snapshot for the given version.
+        Called after sync_sampler to create a versioned checkpoint.
+        
+        Args:
+            version: The training step/version to associate with this snapshot
+        """
+        with self._snapshot_lock:
+            # Deep copy states to ensure snapshot is immutable
+            self._version_snapshots[version] = {
+                '_n': self._n.copy(),
+                '_m': self._m.copy(),
+                '_T': self._T,
+                '_states': [copy.deepcopy(s) for s in self._states],
+                'timestamp': time.time(),
+            }
+            self._cleanup_old_snapshots(version)
+            
+        import logging
+        logger = logging.getLogger("PUCTSampler")
+        logger.info(f"[SNAPSHOT] Saved PUCT snapshot version={version} "
+                   f"(T={self._T}, n_entries={len(self._n)}, states={len(self._states)})")
+    
+    def _cleanup_old_snapshots(self, current_version: int):
+        """Clean up old version snapshots to manage memory."""
+        versions = sorted(self._version_snapshots.keys())
+        if len(versions) > self._max_version_history:
+            # Keep the most recent max_version_history versions
+            to_remove = versions[:-self._max_version_history]
+            for v in to_remove:
+                del self._version_snapshots[v]
+                # Also clean up mappings that point to this version
+                targets_to_remove = [t for t, av in self._version_mapping.items() if av == v]
+                for t in targets_to_remove:
+                    del self._version_mapping[t]
+    
+    def sample_states_for_version(self, num_states: int, target_version: int) -> list[State]:
+        """
+        Sample states using the PUCT state at the specified target version.
+        If target_version snapshot doesn't exist, falls back to the most recent available version.
+        
+        The actual version used is recorded in _version_mapping to ensure consistency:
+        - First call for a target_version determines the actual_version
+        - Subsequent calls for the same target_version reuse the same actual_version
+        
+        Args:
+            num_states: Number of states to sample
+            target_version: The desired PUCT version to use for sampling
+            
+        Returns:
+            List of sampled states
+        """
+        with self._snapshot_lock:
+            # Check if we already have a mapping for this target_version
+            if target_version in self._version_mapping:
+                actual_version = self._version_mapping[target_version]
+                if actual_version == -1:
+                    # Use current state (fallback when no snapshots exist)
+                    return self.sample_states(num_states)
+                else:
+                    snapshot = self._version_snapshots[actual_version]
+                    return self._sample_from_snapshot(num_states, snapshot)
+            
+            # First time: determine actual_version and record mapping
+            if target_version in self._version_snapshots:
+                # Perfect match
+                actual_version = target_version
+            else:
+                # Fallback: find the largest version less than target_version
+                available = sorted(self._version_snapshots.keys())
+                fallback_version = None
+                for v in reversed(available):
+                    if v < target_version:
+                        fallback_version = v
+                        break
+                
+                if fallback_version is not None:
+                    actual_version = fallback_version
+                    import logging
+                    logger = logging.getLogger("PUCTSampler")
+                    logger.warning(f"[VERSION_FALLBACK] target={target_version} -> actual={actual_version}")
+                else:
+                    # No snapshots available, use current state
+                    actual_version = -1
+                    import logging
+                    logger = logging.getLogger("PUCTSampler")
+                    logger.warning(f"[VERSION_FALLBACK] target={target_version} -> current (no snapshots)")
+            
+            # Record the mapping for future consistency
+            self._version_mapping[target_version] = actual_version
+            
+            # Sample from the determined version
+            if actual_version == -1:
+                return self.sample_states(num_states)
+            else:
+                snapshot = self._version_snapshots[actual_version]
+                return self._sample_from_snapshot(num_states, snapshot)
+    
+    def _sample_from_snapshot(self, num_states: int, snapshot: dict) -> list[State]:
+        """
+        Sample states using a saved PUCT snapshot.
+        This is deterministic: same snapshot + same num_states = same result.
+        
+        Args:
+            num_states: Number of states to sample
+            snapshot: Dictionary containing _n, _m, _T, _states from a specific version
+            
+        Returns:
+            List of sampled states
+        """
+        states = snapshot['_states']
+        n = snapshot['_n']
+        m = snapshot['_m']
+        T = snapshot['_T']
+        
+        if not states:
+            return [create_initial_state(self.env_type, self.initial_exp_type, self.budget_s)
+                    for _ in range(num_states)]
+        
+        # Reconstruct sampling logic using snapshot's statistics
+        initial_ids = {s.id for s in self._initial_states}
+        vals = np.array([float(s.value if s.value is not None else float("-inf")) for s in states])
+        non_initial_mask = np.array([s.id not in initial_ids for s in states])
+        scale = self._compute_scale(vals, non_initial_mask if non_initial_mask.any() else None)
+        P = self._compute_prior(vals, scale)
+        G = self.group_size
+        sqrtT = np.sqrt(1.0 + T / G)
+        
+        scores = []
+        for i, s in enumerate(states):
+            n_visits = n.get(s.id, 0)
+            m_value = m.get(s.id, vals[i])
+            Q = m_value if n_visits > 0 else vals[i]
+            bonus = self.puct_c * scale * P[i] * sqrtT / (1.0 + n_visits / G)
+            score = Q + bonus
+            scores.append((score, vals[i], s, n_visits, Q, P[i], bonus))
+        
+        scores.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        
+        if num_states > 1:
+            children_map = self._build_children_map_from_states(states)
+            picked, top_scores, blocked_ids = [], [], set()
+            for entry in scores:
+                s = entry[2]
+                if s.id in blocked_ids:
+                    continue
+                picked.append(s)
+                top_scores.append(entry)
+                blocked_ids.update(self._get_full_lineage_from_states(s, children_map))
+                if len(picked) >= num_states:
+                    break
+        else:
+            top_scores = scores[:num_states]
+            picked = [t[2] for t in top_scores]
+        
+        # Refresh random construction for initial states
+        for s in picked:
+            if s.id in initial_ids:
+                self._refresh_random_construction(s)
+        
+        return picked
+    
+    def _build_children_map_from_states(self, states: list[State]) -> dict[str, set[str]]:
+        """Build children map from a specific list of states (for snapshot sampling)."""
+        children: dict[str, set[str]] = {}
+        for s in states:
+            for p in (s.parents or []):
+                pid = p.get("id")
+                if pid:
+                    children.setdefault(str(pid), set()).add(s.id)
+        return children
+    
+    def _get_full_lineage_from_states(self, state: State, children_map: dict[str, set[str]]) -> set[str]:
+        """Get full lineage using a pre-built children map."""
+        lineage = self._get_lineage(state)
+        queue = [state.id]
+        visited = {state.id}
+        while queue:
+            sid = queue.pop(0)
+            for child_id in children_map.get(sid, []):
+                if child_id not in visited:
+                    visited.add(child_id)
+                    lineage.add(child_id)
+                    queue.append(child_id)
+        return lineage
 
     def update_states(self, states: list[State], parent_states: list[State], save: bool = True, step: int | None = None):
         """
