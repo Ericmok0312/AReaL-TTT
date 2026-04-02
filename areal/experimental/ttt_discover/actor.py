@@ -479,6 +479,12 @@ class TTTDActor(FSDPEngine):
         children, parents, failed, merged_batch_mappings = gathered_data
         self.logger.info(f"[Step {step}] _apply_updates: children={len(children)}, parents={len(parents)}, failed={len(failed)}")
         
+        # Update rank 0's batch version mappings with merged result
+        # (other ranks will get this via deserialize_full_state)
+        if merged_batch_mappings:
+            self.sampler._batch_version_mappings.update(merged_batch_mappings)
+            self.logger.info(f"[Step {step}] Updated batch mappings: {len(merged_batch_mappings)} entries")
+        
         # Record failures (record_failed_rollout has its own lock)
         if failed:
             _T_before = self.sampler._T
