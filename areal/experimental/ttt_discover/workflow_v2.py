@@ -20,6 +20,8 @@ Usage:
     >>> workflow.flush()  # 确保所有更新完成
 """
 
+from __future__ import annotations
+
 import asyncio
 import os
 import time
