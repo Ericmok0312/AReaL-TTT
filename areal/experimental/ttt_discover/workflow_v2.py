@@ -502,6 +502,13 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             
             fixed_version = self._batch_fixed_versions[batch_id]
             
+            # Validate version mapping is correct
+            if not self.validate_version_mapping(batch_id, target_version):
+                logger.warning(
+                    f"[VERSION_VALIDATION_FAIL] batch_id={batch_id} validation failed, "
+                    f"but continuing with fixed_version={fixed_version}"
+                )
+            
             # Sample parents (only once per batch)
             if batch_id not in self._batch_parents:
                 global_batch = self.batch_size * self.dp_world_size
@@ -523,6 +530,66 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             
             return self._batch_parents[batch_id][batch_idx]
     
+    def get_version_mapping_info(self) -> dict:
+        """Get current version mapping state for debugging.
+        
+        Returns:
+            Dict with batch_id -> actual_version mapping and sampler state
+        """
+        if not self.lazy_sampling:
+            return {"enabled": False}
+        
+        return {
+            "enabled": True,
+            "batch_mappings": dict(self._batch_fixed_versions),
+            "sampler_mappings": dict(self.sampler._version_mapping) if self.sampler else {},
+            "available_snapshots": sorted(self.sampler._version_snapshots.keys()) if self.sampler else [],
+        }
+    
+    def validate_version_mapping(self, batch_id: int, expected_target: int) -> bool:
+        """Validate that a batch is using the correct version.
+        
+        Args:
+            batch_id: The batch to validate
+            expected_target: Expected target version for this batch
+            
+        Returns:
+            True if valid, False otherwise
+        """
+        if not self.lazy_sampling:
+            return True
+        
+        if batch_id not in self._batch_fixed_versions:
+            logger.warning(f"[VERSION_VALIDATION] batch_id={batch_id} not found in mappings")
+            return False
+        
+        actual = self._batch_fixed_versions[batch_id]
+        
+        # Check sampler mapping consistency
+        if self.sampler and expected_target in self.sampler._version_mapping:
+            sampler_actual = self.sampler._version_mapping[expected_target]
+            if actual != sampler_actual:
+                logger.error(
+                    f"[VERSION_MISMATCH] batch_id={batch_id}: "
+                    f"workflow has actual_v={actual}, "
+                    f"but sampler mapping says actual_v={sampler_actual}"
+                )
+                return False
+        
+        # Validate: actual should never be > expected (no future versions)
+        if actual > expected_target:
+            logger.error(
+                f"[VERSION_ERROR] batch_id={batch_id}: actual_v={actual} > target_v={expected_target}! "
+                f"This should never happen - using future version!"
+            )
+            return False
+        
+        logger.debug(
+            f"[VERSION_VALIDATION] batch_id={batch_id}: target={expected_target}, "
+            f"actual={actual}, valid=True"
+        )
+        return True
+    
     def cleanup_old_versions(self, current_step: int, max_history: int = 5):
         """Clean up old batch caches to manage memory.
         
@@ -540,12 +607,72 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         sorted_batches = sorted(self._batch_fixed_versions.keys())
         if len(sorted_batches) > max_history:
             to_remove = sorted_batches[:-max_history]  # Remove oldest
+            
+            # Log what we're removing for debugging
+            logger.info(
+                f"[LAZY_CLEANUP] Step {current_step}: Removing {len(to_remove)} old batches: "
+                f"{to_remove}, keeping {sorted_batches[-max_history:]}"
+            )
+            
             for bid in to_remove:
+                actual_v = self._batch_fixed_versions.get(bid, 'N/A')
+                logger.debug(f"[LAZY_CLEANUP] Removing batch_id={bid} (actual_v={actual_v})")
                 self._batch_fixed_versions.pop(bid, None)
                 self._batch_parents.pop(bid, None)
             
-            logger.debug(f"[LAZY_CLEANUP] Removed {len(to_remove)} old batch caches, "
-                        f"kept {len(self._batch_fixed_versions)} recent")
+            # Log remaining mappings for verification
+            remaining = sorted(self._batch_fixed_versions.keys())
+            logger.info(
+                f"[LAZY_CLEANUP] Remaining batches: {remaining}, "
+                f"mappings={dict(self._batch_fixed_versions)}"
+            )
+    
+    def report_version_status(self, current_step: int) -> dict:
+        """Report current version mapping status for monitoring.
+        
+        Args:
+            current_step: Current training step
+            
+        Returns:
+            Status dict with version mapping info
+        """
+        if not self.lazy_sampling:
+            return {"enabled": False}
+        
+        info = self.get_version_mapping_info()
+        
+        # Calculate statistics
+        batch_mappings = info.get("batch_mappings", {})
+        if batch_mappings:
+            versions_used = set(batch_mappings.values())
+            min_batch = min(batch_mappings.keys())
+            max_batch = max(batch_mappings.keys())
+            
+            status = {
+                "enabled": True,
+                "current_step": current_step,
+                "active_batches": len(batch_mappings),
+                "versions_in_use": sorted(versions_used),
+                "batch_range": (min_batch, max_batch),
+                "mappings": batch_mappings,
+            }
+            
+            logger.info(
+                f"[VERSION_STATUS] Step {current_step}: "
+                f"{status['active_batches']} active batches, "
+                f"versions in use: {status['versions_in_use']}, "
+                f"batch range: {status['batch_range']}"
+            )
+        else:
+            status = {
+                "enabled": True,
+                "current_step": current_step,
+                "active_batches": 0,
+                "versions_in_use": [],
+            }
+            logger.info(f"[VERSION_STATUS] Step {current_step}: No active batches")
+        
+        return status
 
     @trace_session("arun_episode")
     async def arun_episode(
