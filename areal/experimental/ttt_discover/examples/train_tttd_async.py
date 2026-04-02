@@ -582,6 +582,12 @@ class TTTDPPOTrainer(PPOTrainer):
         if isinstance(workflow, type):
             workflow = workflow(**self._workflow_kwargs)
         
+        # Save initial PUCT snapshot (version 0) for step 0 sampling
+        # This ensures step 0 uses the initial PUCT state, step 1 uses step 0's result, etc.
+        if config.sampler.lazy_puct_sampling and hasattr(self.sampler, 'save_version_snapshot'):
+            self.sampler.save_version_snapshot(0)
+            logger.info(f"[INIT] Saved initial PUCT snapshot version=0 for step 0 sampling")
+        
         start_step = (
             self.recover_info.last_step_info.next().global_step
             if self.recover_info is not None
