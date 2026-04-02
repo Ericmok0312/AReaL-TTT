@@ -1315,6 +1315,7 @@ def main(args):
         max_reward_workers=64,
         batch_size=local_batch_size,  # Local batch_size per rank
         group_size=group_size,  # Number of rollouts per parent
+        lazy_sampling=config.sampler.lazy_puct_sampling,
     )
     
     # Workflow kwargs - will be updated with sampler reference after trainer init

@@ -116,9 +116,10 @@ class SamplerConfig:
         default=True,
         metadata={"help": "Enable lazy PUCT sampling: defer sampling until VLLM has capacity"}
     )
-    vllm_concurrency: int = field(
-        default=8,
+    vllm_concurrency: Optional[int] = field(
+        default=None,
         metadata={"help": "Per-rank VLLM concurrency limit for lazy sampling. "
+                         "If None, auto-computed as batch_size * group_size. "
                          "Each rank (VLLM instance) can have this many concurrent generations. "
                          "Should match or be less than vllm.max_num_seqs."}
     )
