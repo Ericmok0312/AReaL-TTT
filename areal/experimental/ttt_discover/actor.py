@@ -383,10 +383,11 @@ class TTTDActor(FSDPEngine):
         Phase 1: Gather all local updates to rank 0.
         
         Uses gather_object for lower communication overhead (only rank 0 receives).
+        Also gathers batch version mappings from all ranks for distributed consistency.
         
         Returns:
-            Tuple (all_children, all_parents, all_failed) on rank 0,
-            or ([], [], []) on other ranks.
+            Tuple (all_children, all_parents, all_failed, all_batch_mappings) on rank 0,
+            or ([], [], [], {}) on other ranks.
         """
         from areal.experimental.ttt_discover.state import state_from_dict
         
@@ -395,6 +396,9 @@ class TTTDActor(FSDPEngine):
         p_dicts = [s.to_dict() for s in (local_parents or [])]
         f_dicts = [s.to_dict() for s in (local_failed or [])]
         
+        # Get batch version mappings (for lazy PUCT consistency)
+        batch_mappings = dict(self.sampler._batch_version_mappings) if self.sampler else {}
+        
         world_size = self.data_parallel_world_size
         is_rank0 = self.dp_rank == 0
         
@@ -402,30 +406,60 @@ class TTTDActor(FSDPEngine):
         all_c = [None] * world_size if is_rank0 else None
         all_p = [None] * world_size if is_rank0 else None
         all_f = [None] * world_size if is_rank0 else None
+        all_mappings = [None] * world_size if is_rank0 else None
         
         try:
             # Use gather_object for lower communication overhead
             dist.gather_object(c_dicts, all_c, dst=0, group=self.data_parallel_group)
             dist.gather_object(p_dicts, all_p, dst=0, group=self.data_parallel_group)
             dist.gather_object(f_dicts, all_f, dst=0, group=self.data_parallel_group)
+            dist.gather_object(batch_mappings, all_mappings, dst=0, group=self.data_parallel_group)
         except Exception as e:
             self.logger.error(f"[Rank {self.dp_rank}] Gather failed at step {step}: {e}")
             raise
         
         if not is_rank0:
-            return [], [], []
+            return [], [], [], {}
         
         # Deserialize on rank 0
         children = [state_from_dict(d) for lst in all_c if lst for d in lst]
         parents = [state_from_dict(d) for lst in all_p if lst for d in lst]
         failed = [state_from_dict(d) for lst in all_f if lst for d in lst]
         
+        # Merge batch mappings from all ranks with conflict detection
+        merged_mappings = {}
+        conflicts = []
+        for rank_idx, rank_mappings in enumerate(all_mappings):
+            if not rank_mappings:
+                continue
+            for batch_id, version in rank_mappings.items():
+                if batch_id in merged_mappings:
+                    if merged_mappings[batch_id] != version:
+                        # Conflict detected: same batch_id, different version
+                        conflicts.append({
+                            'batch_id': batch_id,
+                            'existing_version': merged_mappings[batch_id],
+                            'conflict_version': version,
+                            'conflict_rank': rank_idx,
+                        })
+                else:
+                    merged_mappings[batch_id] = version
+        
+        if conflicts:
+            self.logger.error(
+                f"[Step {step}] BATCH_VERSION_CONFLICT detected: {len(conflicts)} conflicts! "
+                f"Details: {conflicts[:3]}..."  # Log first 3
+            )
+        
+        if step and merged_mappings:
+            self.logger.info(f"[Step {step}] Merged batch mappings: {len(merged_mappings)} entries")
+        
         if step:
             self.logger.info(
                 f"[Step {step}] Gathered from {world_size} ranks: "
                 f"children={len(children)}, parents={len(set(p.id for p in parents))}, failed={len(failed)}"
             )
-        return children, parents, failed
+        return children, parents, failed, merged_mappings
 
 
     def _apply_updates(self, gathered_data, step):
@@ -442,7 +476,7 @@ class TTTDActor(FSDPEngine):
         if self.dp_rank != 0:
             return None
         
-        children, parents, failed = gathered_data
+        children, parents, failed, merged_batch_mappings = gathered_data
         self.logger.info(f"[Step {step}] _apply_updates: children={len(children)}, parents={len(parents)}, failed={len(failed)}")
         
         # Record failures (record_failed_rollout has its own lock)
@@ -478,6 +512,8 @@ class TTTDActor(FSDPEngine):
             'last_sampled_indices': self.sampler._last_sampled_indices,
             'last_puct_stats': self.sampler._last_puct_stats,
             'last_scale': self.sampler._last_scale,
+            # Include merged batch version mappings from all ranks
+            'batch_version_mappings': merged_batch_mappings,
         }
 
 

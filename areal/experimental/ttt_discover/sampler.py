@@ -405,6 +405,9 @@ class PUCTSampler(StateSampler):
         self._version_snapshots: dict[int, dict] = {}
         # target_version -> actual_version used (for fallback tracking)
         self._version_mapping: dict[int, int] = {}
+        # batch_id -> version mapping for distributed consistency
+        # Ensures all ranks use same version for same batch_id
+        self._batch_version_mappings: dict[int, int] = {}
         # Snapshot lock for thread safety
         self._snapshot_lock = threading.RLock()
 
@@ -648,6 +651,28 @@ class PUCTSampler(StateSampler):
                 targets_to_remove = [t for t, av in self._version_mapping.items() if av == v]
                 for t in targets_to_remove:
                     del self._version_mapping[t]
+    
+    def get_batch_version(self, batch_id: int) -> int | None:
+        """Get the fixed version for a batch_id.
+        
+        Returns:
+            The version to use for this batch, or None if not assigned yet.
+        """
+        with self._snapshot_lock:
+            return self._batch_version_mappings.get(batch_id)
+    
+    def assign_batch_version(self, batch_id: int, version: int):
+        """Assign version for a batch_id.
+        
+        Called when this batch's first rollout starts processing.
+        The mapping will be synchronized across all ranks in next sync.
+        
+        Args:
+            batch_id: The batch identifier
+            version: The PUCT snapshot version to use
+        """
+        with self._snapshot_lock:
+            self._batch_version_mappings[batch_id] = version
     
     def sample_states_for_version(self, num_states: int, target_version: int) -> list[State]:
         """
@@ -1045,6 +1070,11 @@ class PUCTSampler(StateSampler):
             self._last_sampled_indices = state_data['last_sampled_indices']
             self._last_puct_stats = state_data['last_puct_stats']
             self._last_scale = state_data['last_scale']
+            
+            # Sync batch version mappings for distributed consistency
+            if 'batch_version_mappings' in state_data:
+                with self._snapshot_lock:
+                    self._batch_version_mappings = state_data['batch_version_mappings']
 
 
 

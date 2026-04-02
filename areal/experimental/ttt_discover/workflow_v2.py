@@ -147,8 +147,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                            f"group_size({self.group_size}) = {vllm_concurrency}")
             self._vllm_sem = asyncio.Semaphore(max(1, vllm_concurrency))
             self._exec_sem = asyncio.Semaphore(max(1, execution_concurrency))
-            # Batch-level version fixing
-            self._batch_fixed_versions: dict[int, int] = {}
+            # Batch-level parent caching (version mapping is in sampler)
             self._batch_parents: dict[int, list] = {}
             self._cache_lock = asyncio.Lock()
             logger.info(f"TTTDiscoverWorkflowV2: Lazy sampling enabled, "
@@ -470,11 +469,11 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
     async def _do_lazy_sampling(self, data: dict[str, Any]) -> "State":
         """
         Perform lazy PUCT sampling when VLLM has capacity.
-        This is called within the VLLM semaphore to ensure sampling happens
-        as close to VLLM execution as possible.
         
-        CRITICAL: batch_id from dataloader is just a counter, NOT the training step.
-        We use the latest available snapshot to ensure freshest PUCT state.
+        DISTRIBUTED CONSISTENCY:
+        - Version mapping stored in sampler._batch_version_mappings (single source of truth)
+        - First rollout of a batch assigns the latest available snapshot version
+        - After sync_sampler, all ranks see the same mapping for same batch_id
         
         Args:
             data: The placeholder data from dataloader
@@ -484,45 +483,29 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         """
         batch_id = data["_batch_id"]
         batch_idx = data["_batch_idx"]
-        # NOTE: _puct_version from dataloader is batch counter, not training step.
-        # We ignore it and use the latest available snapshot.
-        _target_version = data["_puct_version"]  # noqa: F841
         
         async with self._cache_lock:
-            # First time for this batch: use the LATEST available snapshot
-            if batch_id not in self._batch_fixed_versions:
-                # Get the latest snapshot version (most recent PUCT state)
+            # Get version from sampler (may be assigned by this rank or synced from other rank)
+            version = self.sampler.get_batch_version(batch_id)
+            
+            if version is None:
+                # First rollout of this batch: assign latest available version
                 available = sorted(self.sampler._version_snapshots.keys())
-                if available:
-                    # Use the most recent snapshot
-                    actual_version = available[-1]
-                else:
-                    # No snapshots yet, use current state (-1 signals this)
-                    actual_version = -1
-                
-                self._batch_fixed_versions[batch_id] = actual_version
+                version = available[-1] if available else -1
+                self.sampler.assign_batch_version(batch_id, version)
                 
                 logger.info(
                     f"[LAZY_VERSION] batch_id={batch_id} rank={self.dp_rank} "
-                    f"latest_v={actual_version if actual_version != -1 else 'current'} "
+                    f"assigned_v={version if version != -1 else 'current'} "
                     f"available_snapshots={available}"
                 )
             
-            fixed_version = self._batch_fixed_versions[batch_id]
-            
-            # Validate version mapping is correct
-            if not self.validate_version_mapping(batch_id, _target_version):
-                logger.warning(
-                    f"[VERSION_VALIDATION_FAIL] batch_id={batch_id} validation failed, "
-                    f"but continuing with fixed_version={fixed_version}"
-                )
-            
-            # Sample parents (only once per batch)
+            # Sample parents (only once per batch per rank)
             if batch_id not in self._batch_parents:
                 global_batch = self.batch_size * self.dp_world_size
                 all_parents = self.sampler.sample_states_for_version(
                     num_states=global_batch,
-                    target_version=fixed_version
+                    target_version=version
                 )
                 
                 # Take this rank's slice
@@ -532,7 +515,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 
                 logger.info(
                     f"[LAZY_SAMPLE] batch_id={batch_id} rank={self.dp_rank} "
-                    f"version={fixed_version} "
+                    f"version={version} "
                     f"parents={[p.id[:8] for p in my_parents]}"
                 )
             
@@ -549,13 +532,16 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         
         return {
             "enabled": True,
-            "batch_mappings": dict(self._batch_fixed_versions),
+            "batch_mappings": dict(self.sampler._batch_version_mappings) if self.sampler else {},
             "sampler_mappings": dict(self.sampler._version_mapping) if self.sampler else {},
             "available_snapshots": sorted(self.sampler._version_snapshots.keys()) if self.sampler else [],
         }
     
     def validate_version_mapping(self, batch_id: int, expected_target: int) -> bool:
-        """Validate that a batch is using the correct version.
+        """Validate that a batch is using the correct version (debug only).
+        
+        Since version is now sourced directly from sampler, this is mainly
+        for detecting logic errors.
         
         Args:
             batch_id: The batch to validate
@@ -564,25 +550,13 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         Returns:
             True if valid, False otherwise
         """
-        if not self.lazy_sampling:
+        if not self.lazy_sampling or not self.sampler:
             return True
         
-        if batch_id not in self._batch_fixed_versions:
-            logger.warning(f"[VERSION_VALIDATION] batch_id={batch_id} not found in mappings")
+        actual = self.sampler.get_batch_version(batch_id)
+        if actual is None:
+            logger.warning(f"[VERSION_VALIDATION] batch_id={batch_id} not found in sampler mappings")
             return False
-        
-        actual = self._batch_fixed_versions[batch_id]
-        
-        # Check sampler mapping consistency
-        if self.sampler and expected_target in self.sampler._version_mapping:
-            sampler_actual = self.sampler._version_mapping[expected_target]
-            if actual != sampler_actual:
-                logger.error(
-                    f"[VERSION_MISMATCH] batch_id={batch_id}: "
-                    f"workflow has actual_v={actual}, "
-                    f"but sampler mapping says actual_v={sampler_actual}"
-                )
-                return False
         
         # Validate: actual should never be > expected (no future versions)
         if actual > expected_target:
@@ -592,10 +566,6 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             )
             return False
         
-        logger.debug(
-            f"[VERSION_VALIDATION] batch_id={batch_id}: target={expected_target}, "
-            f"actual={actual}, valid=True"
-        )
         return True
     
     def cleanup_old_versions(self, current_step: int, max_history: int = 5):
@@ -611,28 +581,17 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         if not self.lazy_sampling:
             return
         
-        # Keep at least max_history recent batches to support old rollouts
-        sorted_batches = sorted(self._batch_fixed_versions.keys())
+        # Clean up _batch_parents (workflow-local cache)
+        sorted_batches = sorted(self._batch_parents.keys())
         if len(sorted_batches) > max_history:
             to_remove = sorted_batches[:-max_history]  # Remove oldest
             
-            # Log what we're removing for debugging
-            logger.info(
-                f"[LAZY_CLEANUP] Step {current_step}: Removing {len(to_remove)} old batches: "
-                f"{to_remove}, keeping {sorted_batches[-max_history:]}"
-            )
-            
             for bid in to_remove:
-                actual_v = self._batch_fixed_versions.get(bid, 'N/A')
-                logger.debug(f"[LAZY_CLEANUP] Removing batch_id={bid} (actual_v={actual_v})")
-                self._batch_fixed_versions.pop(bid, None)
                 self._batch_parents.pop(bid, None)
             
-            # Log remaining mappings for verification
-            remaining = sorted(self._batch_fixed_versions.keys())
             logger.info(
-                f"[LAZY_CLEANUP] Remaining batches: {remaining}, "
-                f"mappings={dict(self._batch_fixed_versions)}"
+                f"[LAZY_CLEANUP] Step {current_step}: Cleaned up {len(to_remove)} old batches, "
+                f"remaining: {len(self._batch_parents)}"
             )
     
     def report_version_status(self, current_step: int) -> dict:
