@@ -1305,8 +1305,9 @@ def main(args):
     local_batch_size = config.sampler.batch_size // train_world_size
     group_size = config.gconfig.n_samples
     
-    # Create workflow
-    workflow = TTTDiscoverWorkflowV2(
+    # Workflow kwargs - will be used to create workflow instance in the engine
+    # This ensures lazy sampling parameters are properly applied
+    workflow_kwargs = dict(
         env=env,
         gconfig=config.gconfig,
         tokenizer=config.tokenizer_path,
@@ -1316,27 +1317,15 @@ def main(args):
         batch_size=local_batch_size,  # Local batch_size per rank
         group_size=group_size,  # Number of rollouts per parent
         lazy_sampling=config.sampler.lazy_puct_sampling,
-    )
-    
-    # Workflow kwargs - will be updated with sampler reference after trainer init
-    workflow_kwargs = dict(
-        env=env,
-        gconfig=config.gconfig,
-        tokenizer=config.tokenizer_path,
-        enable_thinking=config.enable_thinking,
-        max_prompt_thinking_tokens=config.max_prompt_thinking_tokens,
-        lazy_sampling=config.sampler.lazy_puct_sampling,
         vllm_concurrency=config.sampler.vllm_concurrency,
         execution_concurrency=config.sampler.execution_concurrency,
-        # Pass batch_size and group_size for lazy sampling
-        batch_size=local_batch_size,  # Local batch_size per rank
-        group_size=group_size,  # Number of rollouts per parent
     )
     
     # Run training
+    # Pass the class (not instance) so workflow_kwargs are used to create workflow
     with TTTDPPOTrainer(config) as trainer:
         trainer.train(
-            workflow=workflow,
+            workflow=TTTDiscoverWorkflowV2,  # Pass class, not instance
             workflow_kwargs=workflow_kwargs,
         )
 
