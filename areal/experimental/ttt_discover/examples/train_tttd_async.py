@@ -123,15 +123,19 @@ class TTTDPPOTrainer(PPOTrainer):
             # ref model only needs PPOActorConfig (no adv_estimator needed)
             self.ref = self._create_tttd_actor(config.ref)
         
-        # Configure AReaL for lazy sampling if enabled
+        # REMOVED: No longer override max_concurrent_rollouts / max_head_offpolicyness
+        # for lazy sampling. We now rely on the config values (e.g. max_concurrent_rollouts=8)
+        # to naturally bound the number of in-flight rollouts, which keeps PUCT sampling
+        # fresh because at most one batch is executing at a time.
         if config.sampler.lazy_puct_sampling:
-            # Allow large concurrent rollouts - actual concurrency controlled by workflow semaphores
-            config.rollout.max_concurrent_rollouts = 1000
-            config.rollout.max_head_offpolicyness = max(10, config.rollout.max_head_offpolicyness or 10)
-            logger.info(f"[LAZY_CONFIG] Enabled lazy sampling: max_concurrent={config.rollout.max_concurrent_rollouts}, "
-                       f"vllm_concurrency={config.sampler.vllm_concurrency}, "
-                       f"execution_concurrency={config.sampler.execution_concurrency}")
-        
+            logger.info(
+                f"[LAZY_CONFIG] Using configured rollout limits: "
+                f"max_concurrent_rollouts={config.rollout.max_concurrent_rollouts}, "
+                f"max_head_offpolicyness={config.rollout.max_head_offpolicyness}, "
+                f"vllm_concurrency={config.sampler.vllm_concurrency}, "
+                f"execution_concurrency={config.sampler.execution_concurrency}"
+            )
+
         # Create dataloaders using sampler (before engine init, only needs process group)
         self.train_dataloader = self._create_tttd_dataloader(
             sampler=self.sampler,
