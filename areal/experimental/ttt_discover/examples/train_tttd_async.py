@@ -1295,8 +1295,11 @@ def main(args):
     
     # Calculate local batch size (per-rank)
     # NOTE: batch_size here is LOCAL batch_size (per-rank), not global
-    world_size = config.data_parallel_size * config.model_parallel_size
-    local_batch_size = config.sampler.batch_size // world_size
+    # Parse allocation mode to get train world size
+    from areal.api.alloc_mode import AllocationMode
+    alloc_mode = AllocationMode.from_str(config.allocation_mode)
+    train_world_size = alloc_mode.train.world_size
+    local_batch_size = config.sampler.batch_size // train_world_size
     group_size = config.gconfig.n_samples
     
     # Create workflow
