@@ -446,10 +446,12 @@ class TTTDActor(FSDPEngine):
                     merged_mappings[batch_id] = version
         
         if conflicts:
-            self.logger.error(
+            error_msg = (
                 f"[Step {step}] BATCH_VERSION_CONFLICT detected: {len(conflicts)} conflicts! "
-                f"Details: {conflicts[:3]}..."  # Log first 3
+                f"Details: {conflicts[:5]}..."  # Show first 5
             )
+            self.logger.error(error_msg)
+            raise RuntimeError(error_msg)
         
         if step and merged_mappings:
             self.logger.info(f"[Step {step}] Merged batch mappings: {len(merged_mappings)} entries")
