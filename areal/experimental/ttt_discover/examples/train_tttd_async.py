@@ -1293,6 +1293,9 @@ def main(args):
     # Create environment
     env = create_env_from_config(config)
     
+    # DEBUG: Check lazy_puct_sampling value
+    logger.info(f"[DEBUG] config.sampler.lazy_puct_sampling = {config.sampler.lazy_puct_sampling}")
+    
     # Calculate local batch size (per-rank)
     # NOTE: batch_size here is LOCAL batch_size (per-rank), not global
     # Parse allocation mode to get train world size

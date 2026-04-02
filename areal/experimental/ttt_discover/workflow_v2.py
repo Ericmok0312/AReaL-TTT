@@ -532,6 +532,10 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 Should be >= max_head_offpolicyness + 1 to avoid KeyError 
                 when old rollouts complete.
         """
+        # Skip if lazy sampling is not enabled (attributes not initialized)
+        if not self.lazy_sampling:
+            return
+        
         # Keep at least max_history recent batches to support old rollouts
         sorted_batches = sorted(self._batch_fixed_versions.keys())
         if len(sorted_batches) > max_history:
