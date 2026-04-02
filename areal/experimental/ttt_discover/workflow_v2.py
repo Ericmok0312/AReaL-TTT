@@ -473,6 +473,9 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         This is called within the VLLM semaphore to ensure sampling happens
         as close to VLLM execution as possible.
         
+        CRITICAL: batch_id from dataloader is just a counter, NOT the training step.
+        We use the latest available snapshot to ensure freshest PUCT state.
+        
         Args:
             data: The placeholder data from dataloader
             
@@ -481,23 +484,28 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         """
         batch_id = data["_batch_id"]
         batch_idx = data["_batch_idx"]
-        target_version = data["_puct_version"]
+        # NOTE: _puct_version from dataloader is batch counter, not training step.
+        # We ignore it and use the latest available snapshot.
+        _target_version = data["_puct_version"]  # noqa: F841
         
         async with self._cache_lock:
-            # First time for this batch: determine the actual PUCT version
+            # First time for this batch: use the LATEST available snapshot
             if batch_id not in self._batch_fixed_versions:
-                # Use the sampler's version resolution (with fallback)
-                # This ensures all ranks use the same version for the same batch
-                
-                # Pre-check: trigger version resolution
-                _ = self.sampler.sample_states_for_version(1, target_version)
-                actual_version = self.sampler._version_mapping.get(target_version, target_version)
+                # Get the latest snapshot version (most recent PUCT state)
+                available = sorted(self.sampler._version_snapshots.keys())
+                if available:
+                    # Use the most recent snapshot
+                    actual_version = available[-1]
+                else:
+                    # No snapshots yet, use current state (-1 signals this)
+                    actual_version = -1
                 
                 self._batch_fixed_versions[batch_id] = actual_version
                 
                 logger.info(
                     f"[LAZY_VERSION] batch_id={batch_id} rank={self.dp_rank} "
-                    f"target_v={target_version} actual_v={actual_version}"
+                    f"latest_v={actual_version if actual_version != -1 else 'current'} "
+                    f"available_snapshots={available}"
                 )
             
             fixed_version = self._batch_fixed_versions[batch_id]
