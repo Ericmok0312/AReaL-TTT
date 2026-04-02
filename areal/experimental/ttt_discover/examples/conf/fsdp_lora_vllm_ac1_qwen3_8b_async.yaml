@@ -181,7 +181,7 @@ sampler:
   c_puct: 1.0
   gamma: 0.95
   max_children: 100
-  max_states: 10000
+  max_states: 100000
   top_k: 1000
   temperature: 1.0
   save_freq: 100
