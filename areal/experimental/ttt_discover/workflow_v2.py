@@ -511,7 +511,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             fixed_version = self._batch_fixed_versions[batch_id]
             
             # Validate version mapping is correct
-            if not self.validate_version_mapping(batch_id, target_version):
+            if not self.validate_version_mapping(batch_id, _target_version):
                 logger.warning(
                     f"[VERSION_VALIDATION_FAIL] batch_id={batch_id} validation failed, "
                     f"but continuing with fixed_version={fixed_version}"
