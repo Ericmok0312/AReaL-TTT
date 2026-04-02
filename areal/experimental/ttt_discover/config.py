@@ -118,11 +118,15 @@ class SamplerConfig:
     )
     vllm_concurrency: int = field(
         default=8,
-        metadata={"help": "Global VLLM concurrency limit for lazy sampling (across all ranks)"}
+        metadata={"help": "Per-rank VLLM concurrency limit for lazy sampling. "
+                         "Each rank (VLLM instance) can have this many concurrent generations. "
+                         "Should match or be less than vllm.max_num_seqs."}
     )
     execution_concurrency: int = field(
         default=64,
-        metadata={"help": "Global solution execution concurrency limit (across all ranks)"}
+        metadata={"help": "Per-rank solution execution concurrency limit. "
+                         "Each rank can have this many concurrent code executions. "
+                         "Should match AsyncRewardWrapper max_workers (default 64)."}
     )
     max_puct_version_history: int = field(
         default=5,

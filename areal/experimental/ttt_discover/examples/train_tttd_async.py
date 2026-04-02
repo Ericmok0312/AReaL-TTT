@@ -99,9 +99,17 @@ class TTTDPPOTrainer(PPOTrainer):
         # Note: create_sampler_from_config uses config.checkpoint_dir by default.
         # Do NOT override log_path to ensure sampler checkpoints are saved to the
         # configured directory (cluster.fileroot/experiment_name/trial_name/sampler/)
+        # 
+        # max_version_history should be >= max_head_offpolicyness + 1 to support lazy sampling
+        # with all possible policy versions in flight.
+        max_head_offpolicyness = getattr(config.rollout, 'max_head_offpolicyness', 2)
+        max_version_history = max_head_offpolicyness + 1
+        logger.info(f"[SAMPLER_CONFIG] max_head_offpolicyness={max_head_offpolicyness}, "
+                   f"max_version_history={max_version_history} (auto-computed)")
         self.sampler = create_sampler_from_config(
             config=config.sampler,
             env_type=getattr(config.sampler, 'env_type', 'ac1'),
+            max_version_history=max_version_history,
         )
         
         # Create TTTDActor (no critic - TTT-Discover doesn't use value function)
@@ -601,8 +609,10 @@ class TTTDPPOTrainer(PPOTrainer):
                 break
             
             # Clean up old batch caches for lazy sampling
+            # Keep max_head_offpolicyness + 1 batches to support old rollouts
             if config.sampler.lazy_puct_sampling and hasattr(workflow, 'cleanup_old_versions'):
-                workflow.cleanup_old_versions(global_step)
+                max_history = getattr(config.rollout, 'max_head_offpolicyness', 2) + 1
+                workflow.cleanup_old_versions(global_step, max_history=max_history)
             
             # In TTT-Discover, each step is effectively an epoch
             # (we don't use traditional epochs since data comes from PUCTSampler)
@@ -1283,6 +1293,12 @@ def main(args):
     # Create environment
     env = create_env_from_config(config)
     
+    # Calculate local batch size (per-rank)
+    # NOTE: batch_size here is LOCAL batch_size (per-rank), not global
+    world_size = config.data_parallel_size * config.model_parallel_size
+    local_batch_size = config.sampler.batch_size // world_size
+    group_size = config.gconfig.n_samples
+    
     # Create workflow
     workflow = TTTDiscoverWorkflowV2(
         env=env,
@@ -1290,7 +1306,9 @@ def main(args):
         tokenizer=config.tokenizer_path,
         enable_thinking=config.enable_thinking,
         max_prompt_thinking_tokens=config.max_prompt_thinking_tokens,
-        max_reward_workers=64
+        max_reward_workers=64,
+        batch_size=local_batch_size,  # Local batch_size per rank
+        group_size=group_size,  # Number of rollouts per parent
     )
     
     # Workflow kwargs - will be updated with sampler reference after trainer init
@@ -1303,6 +1321,9 @@ def main(args):
         lazy_sampling=config.sampler.lazy_puct_sampling,
         vllm_concurrency=config.sampler.vllm_concurrency,
         execution_concurrency=config.sampler.execution_concurrency,
+        # Pass batch_size and group_size for lazy sampling
+        batch_size=local_batch_size,  # Local batch_size per rank
+        group_size=group_size,  # Number of rollouts per parent
     )
     
     # Run training

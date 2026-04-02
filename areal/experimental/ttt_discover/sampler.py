@@ -674,9 +674,12 @@ class PUCTSampler(StateSampler):
                     return self.sample_states(num_states)
                 else:
                     snapshot = self._version_snapshots[actual_version]
-                    return self._sample_from_snapshot(num_states, snapshot)
+                    return self._sample_from_snapshot(num_states, snapshot, actual_version)
             
             # First time: determine actual_version and record mapping
+            import logging
+            logger = logging.getLogger("PUCTSampler")
+            
             if target_version in self._version_snapshots:
                 # Perfect match
                 actual_version = target_version
@@ -691,15 +694,29 @@ class PUCTSampler(StateSampler):
                 
                 if fallback_version is not None:
                     actual_version = fallback_version
-                    import logging
-                    logger = logging.getLogger("PUCTSampler")
                     logger.warning(f"[VERSION_FALLBACK] target={target_version} -> actual={actual_version}")
                 else:
                     # No snapshots available, use current state
                     actual_version = -1
-                    import logging
-                    logger = logging.getLogger("PUCTSampler")
                     logger.warning(f"[VERSION_FALLBACK] target={target_version} -> current (no snapshots)")
+            
+            # Log decoupling verification: current PUCT state vs snapshot state
+            current_T = self._T
+            current_n_entries = len(self._n)
+            current_states = len(self._states)
+            
+            if actual_version == -1:
+                logger.info(f"[DECOUPLE] target={target_version} using CURRENT "
+                           f"current_T={current_T} current_n={current_n_entries} current_states={current_states}")
+            else:
+                snapshot = self._version_snapshots[actual_version]
+                snap_T = snapshot['_T']
+                snap_n_entries = len(snapshot['_n'])
+                snap_states = len(snapshot['_states'])
+                logger.info(f"[DECOUPLE] target={target_version} actual={actual_version} "
+                           f"current_T={current_T} snap_T={snap_T} "
+                           f"current_n={current_n_entries} snap_n={snap_n_entries} "
+                           f"current_states={current_states} snap_states={snap_states}")
             
             # Record the mapping for future consistency
             self._version_mapping[target_version] = actual_version
@@ -709,9 +726,9 @@ class PUCTSampler(StateSampler):
                 return self.sample_states(num_states)
             else:
                 snapshot = self._version_snapshots[actual_version]
-                return self._sample_from_snapshot(num_states, snapshot)
+                return self._sample_from_snapshot(num_states, snapshot, actual_version)
     
-    def _sample_from_snapshot(self, num_states: int, snapshot: dict) -> list[State]:
+    def _sample_from_snapshot(self, num_states: int, snapshot: dict, actual_version: int = None) -> list[State]:
         """
         Sample states using a saved PUCT snapshot.
         This is deterministic: same snapshot + same num_states = same result.
@@ -719,14 +736,25 @@ class PUCTSampler(StateSampler):
         Args:
             num_states: Number of states to sample
             snapshot: Dictionary containing _n, _m, _T, _states from a specific version
+            actual_version: The version of the snapshot (for logging)
             
         Returns:
             List of sampled states
         """
+        import logging
+        logger = logging.getLogger("PUCTSampler")
+        
         states = snapshot['_states']
         n = snapshot['_n']
         m = snapshot['_m']
         T = snapshot['_T']
+        
+        # Log PUCT state at sampling time for staleness decoupling verification
+        n_nonzero = sum(1 for v in n.values() if v > 0)
+        avg_m = sum(m.values()) / len(m) if m else 0.0
+        logger.info(f"[SNAPSHOT_SAMPLE] version={actual_version} T={T} "
+                   f"n_entries={len(n)} n_nonzero={n_nonzero} m_entries={len(m)} avg_m={avg_m:.4f} "
+                   f"states={len(states)}")
         
         if not states:
             return [create_initial_state(self.env_type, self.initial_exp_type, self.budget_s)
@@ -1095,6 +1123,7 @@ def create_sampler_from_config(
     config,
     log_path: str | None = None,
     env_type: str = "custom",
+    max_version_history: int | None = None,
 ) -> StateSampler:
     """
     Create sampler from TTTDPPOActorConfig.sampler configuration.
@@ -1107,6 +1136,9 @@ def create_sampler_from_config(
         config: SamplerConfig dataclass from TTTDPPOActorConfig
         log_path: Optional override for log path (defaults to config.checkpoint_dir)
         env_type: Environment type identifier
+        max_version_history: Maximum number of PUCT version snapshots to keep.
+            Should be >= max_head_offpolicyness + 1 for lazy sampling.
+            If None, uses config.max_version_history or defaults to 5.
     
     Returns:
         Configured StateSampler instance
@@ -1144,6 +1176,10 @@ def create_sampler_from_config(
         logger = logging.getLogger("Sampler")
         logger.info(f"[Auto-Resume] Found latest sampler checkpoint at step {resume_step}")
     
+    # max_version_history: use argument if provided, else from config, else default
+    if max_version_history is None:
+        max_version_history = getattr(config, 'max_version_history', 5)
+    
     return create_sampler(
         sampler_type=sampler_type,
         log_path=log_path,
@@ -1159,6 +1195,7 @@ def create_sampler_from_config(
         max_states=max_states,
         top_k=top_k,
         temperature=temperature,
+        max_version_history=max_version_history,
     )
 
 

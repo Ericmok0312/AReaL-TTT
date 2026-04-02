@@ -74,8 +74,8 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         group_size: int | None = None,
         puct_update_mode: str = "eager",
         lazy_sampling: bool = False,
-        vllm_concurrency: int = 8,
-        execution_concurrency: int = 64,
+        vllm_concurrency: int | None = None,  # Per-rank slot-level. Default: batch_size * group_size
+        execution_concurrency: int = 64,  # Per-rank, should match AsyncRewardWrapper max_workers
         dp_rank: int = 0,
         dp_world_size: int = 1,
     ):
@@ -106,8 +106,10 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                   This prevents cross-batch contamination by delaying PUCT updates for late children.
                   Use this mode to isolate staleness effects on policy training from PUCT update effects.
             lazy_sampling: If True, defer PUCT sampling until VLLM has capacity (minimizes staleness)
-            vllm_concurrency: Max concurrent VLLM generations (for lazy mode, controls sampling frequency)
-            execution_concurrency: Max concurrent solution executions (for lazy mode, separate from VLLM)
+            vllm_concurrency: Per-rank max concurrent VLLM generations (for lazy mode). 
+                Should match vllm.max_num_seqs per instance (e.g., 128). Not divided by dp_world_size.
+            execution_concurrency: Per-rank max concurrent solution executions (for lazy mode). 
+                Should match AsyncRewardWrapper max_workers (default 64). Not divided by dp_world_size.
             dp_rank: Data parallel rank for distributed training
             dp_world_size: Total number of data parallel ranks
         """
@@ -135,16 +137,21 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         if lazy_sampling:
             if sampler is None:
                 raise ValueError("sampler must be provided when lazy_sampling=True")
-            # Calculate per-rank concurrency
-            self._vllm_sem = asyncio.Semaphore(max(1, vllm_concurrency // dp_world_size))
-            self._exec_sem = asyncio.Semaphore(max(1, execution_concurrency // dp_world_size))
+            # Use per-rank concurrency directly (slot-level: allow pipeline flow)
+            # vllm_concurrency default: batch_size * group_size (one full batch per rank)
+            if vllm_concurrency is None:
+                vllm_concurrency = self.batch_size * self.group_size
+                logger.info(f"Auto vllm_concurrency = batch_size({self.batch_size}) * "
+                           f"group_size({self.group_size}) = {vllm_concurrency}")
+            self._vllm_sem = asyncio.Semaphore(max(1, vllm_concurrency))
+            self._exec_sem = asyncio.Semaphore(max(1, execution_concurrency))
             # Batch-level version fixing
             self._batch_fixed_versions: dict[int, int] = {}
             self._batch_parents: dict[int, list] = {}
             self._cache_lock = asyncio.Lock()
             logger.info(f"TTTDiscoverWorkflowV2: Lazy sampling enabled, "
-                       f"vllm_sem={max(1, vllm_concurrency // dp_world_size)}, "
-                       f"exec_sem={max(1, execution_concurrency // dp_world_size)}")
+                       f"vllm_sem={max(1, vllm_concurrency)} (slot-level per-rank), "
+                       f"exec_sem={max(1, execution_concurrency)} (per-rank)")
         
         # PUCT update mode for controlling cross-batch contamination
         self.puct_update_mode = puct_update_mode
@@ -514,15 +521,25 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             
             return self._batch_parents[batch_id][batch_idx]
     
-    def cleanup_old_versions(self, current_step: int):
-        """Clean up old batch caches to manage memory."""
-        to_remove = [bid for bid in list(self._batch_fixed_versions.keys()) if bid < current_step - 2]
-        for bid in to_remove:
-            self._batch_fixed_versions.pop(bid, None)
-            self._batch_parents.pop(bid, None)
+    def cleanup_old_versions(self, current_step: int, max_history: int = 5):
+        """Clean up old batch caches to manage memory.
         
-        if to_remove:
-            logger.debug(f"[LAZY_CLEANUP] Removed {len(to_remove)} old batch caches")
+        Args:
+            current_step: Current training step
+            max_history: Maximum number of batch caches to keep. 
+                Should be >= max_head_offpolicyness + 1 to avoid KeyError 
+                when old rollouts complete.
+        """
+        # Keep at least max_history recent batches to support old rollouts
+        sorted_batches = sorted(self._batch_fixed_versions.keys())
+        if len(sorted_batches) > max_history:
+            to_remove = sorted_batches[:-max_history]  # Remove oldest
+            for bid in to_remove:
+                self._batch_fixed_versions.pop(bid, None)
+                self._batch_parents.pop(bid, None)
+            
+            logger.debug(f"[LAZY_CLEANUP] Removed {len(to_remove)} old batch caches, "
+                        f"kept {len(self._batch_fixed_versions)} recent")
 
     @trace_session("arun_episode")
     async def arun_episode(

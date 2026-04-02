@@ -292,12 +292,16 @@ def main(args):
     
     # Create V2 workflow - inject sampler directly!
     # Paper: "limit the total length of the prompt and the thinking tokens to 26000"
+    # NOTE: batch_size here is LOCAL batch_size (per-rank)
+    local_batch_size = batch_size // world_size if world_size > 1 else batch_size
     workflow = TTTDiscoverWorkflowV2(
         env=env,
         gconfig=config.gconfig,
         tokenizer=tokenizer,
         enable_thinking=config.enable_thinking,
         max_prompt_thinking_tokens=config.max_prompt_thinking_tokens,
+        batch_size=local_batch_size,  # Local batch_size per rank
+        group_size=group_size,  # Number of rollouts per parent
     )
     
     saver = Saver(config.saver, ft_spec)

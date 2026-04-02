@@ -102,7 +102,7 @@ tokenizer_path: ${path}
 cluster:
   n_nodes: 1
   n_gpus_per_node: 8
-  fileroot: ./outputs_ac1_async  # AC1 专门的输出目录
+  fileroot: ./outputs_ac1_async_v2  # AC1 专门的输出目录
   name_resolve:
     type: nfs
     nfs_record_root: /tmp/areal/name_resolve
