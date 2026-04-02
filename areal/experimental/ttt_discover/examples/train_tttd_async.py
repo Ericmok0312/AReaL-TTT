@@ -577,6 +577,11 @@ class TTTDPPOTrainer(PPOTrainer):
                 self._workflow_kwargs['dp_rank'] = self.actor.dp_rank
                 self._workflow_kwargs['dp_world_size'] = self.actor.data_parallel_world_size
         
+        # Create workflow instance from class and kwargs
+        # (needed for calling methods like cleanup_old_versions)
+        if isinstance(workflow, type):
+            workflow = workflow(**self._workflow_kwargs)
+        
         start_step = (
             self.recover_info.last_step_info.next().global_step
             if self.recover_info is not None
