@@ -1,5 +1,5 @@
-# TTT-Discover FSDP + LoRA + vLLM Configuration for AC2 (Lower Bound Maximization) with Qwen3-8B
-# Based on fsdp_lora_vllm_ac1_qwen3_8b_async.yaml but adapted for AC2 optimization problem
+# TTT-Discover FSDP + LoRA + vLLM Configuration for AC2 (Inequality) with Qwen3-8B
+# Based on fsdp_lora_vllm_qwen3_8b.yaml but adapted for AC2 optimization problem
 
 experiment_name: tttd-async-qwen3-8b-ac2
 trial_name: trial0
@@ -172,7 +172,7 @@ vllm:
   # CRITICAL: This path must exist BEFORE training starts because vLLM loads
   # the LoRA adapter at startup. Run prepare_lora_init.py first to create it:
   #   python areal/experimental/ttt_discover/examples/prepare_lora_init.py \
-  #     --config-path conf/fsdp_lora_vllm_ac2_qwen3_8b_async.yaml
+  #     --config-path conf/fsdp_lora_vllm_ac2_qwen3_8b.yaml
   lora_modules: '{"name": "${gconfig.lora_name}", "path": "./lora_init_ac2_async", "base_model_name": "${path}"}'
 
 sampler:
@@ -186,12 +186,15 @@ sampler:
   temperature: 1.0
   save_freq: 100
   checkpoint_dir: ${cluster.fileroot}/${experiment_name}/${trial_name}/sampler
-  initial_exp_type: best_available  # Paper: "we initialize the buffer with random states"
-  env_type: ac2  # AC2: maximize lower bound
+  initial_exp_type: random  # Paper: "we initialize the buffer with random states"
+  env_type: ac2  # 改为 AC2
   # AC2-specific parameters
   budget_s: 1100           # Paper: algorithm budget in seconds
   eval_timeout: 1100        #  timeout (1100秒)
   num_cpus: 2              # Paper: "2 CPUs each"
+  gpu_type: H100
+  n: 100
+
 
 # CRITICAL FIX: 添加 max_length 过滤超长样本
 train_dataset:
