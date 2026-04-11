@@ -141,13 +141,8 @@ def create_initial_state(env_type: str, initial_exp_type: str, budget_s: int = 1
         return create_initial_state_ac1(initial_exp_type=initial_exp_type, budget_s=budget_s)
     elif env_type == "ac2":
         # AC2: maximize lower bound (value = bound directly)
-        from areal.experimental.ttt_discover.envs.inequalities import create_initial_state_ac1
-        state = create_initial_state_ac1(initial_exp_type=initial_exp_type, budget_s=budget_s)
-        # Re-evaluate with AC2 verifier (bound is the reward for maximization)
-        from areal.experimental.ttt_discover.envs.inequalities import evaluate_sequence_ac2
-        if state.construction:
-            state.value = evaluate_sequence_ac2(state.construction)
-        return state
+        from areal.experimental.ttt_discover.envs.inequalities import create_initial_state_ac2
+        return create_initial_state_ac2(initial_exp_type=initial_exp_type, budget_s=budget_s)
     elif env_type == "cp":
         from areal.experimental.ttt_discover.envs.circle_packing import create_initial_state_cp
         # Determine n_item from config or use default

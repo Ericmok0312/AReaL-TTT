@@ -418,8 +418,7 @@ class InequalitiesEnv(BaseEnv):
         if self.problem_type == "ac1":
             return get_ac1_prompt(self.budget_s, last_code, value_ctx)
         else:
-            # AC2 prompt - can be added similarly
-            raise NotImplementedError("AC2 prompt not yet implemented")
+            return get_ac2_prompt(self.budget_s, last_code, value_ctx, self.num_cpus)
     
     def _execute_code(self, code: str, state: InequalitiesState) -> tuple[Any, str]:
         """
@@ -799,6 +798,235 @@ def create_initial_state_ac1(
         
         initial_bound = evaluate_sequence_ac1(construction)
         initial_value = 1.0 / (1e-8 + initial_bound)
+        
+        return InequalitiesState(
+            timestep=timestep,
+            construction=construction,
+            code="",
+            value=initial_value,
+        )
+    
+    else:
+        raise ValueError(f"Unknown initial_exp_type: {initial_exp_type}")
+
+
+# ============================================================================
+# AC2 (AlphaEvolve AC2) Support - Lower Bound Maximization
+# ============================================================================
+
+AC2_LITERATURE = r"""A previous state of the art used the following approach. You can use it as inspiration, but you are not required to use it, and you are encouraged to explore.
+```latex
+Their procedure is a coarse-to-fine optimization of the score. It starts with a stochastic global search that repeatedly perturbs the current best candidate and keeps the perturbation whenever it improves (Q), with the perturbation scale gradually reduced over time. Once a good basin is found, they switch to a deterministic local improvement step, performing projected gradient ascent (move in the gradient direction and project back to the feasible region). To reach higher resolution, they lift a good low-resolution solution to a higher-dimensional one by simply repeating its entries and then rerun the local refinement. Iterating this explore–refine–upscale cycle yields their final high-resolution maximizer and the improved lower bound.
+```"""
+
+AC2_EVAL_FUNCTION = '''```python
+import numpy as np
+
+def evaluate_sequence(sequence: list[float]) -> float:
+    """
+    Evaluates a sequence of coefficients for AC2 (maximize lower bound).
+    Returns -np.inf if the input is invalid.
+    """
+    # Verify that the input is a list
+    if not isinstance(sequence, list):
+        return -np.inf
+
+    # Reject empty lists
+    if not sequence:
+        return -np.inf
+
+    # Check each element in the list for validity
+    for x in sequence:
+        # Reject boolean types and other non-numeric types
+        if isinstance(x, bool) or not isinstance(x, (int, float)):
+            return -np.inf
+        # Reject NaN and infinity values
+        if np.isnan(x) or np.isinf(x):
+            return -np.inf
+
+    # Convert all elements to float for consistency
+    sequence = [float(x) for x in sequence]
+
+    # Protect against negative numbers
+    sequence = [max(0, x) for x in sequence]
+
+    # Check if sum of sequence will be too close to zero
+    if np.sum(sequence) < 0.01:
+        return -np.inf
+    
+    # Protect against numbers that are too large
+    sequence = [min(1000.0, x) for x in sequence]
+
+    convolution_2 = np.convolve(sequence, sequence)
+    
+    # Calculate the 2-norm squared: ||f*f||_2^2
+    num_points = len(convolution_2)
+    x_points = np.linspace(-0.5, 0.5, num_points + 2)
+    x_intervals = np.diff(x_points)
+    y_points = np.concatenate(([0], convolution_2, [0]))
+    l2_norm_squared = 0.0
+    for i in range(len(convolution_2) + 1):
+        y1 = y_points[i]
+        y2 = y_points[i+1]
+        h = x_intervals[i]
+        interval_l2_squared = (h / 3) * (y1**2 + y1 * y2 + y2**2)
+        l2_norm_squared += interval_l2_squared
+
+    # Calculate the 1-norm: ||f*f||_1
+    norm_1 = np.sum(np.abs(convolution_2)) / (len(convolution_2) + 1)
+
+    # Calculate the infinity-norm: ||f*f||_inf
+    norm_inf = np.max(np.abs(convolution_2))
+    
+    if norm_1 <= 0 or norm_inf <= 0:
+        return -np.inf
+        
+    C_lower_bound = l2_norm_squared / (norm_1 * norm_inf)
+    return C_lower_bound
+```'''
+
+
+def get_ac2_prompt(budget_s: int, last_code: str, value_context: str, num_cpus: int = 2) -> str:
+    """Generate AC2 prompt from template."""
+    return f'''Act as an expert software developer and inequality specialist specializing in creating step functions with certain properties.
+
+Your task is to generate the sequence of non-negative heights of a step function, that maximizes the following evaluation function:
+
+{AC2_EVAL_FUNCTION}
+
+{AC2_LITERATURE}
+
+Your task is to write a search function, `construct_function()`, that searches for the best sequence of coefficients. Your function will have {budget_s} seconds to run, and after that it has to have returned the best sequence it found. If after {budget_s} seconds it has not returned anything, it will be terminated with negative infinity points. All numbers in your sequence have to be positive or zero. Larger sequences with 1000s of items often have better attack surface, but too large sequences with 100s of thousands of items may be too slow to search.
+
+You may code up any search method you want, and you are allowed to call the evaluate_sequence() function as many times as you want. You have access to it, you don't need to code up the evaluate_sequence() function.
+
+Here is the last code we ran:
+{last_code}
+
+{value_context}
+
+You may want to start your search from one of the constructions we have found so far, which you can access through the 'height_sequence_1' global variable. 
+However, you are encouraged to explore solutions that use other starting points to prevent getting stuck in a local minimum.
+
+Reason about how you could further improve this construction.
+Ideally, try to do something different than the above algorithm. Could be using different algorithmic ideas, adjusting your heuristics, adjusting / sweeping your hyperparemeters, etc. 
+Unless you make a meaningful improvement, you will not be rewarded, if you are stuck you should think about how to get unstuck.
+
+Rules:
+- You must define the `construct_function` function as this is what will be invoked.
+- You can use scientific libraries like scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,GUROBI,MOSEK,PDLP,SCIP,XPRESS,ECOS], math.
+- You can use up to {num_cpus} CPUs.
+- Make all helper functions top level and have no closures from function nesting. Don't use any lambda functions.
+- No filesystem or network IO.
+- Do not import evaluate_sequence yourself. Assume it will already be imported and can be directly invoked. Do not import height_sequence_1 yourself; it will already be available.
+- **Print statements**: Use `print()` to log progress, intermediate bounds, timing info, etc. Your output will be shown back to you.
+- Include a short docstring at the top summarizing your algorithm.
+
+Make sure to think and return the final program between ```python and ```.'''
+
+
+def create_initial_state_ac2(
+    initial_exp_type: str = "best_available",
+    budget_s: int = 1000,
+    **kwargs
+) -> InequalitiesState:
+    """Create initial state for AC2 (lower bound maximization)."""
+    timestep = -1
+    
+    if initial_exp_type == "best_available":
+        # Load SOTA sequence for AC2
+        try:
+            # Try to import from tasks if available
+            from tasks.alphaevolve_ac2.ae_seq import height_sequence_2
+            construction = list(height_sequence_2)
+        except ImportError:
+            # Fallback: try alphaevolve_ac version
+            try:
+                from tasks.alphaevolve_ac.sota_alphaevolve2 import height_sequence_1
+                construction = list(height_sequence_1)
+            except ImportError:
+                # Final fallback: generate random construction
+                rng = np.random.default_rng(12345)
+                construction = [rng.random() for _ in range(rng.integers(1000, 8000))]
+        
+        initial_value = evaluate_sequence_ac2(construction)
+        
+        # Use a simple initial code that uses the best available construction
+        initial_code = f'''
+import numpy as np
+import time
+
+def construct_function(seed=42, budget_s={budget_s}, **kwargs):
+    """
+    Simple local search starting from the best known construction.
+    """
+    np.random.seed(seed)
+    deadline = time.time() + budget_s - 10
+    
+    # Start from the best known sequence
+    best_sequence = list(height_sequence_1)
+    best_score = evaluate_sequence(best_sequence)
+    
+    curr_sequence = best_sequence.copy()
+    
+    iteration = 0
+    while time.time() < deadline:
+        iteration += 1
+        # Random perturbation
+        idx = np.random.randint(len(curr_sequence))
+        curr_sequence[idx] = max(0, curr_sequence[idx] + np.random.randn() * 0.01)
+        
+        try:
+            curr_score = evaluate_sequence(curr_sequence)
+            if curr_score > best_score:
+                best_score = curr_score
+                best_sequence = curr_sequence.copy()
+                print(f"[{{iteration}}] New best: {{best_score:.6f}}")
+        except:
+            pass
+    
+    print(f"Final score: {{best_score:.6f}}")
+    return best_sequence
+'''
+        code = "```python\n" + initial_code + "\n```"
+        
+        return InequalitiesState(
+            timestep=timestep,
+            construction=construction,
+            code=code,
+            value=initial_value,
+        )
+    
+    elif initial_exp_type == "none":
+        code = "```python\n# No initial code available. Start from scratch.\n```"
+        
+        return InequalitiesState(
+            timestep=timestep,
+            construction=None,
+            code=code,
+            value=0.0,
+        )
+    
+    elif initial_exp_type == "random":
+        rng = np.random.default_rng(12345)
+        construction = [rng.random() for _ in range(rng.integers(1000, 8000))]
+        
+        initial_value = evaluate_sequence_ac2(construction)
+        
+        code = "```python\n# Random initialization\n```"
+        
+        return InequalitiesState(
+            timestep=timestep,
+            construction=construction,
+            code=code,
+            value=initial_value,
+        )
+    
+    elif initial_exp_type == "random_no_code":
+        rng = np.random.default_rng(42)
+        construction = list(rng.random(1000))
+        
+        initial_value = evaluate_sequence_ac2(construction)
         
         return InequalitiesState(
             timestep=timestep,
