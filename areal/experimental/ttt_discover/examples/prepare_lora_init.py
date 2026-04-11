@@ -32,9 +32,17 @@ def create_initial_lora(config: TTTDPPOActorConfig) -> str:
     
     # Extract lora_modules path from vllm config
     lora_output_path = "./lora_init"
-    if hasattr(config, 'vllm') and isinstance(config.vllm, dict):
+    lora_modules_str = None
+    
+    if hasattr(config, 'vllm'):
         import json
-        lora_modules_str = config.vllm.get('lora_modules', '')
+        # Try dict first (raw config before __post_init__)
+        if isinstance(config.vllm, dict):
+            lora_modules_str = config.vllm.get('lora_modules', '')
+        # Try dataclass object (after config is processed by __post_init__)
+        elif hasattr(config.vllm, 'lora_modules'):
+            lora_modules_str = config.vllm.lora_modules
+        
         if lora_modules_str:
             try:
                 lora_modules = json.loads(lora_modules_str)
