@@ -102,12 +102,12 @@ tokenizer_path: ${path}
 cluster:
   n_nodes: 1
   n_gpus_per_node: 8
-  fileroot: ./outputs_ac2_async  # AC2 专门的输出目录
+  fileroot: ./outputs_ac2_async_v2  # AC2 专门的输出目录
   name_resolve:
     type: nfs
     nfs_record_root: /tmp/areal/name_resolve
 
-allocation_mode: vllm[rollout]:d3p1t1+fsdp[actor]:d4p1t1
+allocation_mode: vllm[rollout]:d4p1t1+fsdp[actor]:d4p1t1
 
 scheduler:
   type: null
