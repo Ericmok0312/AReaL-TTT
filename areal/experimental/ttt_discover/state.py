@@ -43,6 +43,54 @@ class State(ABC):
         self.value = sum(rewards) / len(rewards)
         return self.value
 
+    def to_prompt(self, target, metric_name: str = "value", maximize: bool = True, language: str = "") -> str:
+        """Generate prompt value context from state."""
+        value_ctx = f"You are iteratively optimizing {metric_name}."
+        improvement_direction = "higher" if maximize else "lower"
+
+        has_code = self.code and self.code.strip()
+        if has_code:
+            value_ctx += f"\nHere is the last code we ran:\n"
+            if language:
+                value_ctx += f"```{language}\n{self.code}\n```"
+            else:
+                value_ctx += f"{self.code}"
+        else:
+            value_ctx += f"\nNo previous code available."
+
+        # Value context: show before/after if we have parent values
+        if self.parent_values and self.value is not None and getattr(self, "construction", None):
+            before_value = self.parent_values[0] if maximize else -self.parent_values[0]
+            after_value = self.value if maximize else -self.value
+            current_gap = target - after_value if maximize else after_value - target
+            value_ctx += (
+                f"\nHere is the {metric_name} before and after running the code above "
+                f"({improvement_direction} is better): {before_value:.6f} -> {after_value:.6f}"
+            )
+            value_ctx += (
+                f"\nTarget: {target}. Current gap: {current_gap:.6f}. "
+                f"Further improvements will also be generously rewarded."
+            )
+        elif self.value is not None:
+            after_value = self.value if maximize else -self.value
+            current_gap = target - after_value if maximize else after_value - target
+            value_ctx += f"\nCurrent {metric_name} ({improvement_direction} is better): {after_value:.6f}"
+            value_ctx += (
+                f"\nTarget: {target}. Current gap: {current_gap:.6f}. "
+                f"Further improvements will also be generously rewarded."
+            )
+        else:
+            value_ctx += f"\nTarget {metric_name}: {target}"
+
+        # Show previous stdout if available
+        if self.observation and self.observation.strip():
+            stdout = self.observation.strip()
+            if len(stdout) > 500:
+                stdout = "\n\n\t\t ...(TRUNCATED)...\n" + stdout[-500:]
+            value_ctx += f"\n\n--- Previous Program Output ---\n{stdout}\n--- End Output ---"
+
+        return value_ctx
+
     @abstractmethod
     def to_dict(self) -> dict:
         """Serialize state to dict."""

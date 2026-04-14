@@ -148,17 +148,8 @@ def create_initial_state(env_type: str, initial_exp_type: str, budget_s: int = 1
         # Determine n_item from config or use default
         return create_initial_state_cp(n=26, initial_exp_type=initial_exp_type)
     elif env_type == "erdos":
-        # Erdos uses random construction
-        rng = np.random.default_rng()
-        n_points = rng.integers(40, 100)
-        construction = np.ones(n_points) * 0.5
-        perturbation = rng.uniform(-0.4, 0.4, n_points)
-        perturbation = perturbation - np.mean(perturbation)
-        construction = construction + perturbation
-        dx = 2.0 / n_points
-        correlation = np.correlate(construction, 1 - construction, mode="full") * dx
-        c5_bound = float(np.max(correlation))
-        return ErdosState(timestep=-1, code="", value=-c5_bound, c5_bound=c5_bound, construction=list(construction))
+        from areal.experimental.ttt_discover.envs.erdos import create_initial_state_erdos
+        return create_initial_state_erdos(budget_s=budget_s)
     elif env_type == "mla_decode_nvidia":
         from tasks.gpu_mode.initial_program_mla_decode import INITIAL_CODE, INITIAL_VALUE
         return GpuModeState(timestep=-1, code=INITIAL_CODE, value=INITIAL_VALUE)

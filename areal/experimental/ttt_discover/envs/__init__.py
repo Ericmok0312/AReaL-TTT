@@ -36,6 +36,11 @@ from areal.experimental.ttt_discover.envs.inequalities import (
     evaluate_sequence_ac2,
 )
 
+from areal.experimental.ttt_discover.envs.erdos import (
+    ErdosEnv,
+    create_initial_state_erdos,
+)
+
 # GpuModeEnv is optional and requires additional dependencies
 try:
     from areal.experimental.ttt_discover.envs.gpu_mode import (
@@ -57,6 +62,9 @@ __all__ = [
     "create_initial_state_ac1",
     "evaluate_sequence_ac1",
     "evaluate_sequence_ac2",
+    # Erdos
+    "ErdosEnv",
+    "create_initial_state_erdos",
     # GPU Mode (optional)
     "GpuModeEnv",
     "create_initial_state_gpu_mode",
