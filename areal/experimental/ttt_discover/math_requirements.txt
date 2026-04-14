@@ -22,7 +22,6 @@ certifi
 cffi
 charset-normalizer
 chess
-chz
 clarabel
 click
 cloudpickle
