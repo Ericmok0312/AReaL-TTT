@@ -1328,7 +1328,7 @@ def main(args):
         tokenizer=config.tokenizer_path,
         enable_thinking=config.enable_thinking,
         max_prompt_thinking_tokens=config.max_prompt_thinking_tokens,
-        max_reward_workers=32,
+        max_reward_workers=24,
         batch_size=local_batch_size,  # Local batch_size per rank
         group_size=group_size,  # Number of rollouts per parent
         lazy_sampling=config.sampler.lazy_puct_sampling,
