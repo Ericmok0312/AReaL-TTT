@@ -1144,6 +1144,7 @@ Rules:
 - You must define the `construct_function` function as this is what will be invoked.
 - You can use scientific libraries like scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,GUROBI,MOSEK,PDLP,SCIP,XPRESS,ECOS], math.
 - You can use up to {num_cpus} CPUs.
+- You can use up to 2GB of RAM, but try to be efficient with memory to allow for larger batch sizes and faster runtimes.
 - Make all helper functions top level and have no closures from function nesting. Don't use any lambda functions.
 - No filesystem or network IO.
 - Do not import evaluate_sequence yourself. Assume it will already be imported and can be directly invoked. Do not import height_sequence_1 yourself; it will already be available.
