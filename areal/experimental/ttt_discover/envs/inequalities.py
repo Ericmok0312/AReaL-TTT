@@ -11,10 +11,12 @@ import subprocess
 import pickle
 import signal
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import psutil
 
 from areal.experimental.ttt_discover.envs.env import BaseEnv, EnvResult
 from areal.experimental.ttt_discover.state import InequalitiesState, State
@@ -329,6 +331,7 @@ class InequalitiesEnv(BaseEnv):
         eval_timeout: int = 600,
         log_dir: str = "/tmp/ttt_logs",
         num_cpus: int = 2,
+        memory_threshold: float = 0.60,
     ):
         self.problem_type = problem_type
         self.budget_s = budget_s
@@ -336,6 +339,7 @@ class InequalitiesEnv(BaseEnv):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.num_cpus = num_cpus
+        self.memory_threshold = memory_threshold
         
         # Select verifier based on problem type
         if problem_type == "ac1":
@@ -450,6 +454,17 @@ except Exception as e:
 '''
             f.write(runner_code)
         
+        # Monitor RAM before starting new execution
+        mem = psutil.virtual_memory()
+        while mem.percent >= self.memory_threshold * 100:
+            logger.warning(
+                f"System memory usage is {mem.percent:.1f}%, "
+                f"exceeds threshold {self.memory_threshold * 100:.0f}%. "
+                f"Pausing execution of temp.py until memory drops..."
+            )
+            time.sleep(5)
+            mem = psutil.virtual_memory()
+
         process = None
         try:
             # Run in subprocess with timeout
