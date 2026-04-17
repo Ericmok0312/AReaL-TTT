@@ -680,6 +680,20 @@ class TTTDPPOTrainer(PPOTrainer):
                 )
             rollout_time = time.perf_counter() - rollout_start
             
+            # === Rollout token counting for MFU calculation ===
+            rollout_total_tokens = 0
+            if "attention_mask" in rollout_batch:
+                rollout_total_tokens = int(rollout_batch["attention_mask"].sum().item())
+            elif "input_ids" in rollout_batch:
+                rollout_total_tokens = rollout_batch["input_ids"].numel()
+            
+            if dist.is_initialized():
+                local_rollout_tokens = torch.tensor([rollout_total_tokens], dtype=torch.long, device=self.actor.device)
+                dist.all_reduce(local_rollout_tokens, op=dist.ReduceOp.SUM)
+                global_rollout_tokens = int(local_rollout_tokens.item())
+            else:
+                global_rollout_tokens = rollout_total_tokens
+            
             # Get execute tail latency from workflow if available
             execute_tail = 0.0
             timing_stats = {}
@@ -892,6 +906,24 @@ class TTTDPPOTrainer(PPOTrainer):
             
             best_reward = max(best_reward, step_max_reward)
             
+            # === Actor policy update token counting for MFU calculation ===
+            # loss_mask indicates which tokens actually participate in policy gradient computation
+            # Note: compute_advantages() rolls loss_mask by -1, but sum remains the same
+            actor_update_tokens = 0
+            if "loss_mask" in rollout_batch:
+                actor_update_tokens = int(rollout_batch["loss_mask"].sum().item())
+            elif "attention_mask" in rollout_batch:
+                actor_update_tokens = int(rollout_batch["attention_mask"].sum().item())
+            elif "input_ids" in rollout_batch:
+                actor_update_tokens = rollout_batch["input_ids"].numel()
+            
+            if dist.is_initialized():
+                local_actor_tokens = torch.tensor([actor_update_tokens], dtype=torch.long, device=self.actor.device)
+                dist.all_reduce(local_actor_tokens, op=dist.ReduceOp.SUM)
+                global_actor_update_tokens = int(local_actor_tokens.item())
+            else:
+                global_actor_update_tokens = actor_update_tokens
+            
             # Record Training History
             local_step_rewards = step_rewards.tolist()
             current_best_solution = None
@@ -909,6 +941,10 @@ class TTTDPPOTrainer(PPOTrainer):
                 'global_rollouts': global_rollouts,
                 'step_max_reward': step_max_reward,
                 'step_mean_reward': step_mean_reward,
+                'rollout_total_tokens': global_rollout_tokens,
+                'actor_update_tokens': global_actor_update_tokens,
+                'local_rollout_total_tokens': rollout_total_tokens,
+                'local_actor_update_tokens': actor_update_tokens,
             }
             
             # NOTE: Staleness metrics are now collected from rollout_metadata in async_metrics
@@ -1011,6 +1047,8 @@ class TTTDPPOTrainer(PPOTrainer):
                 "train/advantages/avg": stats.get('ppo_actor/advantages/avg', 0.0),
                 "train/advantages/max": stats.get('ppo_actor/advantages/max', 0.0),
                 "train/advantages/min": stats.get('ppo_actor/advantages/min', 0.0),
+                "rollout/total_tokens": global_rollout_tokens,
+                "train/actor_update_tokens": global_actor_update_tokens,
             })
             
             # Log to stats_logger
@@ -1024,7 +1062,8 @@ class TTTDPPOTrainer(PPOTrainer):
                 logger.info(
                     f"[Step {global_step}] Reward: max={step_max_reward:.4f}, mean={step_mean_reward:.4f}, best={best_reward:.4f} | "
                     f"Loss: {metrics['train/actor_loss']:.4f}, KL: {metrics['train/approx_kl']:.4f}, "
-                    f"Entropy: {metrics['train/entropy']:.4f}, GradNorm: {metrics['train/grad_norm']:.4f}, LR: {metrics['train/lr']:.6f}"
+                    f"Entropy: {metrics['train/entropy']:.4f}, GradNorm: {metrics['train/grad_norm']:.4f}, LR: {metrics['train/lr']:.6f} | "
+                    f"Tokens: rollout={global_rollout_tokens}, actor_update={global_actor_update_tokens}"
                 )
             
             # Update weights and save (all part of training phase)
