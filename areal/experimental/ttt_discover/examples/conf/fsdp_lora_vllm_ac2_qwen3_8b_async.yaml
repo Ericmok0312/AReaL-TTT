@@ -190,7 +190,7 @@ sampler:
   env_type: ac2  # 改为 AC2
   # AC2-specific parameters
   budget_s: 1100           # Paper: algorithm budget in seconds
-  eval_timeout: 1300        #  timeout (1100秒)
+  eval_timeout: 1400        #  timeout (1100秒)
   num_cpus: 2              # Paper: "2 CPUs each"
   gpu_type: H100
   n: 100
