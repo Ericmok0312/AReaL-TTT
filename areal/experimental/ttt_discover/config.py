@@ -410,7 +410,7 @@ def create_env_from_config(config):
         Environment instance
     """
     # Import here to avoid circular imports
-    from .envs import CirclePackingEnv, InequalitiesEnv, ErdosEnv
+    from .envs import CirclePackingEnv, InequalitiesEnv, ErdosEnv, DenoisingEnv
     
     env_type = getattr(config.sampler, 'env_type', 'ac1')
     eval_timeout = getattr(config.sampler, 'eval_timeout', 600)
@@ -433,6 +433,12 @@ def create_env_from_config(config):
         return ErdosEnv(
             n=getattr(config.sampler, 'n', 200),
             budget_s=getattr(config.sampler, 'budget_s', 1000),
+            eval_timeout=eval_timeout,
+            log_dir=config.saver.fileroot,
+            num_cpus=getattr(config.sampler, 'num_cpus', 2),
+        )
+    elif env_type == 'denoising':
+        return DenoisingEnv(
             eval_timeout=eval_timeout,
             log_dir=config.saver.fileroot,
             num_cpus=getattr(config.sampler, 'num_cpus', 2),

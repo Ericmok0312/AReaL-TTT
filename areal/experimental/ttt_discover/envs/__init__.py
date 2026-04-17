@@ -41,6 +41,11 @@ from areal.experimental.ttt_discover.envs.erdos import (
     create_initial_state_erdos,
 )
 
+from areal.experimental.ttt_discover.envs.denoising import (
+    DenoisingEnv,
+    create_initial_state_denoising,
+)
+
 # GpuModeEnv is optional and requires additional dependencies
 try:
     from areal.experimental.ttt_discover.envs.gpu_mode import (
@@ -65,6 +70,9 @@ __all__ = [
     # Erdos
     "ErdosEnv",
     "create_initial_state_erdos",
+    # Denoising
+    "DenoisingEnv",
+    "create_initial_state_denoising",
     # GPU Mode (optional)
     "GpuModeEnv",
     "create_initial_state_gpu_mode",

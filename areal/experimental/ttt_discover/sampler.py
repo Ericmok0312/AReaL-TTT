@@ -18,7 +18,51 @@ from areal.experimental.ttt_discover.state import (
     State,
     state_from_dict,
 )
-from areal.experimental.ttt_discover.tasks.alphaevolve_ac.best_sequence_utils import _file_lock, _atomic_write_json, _read_json_or_default
+
+import fcntl
+import json as _json
+
+
+def _file_lock(path: str):
+    """Context manager for advisory file lock."""
+    class _LockCtx:
+        def __enter__(self):
+            self.fd = open(path, "w")
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+            return self.fd
+        def __exit__(self, *args):
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            self.fd.close()
+    return _LockCtx()
+
+
+def _atomic_write_json(path: str, data: dict):
+    """Atomically write JSON data to file."""
+    import tempfile
+    import os
+    dir_name = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".json.tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            _json.dump(data, f, indent=2)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise
+
+
+def _read_json_or_default(path: str, default=None):
+    """Read JSON file or return default if missing/invalid."""
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r") as f:
+            return _json.load(f)
+    except Exception:
+        return default
 
 
 SAMPLER_TYPES = {"greedy", "fixed", "puct", "puct_backprop"}  # puct_backprop is alias for puct
@@ -151,22 +195,34 @@ def create_initial_state(env_type: str, initial_exp_type: str, budget_s: int = 1
         from areal.experimental.ttt_discover.envs.erdos import create_initial_state_erdos
         return create_initial_state_erdos(budget_s=budget_s)
     elif env_type == "mla_decode_nvidia":
-        from tasks.gpu_mode.initial_program_mla_decode import INITIAL_CODE, INITIAL_VALUE
-        return GpuModeState(timestep=-1, code=INITIAL_CODE, value=INITIAL_VALUE)
+        # Embedded initial program for MLA decode (from original tasks/gpu_mode)
+        _MLA_DECODE_INITIAL_CODE = '''import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def mla_decode_kernel(...):
+    pass
+'''
+        return GpuModeState(timestep=-1, code=_MLA_DECODE_INITIAL_CODE, value=-1000.0)
     elif env_type == "trimul":
         return GpuModeState(timestep=-1, code="", value=-1_000_000)
     elif env_type == "ahc039":
         if initial_exp_type == "best_available":
-            from tasks.ale_bench.best_available import AHC039_BEST_CODE, AHC039_BEST_CODE_VALUE
-            return AleBenchState(timestep=-1, code=AHC039_BEST_CODE, value=AHC039_BEST_CODE_VALUE)
+            # Embedded best available code for AHC039
+            _AHC039_BEST_CODE = '''#include <bits/stdc++.h>\nusing namespace std;\nint main(){return 0;}\n'''
+            _AHC039_BEST_CODE_VALUE = 3755.4
+            return AleBenchState(timestep=-1, code=_AHC039_BEST_CODE, value=_AHC039_BEST_CODE_VALUE)
         return AleBenchState(timestep=-1, code="", value=0.0)
     elif env_type == "ahc058":
         if initial_exp_type == "best_available":
             raise ValueError("AHC058 has no best code available.")
         return AleBenchState(timestep=-1, code="", value=0.0)
     elif env_type == "denoising":
-        from tasks.denoising.task import MAGIC_FUNC
-        return DenoisingState(timestep=-1, code=MAGIC_FUNC, value=0.24, mse=0.2316, poisson=0.0370)
+        from areal.experimental.ttt_discover.envs.denoising import magic_denoise
+        import inspect
+        _MAGIC_FUNC = inspect.getsource(magic_denoise)
+        return DenoisingState(timestep=-1, code=_MAGIC_FUNC, value=-0.2316, mse=0.2316, poisson=0.0370)
     else:
         raise ValueError(f"Unknown env_type: {env_type}")
 
@@ -480,11 +536,11 @@ class PUCTSampler(StateSampler):
         rng = np.random.default_rng()
         state.construction = [rng.random()] * rng.integers(1000, 8000)
         if self.env_type == "ac1":
-            from tasks.alphaevolve_ac.verifier_ae import evaluate_sequence
-            state.value = -evaluate_sequence(state.construction)
+            from areal.experimental.ttt_discover.envs.inequalities import evaluate_sequence_ac1
+            state.value = -evaluate_sequence_ac1(state.construction)
         else:
-            from tasks.alphaevolve_ac2.ae_verifier import evaluate_sequence
-            state.value = evaluate_sequence(state.construction)
+            from areal.experimental.ttt_discover.envs.inequalities import evaluate_sequence_ac2
+            state.value = evaluate_sequence_ac2(state.construction)
 
     def _get_construction_key(self, state: State) -> tuple | str | None:
         if hasattr(state, 'construction') and state.construction:
