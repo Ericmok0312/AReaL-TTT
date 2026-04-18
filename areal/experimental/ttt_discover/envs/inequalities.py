@@ -6,6 +6,7 @@ Based on latest ttt-discover codebase - simplified architecture without task lay
 
 import sys
 import os
+import resource
 import tempfile
 import subprocess
 import pickle
@@ -332,6 +333,7 @@ class InequalitiesEnv(BaseEnv):
         log_dir: str = "/tmp/ttt_logs",
         num_cpus: int = 2,
         memory_threshold: float = 0.60,
+        max_memory_mb: int = 2048,
     ):
         self.problem_type = problem_type
         self.budget_s = budget_s
@@ -340,6 +342,7 @@ class InequalitiesEnv(BaseEnv):
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.num_cpus = num_cpus
         self.memory_threshold = memory_threshold
+        self.max_memory_mb = max_memory_mb
         
         # Select verifier based on problem type
         if problem_type == "ac1":
@@ -475,12 +478,18 @@ except Exception as e:
             env.setdefault("OPENBLAS_NUM_THREADS", t)
             env.setdefault("NUMEXPR_NUM_THREADS", t)
             
+            def _limit_memory():
+                if self.max_memory_mb > 0:
+                    max_bytes = self.max_memory_mb * 1024 * 1024
+                    resource.setrlimit(resource.RLIMIT_AS, (max_bytes, max_bytes))
+
             process = subprocess.Popen(
                 [sys.executable, runner_path],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=env,
                 start_new_session=True,
+                preexec_fn=_limit_memory,
             )
             
             try:
@@ -503,6 +512,20 @@ except Exception as e:
                 
                 # No result found
                 if process.returncode != 0:
+                    # Detect memory-related crashes
+                    is_memory_error = (
+                        "MemoryError" in stderr
+                        or process.returncode == -9   # SIGKILL (OOM killer)
+                        or process.returncode == -11  # SIGSEGV (failed malloc)
+                    )
+                    if is_memory_error:
+                        logger.warning(
+                            f"Memory limit exceeded (max {self.max_memory_mb}MB) "
+                            f"for subprocess PID {process.pid}. "
+                            f"Return code: {process.returncode}. "
+                            f"Stderr preview: {stderr[:200]!r}"
+                        )
+                        return None, f"Memory limit exceeded (max {self.max_memory_mb}MB)"
                     return None, f"Process failed: {stderr[:500]}"
                 
                 return None, "No result returned"
@@ -549,12 +572,19 @@ except Exception as e:
             
             if error_msg:
                 is_timeout = "timeout" in error_msg.lower()
+                is_memory_error = "memory limit exceeded" in error_msg.lower()
+                if is_timeout:
+                    fail_type = "timeout"
+                elif is_memory_error:
+                    fail_type = "memory_error"
+                else:
+                    fail_type = "execution_error"
                 return EnvResult(
                     reward=0.0,
                     observation=error_msg,
                     is_valid=False,
-                    fail_type="timeout" if is_timeout else "execution_error",
-                    metadata={"timeout": is_timeout, "error": error_msg},
+                    fail_type=fail_type,
+                    metadata={"timeout": is_timeout, "memory_error": is_memory_error, "error": error_msg},
                 )
             
             # Verify and compute reward
@@ -683,6 +713,14 @@ except Exception as e:
                 observation="No valid Python code block found in response",
                 is_valid=False,
                 fail_type=fail_type,
+            )
+        elif fail_type == "memory_error":
+            return EnvResult(
+                reward=0.0,
+                observation=f"Memory limit exceeded: {error_msg}" if error_msg else "Memory limit exceeded",
+                is_valid=False,
+                fail_type=fail_type,
+                metadata={"memory_error": True, "max_memory_mb": self.max_memory_mb},
             )
         elif fail_type == "execution_error":
             return EnvResult(
