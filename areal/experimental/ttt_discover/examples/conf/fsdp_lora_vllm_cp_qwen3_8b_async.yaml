@@ -189,7 +189,7 @@ sampler:
   env_type: cp
   # Circle Packing specific parameters
   n_item: 26
-  eval_timeout: 530
+  eval_timeout: 600
   num_cpus: 1
 
 # CRITICAL: add max_length filter
