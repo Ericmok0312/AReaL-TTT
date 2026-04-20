@@ -102,7 +102,7 @@ tokenizer_path: ${path}
 cluster:
   n_nodes: 1
   n_gpus_per_node: 8
-  fileroot: ./outputs_cp_async
+  fileroot: ./outputs_cp_async_n32
   name_resolve:
     type: nfs
     nfs_record_root: /tmp/areal/name_resolve
@@ -188,7 +188,7 @@ sampler:
   initial_exp_type: best_available
   env_type: cp
   # Circle Packing specific parameters
-  n_item: 26
+  n_item: 32
   eval_timeout: 600
   num_cpus: 1
 
