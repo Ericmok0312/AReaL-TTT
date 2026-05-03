@@ -495,12 +495,16 @@ class TTTDDistillTrainer(PPOTrainer):
                 adapter_cfg = json.load(f)
             base_model = adapter_cfg.get("base_model_name_or_path", config.path)
             
-            # If base_model is relative or not valid, fall back to student's base model
-            if not base_model or not (
-                os.path.isdir(base_model) or os.path.isdir(os.path.join(config.teacher_path, base_model))
-            ):
-                base_model = config.path
-                logger.info(f"[Teacher] Using student's base model as fallback: {base_model}")
+            # If base_model is a HF Hub ID (not a local path), use student's base model
+            # or the teacher checkpoint dir itself (which has config.json/tokenizer)
+            if not base_model or not os.path.isdir(base_model):
+                # Prefer teacher checkpoint dir if it has config.json
+                if os.path.isfile(os.path.join(config.teacher_path, "config.json")):
+                    base_model = config.teacher_path
+                    logger.info(f"[Teacher] Using teacher checkpoint dir as base model: {base_model}")
+                else:
+                    base_model = config.path
+                    logger.info(f"[Teacher] Using student's base model as fallback: {base_model}")
             
             teacher_config.path = base_model
             teacher_config.use_lora = True
