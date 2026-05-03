@@ -124,7 +124,13 @@ def main():
     args = parser.parse_args()
     
     # Load config
-    config, _ = load_expr_config([f"--config={args.config_path}"], TTTDPPOActorConfig)
+    # Try TTTDDistillConfig first (for distillation configs with teacher_path),
+    # fall back to TTTDPPOActorConfig for standard training configs.
+    try:
+        from train_tttd_distill import TTTDDistillConfig
+        config, _ = load_expr_config([f"--config={args.config_path}"], TTTDDistillConfig)
+    except Exception:
+        config, _ = load_expr_config([f"--config={args.config_path}"], TTTDPPOActorConfig)
     
     if not config.use_lora:
         print("LoRA is not enabled in config (use_lora=false). Nothing to do.")
