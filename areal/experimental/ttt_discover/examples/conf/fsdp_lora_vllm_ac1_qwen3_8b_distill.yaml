@@ -34,11 +34,11 @@ dtype: bfloat16
 # =============================================================================
 # Path to teacher LoRA adapter (HF PEFT format with adapter_config.json)
 # This should point to a finished TTT-Discover training run's LoRA output.
-teacher_path: ./outputs_ac1_async_v2/tttd-qwen3-8b-ac1/trial0/saver/tttd_lora_adapter
+teacher_path: ./outputs_ac1_async_v2/checkpoints/eric/tttd-async-qwen3-8b-ac1/trial0/default/epoch49epochstep49globalstep49
 
 # Path to teacher PUCTSampler checkpoint directory
 # The sampler contains the tree search state (states, n, m, Q, etc.)
-teacher_sampler_checkpoint: ./outputs_ac1_async_v2/tttd-qwen3-8b-ac1/trial0/sampler
+teacher_sampler_checkpoint: ./outputs_ac1_async_v2/tttd-async-qwen3-8b-ac1/trial0/sampler
 
 # Teacher checkpoint format: 'hf' (default) or 'dcp'
 teacher_weight_format: hf
