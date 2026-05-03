@@ -583,7 +583,7 @@ class TTTDDistillTrainer(PPOTrainer):
             logger.info(f"[Teacher] Using HF weights loaded during initialize() from {teacher_config.path}")
         
         # Freeze teacher parameters
-        for param in teacher.parameters():
+        for param in teacher.model.parameters():
             param.requires_grad = False
         
         logger.info("[Teacher] Teacher model created and frozen")
