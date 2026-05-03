@@ -809,6 +809,9 @@ class TTTDDistillTrainer(PPOTrainer):
         # Update workflow kwargs with sampler and DP info
         if workflow_kwargs is not None:
             self._workflow_kwargs = workflow_kwargs.copy()
+            # Sync lazy_sampling to the potentially modified config value
+            # (TTTDDistillTrainer.__init__ may disable lazy_puct_sampling in sync mode)
+            self._workflow_kwargs['lazy_sampling'] = config.sampler.lazy_puct_sampling
             if config.sampler.lazy_puct_sampling and 'sampler' not in self._workflow_kwargs:
                 self._workflow_kwargs['sampler'] = self.sampler
                 self._workflow_kwargs['dp_rank'] = self.actor.dp_rank
