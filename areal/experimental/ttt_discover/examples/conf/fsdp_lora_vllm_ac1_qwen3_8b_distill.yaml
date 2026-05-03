@@ -41,7 +41,7 @@ teacher_path: ./outputs_ac1_async_v2/checkpoints/eric/tttd-async-qwen3-8b-ac1/tr
 teacher_sampler_checkpoint: ./outputs_ac1_async_v2/tttd-async-qwen3-8b-ac1/trial0/sampler
 
 # Teacher checkpoint format: 'hf' (default) or 'dcp'
-teacher_weight_format: dcp
+teacher_weight_format: hf
 
 # =============================================================================
 # DISTILLATION HYPERPARAMETERS

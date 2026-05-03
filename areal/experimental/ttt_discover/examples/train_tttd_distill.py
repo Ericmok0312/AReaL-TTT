@@ -535,11 +535,11 @@ class TTTDDistillTrainer(PPOTrainer):
         
         # Load weights
         if is_lora_adapter:
-            # Load LoRA adapter weights
+            # Load LoRA adapter weights (always HF/PEFT format)
             from areal.api.io_struct import SaveLoadMeta
             meta = SaveLoadMeta(
                 path=config.teacher_path,
-                weight_format=config.teacher_weight_format,
+                weight_format="hf",
                 with_optim=False,
                 tokenizer=None,
                 processor=None,
