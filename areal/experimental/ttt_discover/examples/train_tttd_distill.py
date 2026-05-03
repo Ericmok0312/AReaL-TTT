@@ -791,6 +791,10 @@ class TTTDDistillTrainer(PPOTrainer):
         rollout_batch["returns"] = advantages
         rollout_batch["loss_mask"] = loss_mask
         
+        # ppo_update expects kl_rewards and tot_rewards for logging
+        rollout_batch["kl_rewards"] = torch.zeros_like(advantages)
+        rollout_batch["tot_rewards"] = reward_score.unsqueeze(-1).expand(-1, max_seqlen) * loss_mask
+        
         return rollout_batch
     
     def train(
