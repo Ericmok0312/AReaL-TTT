@@ -430,18 +430,27 @@ class TTTDDistillTrainer(PPOTrainer):
         
         # 5. Run rollout
         eval_start = time.perf_counter()
-        with stats_tracker.record_timing(f"eval_rollout_{model_name}"):
-            eval_batch = self.actor.prepare_batch(
-                temp_dataloader,
-                workflow=eval_workflow,
-                workflow_kwargs=None,
-                should_accept_fn=None,
-                group_size=group_size,
-                dynamic_bs=False,
-            )
+        try:
+            with stats_tracker.record_timing(f"eval_rollout_{model_name}"):
+                eval_batch = self.actor.prepare_batch(
+                    temp_dataloader,
+                    workflow=eval_workflow,
+                    workflow_kwargs=None,
+                    should_accept_fn=None,
+                    group_size=group_size,
+                    dynamic_bs=False,
+                )
+        except Exception as e:
+            logger.error(f"[Eval-{model_name}] prepare_batch failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            raise
         eval_rollout_time = time.perf_counter() - eval_start
         
         # 6. Gather results (with all_gather for full reward distribution)
+        if "rewards" not in eval_batch:
+            logger.error(f"[Eval-{model_name}] eval_batch missing 'rewards' key. Keys: {list(eval_batch.keys())}")
+            raise KeyError(f"eval_batch missing 'rewards' key")
         local_rollouts = eval_batch["rewards"].shape[0]
         eval_rewards = eval_batch["rewards"].cpu().numpy()
         eval_max_reward = float(eval_rewards.max())
