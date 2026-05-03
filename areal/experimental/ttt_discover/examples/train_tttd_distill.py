@@ -535,7 +535,7 @@ class TTTDDistillTrainer(PPOTrainer):
             from areal.api.io_struct import SaveLoadMeta
             meta = SaveLoadMeta(
                 path=config.teacher_path,
-                weight_format="hf",
+                weight_format=config.teacher_weight_format,
                 with_optim=False,
                 tokenizer=None,
                 processor=None,
