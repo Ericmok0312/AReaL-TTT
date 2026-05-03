@@ -342,21 +342,63 @@ class TTTDDistillTrainer(PPOTrainer):
             apply_clamp=True,
         )
 
+    def _load_hf_checkpoint(self, engine, path: str, model_name: str = ""):
+        """Load HF checkpoint, handling PEFT LoRA adapter key conversion.
+        
+        PEFT save_pretrained() strips '.default' suffix from adapter keys,
+        but FSDP-wrapped PEFT models expect it. We fix the keys here.
+        """
+        from areal.api.io_struct import SaveLoadMeta
+        from safetensors.torch import load_file
+        from torch.distributed.checkpoint.state_dict import (
+            StateDictOptions,
+            set_model_state_dict,
+        )
+        
+        adapter_path = os.path.join(path, "adapter_model.safetensors")
+        is_lora_adapter = os.path.isfile(adapter_path)
+        
+        if not is_lora_adapter:
+            # Standard HF checkpoint (full model)
+            meta = SaveLoadMeta(
+                path=path,
+                weight_format="hf",
+                with_optim=False,
+                tokenizer=None,
+                processor=None,
+            )
+            engine.load(meta)
+            return
+        
+        # LoRA adapter: manually load and fix keys
+        logger.info(f"[Load-{model_name}] Loading LoRA adapter from {path}")
+        if dist.get_rank() == 0:
+            lora_state = load_file(adapter_path)
+            fixed_state = {}
+            for k, v in lora_state.items():
+                if "lora_A" in k or "lora_B" in k:
+                    k = k.replace(".lora_A.weight", ".lora_A.default.weight")
+                    k = k.replace(".lora_B.weight", ".lora_B.default.weight")
+                fixed_state[k] = v
+        else:
+            fixed_state = {}
+        
+        options = StateDictOptions(
+            full_state_dict=True,
+            cpu_offload=False,
+            broadcast_from_rank0=True,
+            strict=False,
+        )
+        set_model_state_dict(engine.model, fixed_state, options=options)
+        logger.info(f"[Load-{model_name}] Loaded LoRA adapter from {path}")
+    
     def _run_model_eval(self, model_path, model_name, workflow_class, initial_states, group_size):
         """Evaluate a single model on initial states with verification."""
-        from areal.api.io_struct import SaveLoadMeta
         
         logger.info(f"[Eval-{model_name}] Loading weights from {model_path}")
         
         # 1. Load model weights into actor
-        load_meta = SaveLoadMeta(
-            path=model_path,
-            weight_format="hf",
-            with_optim=False,
-            tokenizer=None,
-            processor=None,
-        )
-        self.actor.load(load_meta)
+        self._load_hf_checkpoint(self.actor, model_path, model_name)
         
         # 2. Push to vLLM
         self.rollout.pause()
@@ -535,38 +577,7 @@ class TTTDDistillTrainer(PPOTrainer):
         
         # Load weights
         if is_lora_adapter:
-            # Load LoRA adapter weights manually.
-            # PEFT save_pretrained() strips the '.default' adapter suffix from keys,
-            # but FSDP-wrapped PEFT models expect it. We fix the keys here and use
-            # strict=False so only matching LoRA keys are loaded.
-            from safetensors.torch import load_file
-            from torch.distributed.checkpoint.state_dict import (
-                StateDictOptions,
-                set_model_state_dict,
-            )
-
-            adapter_path = os.path.join(
-                config.teacher_path, "adapter_model.safetensors"
-            )
-            if dist.get_rank() == 0:
-                lora_state = load_file(adapter_path)
-                fixed_state = {}
-                for k, v in lora_state.items():
-                    if "lora_A" in k or "lora_B" in k:
-                        k = k.replace(".lora_A.weight", ".lora_A.default.weight")
-                        k = k.replace(".lora_B.weight", ".lora_B.default.weight")
-                    fixed_state[k] = v
-            else:
-                fixed_state = {}
-
-            options = StateDictOptions(
-                full_state_dict=True,
-                cpu_offload=False,
-                broadcast_from_rank0=True,
-                strict=False,
-            )
-            set_model_state_dict(teacher.model, fixed_state, options=options)
-            logger.info(f"[Teacher] Loaded LoRA weights from {config.teacher_path}")
+            self._load_hf_checkpoint(teacher, config.teacher_path, "Teacher")
         elif config.teacher_weight_format == "dcp":
             from areal.api.io_struct import SaveLoadMeta
             meta = SaveLoadMeta(
@@ -1015,13 +1026,15 @@ class TTTDDistillTrainer(PPOTrainer):
                 ("teacher", self.teacher_eval_path),
                 ("student", self.student_eval_path),
             ]:
+                if dist.is_initialized():
+                    dist.barrier()
                 all_results[label] = self._run_model_eval(
                     path, label, workflow, initial_states, group_size
                 )
             
             # Restore student weights
             logger.info("[Eval] Restoring student weights")
-            self.actor.load(student_backup_meta)
+            self._load_hf_checkpoint(self.actor, self.student_eval_path, "StudentRestore")
             self.rollout.pause()
             self.actor.update_weights(self.weight_update_meta)
             self.rollout.resume()
@@ -1049,6 +1062,10 @@ class TTTDDistillTrainer(PPOTrainer):
                         f"children={r['n_children']} | failed={r['n_failed']}"
                     )
                 logger.info("="*70)
+                
+            # Ensure all ranks finish evaluation before returning
+            if dist.is_initialized():
+                dist.barrier()
     
     def _save_hf(self, epoch: int, epoch_step: int, global_step: int):
         """Override parent _save_hf to remove extra barrier."""
