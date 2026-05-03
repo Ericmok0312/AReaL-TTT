@@ -763,6 +763,7 @@ class TTTDDistillTrainer(PPOTrainer):
         
         # Sequence-level rewards (already -KL)
         reward_score = rollout_batch["rewards"].squeeze(-1)  # [bs]
+        rollout_batch["rewards"] = reward_score
         
         # Optional mean baseline across all ranks
         if dist.is_initialized() and self.actor.data_parallel_world_size > 1:
