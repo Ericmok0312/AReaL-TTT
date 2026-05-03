@@ -535,17 +535,37 @@ class TTTDDistillTrainer(PPOTrainer):
         
         # Load weights
         if is_lora_adapter:
-            # Load LoRA adapter weights (always HF/PEFT format)
-            from areal.api.io_struct import SaveLoadMeta
-            meta = SaveLoadMeta(
-                path=config.teacher_path,
-                weight_format="hf",
-                with_optim=False,
-                tokenizer=None,
-                processor=None,
-                base_model_path=None,
+            # Load LoRA adapter weights manually.
+            # PEFT save_pretrained() strips the '.default' adapter suffix from keys,
+            # but FSDP-wrapped PEFT models expect it. We fix the keys here and use
+            # strict=False so only matching LoRA keys are loaded.
+            from safetensors.torch import load_file
+            from torch.distributed.checkpoint.state_dict import (
+                StateDictOptions,
+                set_model_state_dict,
             )
-            teacher.load(meta)
+
+            adapter_path = os.path.join(
+                config.teacher_path, "adapter_model.safetensors"
+            )
+            if dist.get_rank() == 0:
+                lora_state = load_file(adapter_path)
+                fixed_state = {}
+                for k, v in lora_state.items():
+                    if "lora_A" in k or "lora_B" in k:
+                        k = k.replace(".lora_A.weight", ".lora_A.default.weight")
+                        k = k.replace(".lora_B.weight", ".lora_B.default.weight")
+                    fixed_state[k] = v
+            else:
+                fixed_state = {}
+
+            options = StateDictOptions(
+                full_state_dict=True,
+                cpu_offload=False,
+                broadcast_from_rank0=True,
+                strict=False,
+            )
+            set_model_state_dict(teacher.model, fixed_state, options=options)
             logger.info(f"[Teacher] Loaded LoRA weights from {config.teacher_path}")
         elif config.teacher_weight_format == "dcp":
             from areal.api.io_struct import SaveLoadMeta
