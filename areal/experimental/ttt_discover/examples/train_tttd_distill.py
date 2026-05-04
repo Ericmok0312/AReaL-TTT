@@ -726,7 +726,13 @@ class TTTDDistillTrainer(PPOTrainer):
         if workflow_executor is not None and hasattr(workflow_executor, 'data_generator'):
             delattr(workflow_executor, 'data_generator')
             logger.info("[Distill] Cleared workflow executor cache")
-    
+
+        if hasattr(self.rollout, 'data_generator'):
+            delattr(self.rollout, 'data_generator')
+            logger.info("[Distill] Cleared rollout controller data_generator")
+
+
+
     def _compute_kl_reward(self, rollout_batch: dict[str, Any]) -> torch.Tensor:
         """Compute KL divergence reward for a rollout batch.
         
