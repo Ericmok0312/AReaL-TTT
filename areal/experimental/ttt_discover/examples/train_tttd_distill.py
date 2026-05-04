@@ -8,7 +8,7 @@ This script distills a teacher model's policy into a student model with LoRA:
 3. Student is a new model with LoRA
 4. Training: sample from teacher's PUCTSampler, student rollout (no verification)
 5. Reward = negative KL divergence between student and teacher
-6. Run N distill steps, then 1 eval step with verification
+6. Run N distill steps and save student checkpoint
 
 Usage:
     python train_tttd_distill.py --config conf/distill_lora_vllm_cp_qwen3_8b.yaml
@@ -64,27 +64,6 @@ logger = logging.getLogger("train_tttd_distill")
 
 
 # =============================================================================
-# Helper: Sampler that only returns initial states (for evaluation)
-# =============================================================================
-class _InitialStateSampler:
-    """Simple state sampler that cycles through initial states only.
-    
-    Used for evaluation to ensure all models see the same starting states.
-    """
-    def __init__(self, initial_states):
-        self._initial_states = initial_states
-        self._idx = 0
-        self._states = initial_states  # for compatibility
-    
-    def sample_states(self, num_states: int):
-        result = []
-        for _ in range(num_states):
-            result.append(self._initial_states[self._idx % len(self._initial_states)])
-            self._idx += 1
-        return result
-
-
-# =============================================================================
 # Dummy reward function for distill steps (no verification)
 # =============================================================================
 def dummy_reward_fn(prompt, completions, prompt_ids, completion_ids, **data):
@@ -124,10 +103,6 @@ class TTTDDistillConfig(TTTDPPOActorConfig):
     distill_steps: int = field(
         default=3,
         metadata={"help": "Number of distillation steps (no verification)"}
-    )
-    run_eval_step: bool = field(
-        default=True,
-        metadata={"help": "Run evaluation step with verification after distillation"}
     )
     kl_reward_scale: float = field(
         default=1.0,
@@ -392,126 +367,6 @@ class TTTDDistillTrainer(PPOTrainer):
         set_model_state_dict(engine.model, fixed_state, options=options)
         logger.info(f"[Load-{model_name}] Loaded LoRA adapter from {path}")
     
-    def _run_model_eval(self, model_path, model_name, workflow_class, initial_states, group_size):
-        """Evaluate a single model on initial states with verification."""
-        
-        logger.info(f"[Eval-{model_name}] Loading weights from {model_path}")
-        
-        # 1. Load model weights into actor
-        self._load_hf_checkpoint(self.actor, model_path, model_name)
-        
-        # 2. Push to vLLM
-        self.rollout.pause()
-        self.actor.update_weights(self.weight_update_meta)
-        self.rollout.resume()
-        
-        # Give vLLM time to load new LoRA
-        time.sleep(2)
-        
-        # 3. Create temp dataloader with initial states only
-        temp_sampler = _InitialStateSampler(initial_states)
-        eval_batch_size = min(len(initial_states), self.config.sampler.batch_size)
-        eval_batch_size = max(eval_batch_size, 1)
-        
-        temp_dataloader = create_tttd_dataloader(
-            temp_sampler,
-            rank=self.actor.data_parallel_rank,
-            world_size=self.actor.data_parallel_world_size,
-            batch_size=eval_batch_size,
-            lazy_sampling=False,
-        )
-        
-        # 4. Create eval workflow with verification
-        eval_kwargs = self._workflow_kwargs.copy()
-        eval_kwargs['reward_fn'] = tttd_reward_fn
-        eval_workflow = workflow_class(**eval_kwargs)
-        
-        self._clear_workflow_cache()
-        
-        # 5. Run rollout
-        eval_start = time.perf_counter()
-        try:
-            with stats_tracker.record_timing(f"eval_rollout_{model_name}"):
-                eval_batch = self.actor.prepare_batch(
-                    temp_dataloader,
-                    workflow=eval_workflow,
-                    workflow_kwargs=None,
-                    should_accept_fn=None,
-                    group_size=group_size,
-                    dynamic_bs=False,
-                )
-        except Exception as e:
-            logger.error(f"[Eval-{model_name}] prepare_batch failed: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            raise
-        eval_rollout_time = time.perf_counter() - eval_start
-        
-        # 6. Gather results (with all_gather for full reward distribution)
-        if "rewards" not in eval_batch:
-            logger.error(f"[Eval-{model_name}] eval_batch missing 'rewards' key. Keys: {list(eval_batch.keys())}")
-            raise KeyError(f"eval_batch missing 'rewards' key")
-        local_rollouts = eval_batch["rewards"].shape[0]
-        eval_rewards = eval_batch["rewards"].cpu().numpy()
-        eval_max_reward = float(eval_rewards.max())
-        eval_mean_reward = float(eval_rewards.mean())
-        local_rewards_list = eval_rewards.tolist()
-        
-        if dist.is_initialized():
-            local_max = torch.tensor([eval_max_reward], dtype=torch.float32, device=self.actor.device)
-            local_sum = torch.tensor([eval_rewards.sum()], dtype=torch.float32, device=self.actor.device)
-            local_count = torch.tensor([len(eval_rewards)], dtype=torch.float32, device=self.actor.device)
-            dist.all_reduce(local_max, op=dist.ReduceOp.MAX)
-            dist.all_reduce(local_sum, op=dist.ReduceOp.SUM)
-            dist.all_reduce(local_count, op=dist.ReduceOp.SUM)
-            eval_max_reward = local_max.item()
-            eval_mean_reward = (local_sum / local_count).item() if local_count.item() > 0 else 0.0
-            global_rollouts = int(local_count.item())
-            
-            # All-gather raw rewards from all ranks for full distribution analysis
-            world_size = self.actor.data_parallel_world_size
-            all_rewards_gathered = [None] * world_size
-            dist.all_gather_object(all_rewards_gathered, local_rewards_list)
-            all_rewards_list = [r for rank_rewards in all_rewards_gathered for r in rank_rewards]
-        else:
-            global_rollouts = local_rollouts
-            all_rewards_list = local_rewards_list
-        
-        # 7. Get pending updates (verification details)
-        eval_updates = eval_workflow.get_pending_updates(clear=True)
-        if len(eval_updates) == 5:
-            eval_children, eval_parents, eval_failed, eval_metadata, _ = eval_updates
-        else:
-            eval_children, eval_parents, eval_failed, eval_metadata = eval_updates
-        
-        result = {
-            "model": model_name,
-            "global_rollouts": global_rollouts,
-            "max_reward": eval_max_reward,
-            "mean_reward": eval_mean_reward,
-            "all_rewards": all_rewards_list,
-            "n_children": len(eval_children),
-            "n_parents": len(eval_parents),
-            "n_failed": len(eval_failed),
-            "rollout_time_s": eval_rollout_time,
-            "children": [],
-        }
-        
-        for child in eval_children:
-            result["children"].append({
-                "id": child.id,
-                "timestep": child.timestep,
-                "value": child.value,
-                "code": getattr(child, 'code', None),
-            })
-        
-        logger.info(
-            f"[Eval-{model_name}] max={eval_max_reward:.4f}, mean={eval_mean_reward:.4f}, "
-            f"children={len(eval_children)}, failed={len(eval_failed)}"
-        )
-        
-        return result
-    
     def _create_tttd_actor(self, actor_config: TTTDDistillConfig):
         """Create student TTTDActor."""
         actor = TTTDActor(config=actor_config)
@@ -628,7 +483,7 @@ class TTTDDistillTrainer(PPOTrainer):
     
     def _initialize_engines(self):
         """Initialize training engines."""
-        max_steps = self.config.distill_steps + (1 if self.config.run_eval_step else 0)
+        max_steps = self.config.distill_steps
         ft_spec = FinetuneSpec(
             total_train_epochs=max_steps,
             dataset_size=max_steps * self.config.sampler.batch_size,
@@ -687,7 +542,7 @@ class TTTDDistillTrainer(PPOTrainer):
         """Setup evaluator, saver, recover handler, and stats logger."""
         config = self.config
         
-        max_steps = config.distill_steps + (1 if config.run_eval_step else 0)
+        max_steps = config.distill_steps
         ft_spec = FinetuneSpec(
             total_train_epochs=max_steps,
             dataset_size=max_steps * config.sampler.batch_size,
@@ -864,7 +719,6 @@ class TTTDDistillTrainer(PPOTrainer):
         logger.info(
             f"[Distill] Starting distillation: "
             f"distill_steps={config.distill_steps}, "
-            f"eval_step={config.run_eval_step}, "
             f"total_rollouts_per_step={total_rollouts}, "
             f"kl_scale={config.kl_reward_scale}"
         )
@@ -1007,80 +861,22 @@ class TTTDDistillTrainer(PPOTrainer):
             )
         
         # =====================================================================
-        # Phase 2: Evaluation step (with verification)
+        # Save final student checkpoint for separate evaluation
         # =====================================================================
-        if config.run_eval_step:
-            eval_step = config.distill_steps
-            logger.info(f"[Eval][Step {eval_step}] Starting 3-model comparison on initial states")
-            
-            # Get initial states
-            initial_states = self.sampler._initial_states
-            if not initial_states:
-                initial_states = [s for s in self.sampler._states if getattr(s, 'timestep', 0) == 0]
-            if not initial_states:
-                initial_states = self.sampler._states[:1]
-                logger.warning("[Eval] No initial states found, using first available state")
-            
-            logger.info(f"[Eval] Using {len(initial_states)} initial states for evaluation")
-            
-            # Save current student weights before switching
-            from areal.api.io_struct import SaveLoadMeta
-            student_backup_meta = SaveLoadMeta(
-                path=self.student_eval_path,
-                weight_format="hf",
-                with_optim=False,
-                tokenizer=None,
-                processor=None,
-            )
-            self.actor.save(student_backup_meta)
-            
-            # Evaluate three models
-            all_results = {}
-            for label, path in [
-                ("base", self.base_eval_path),
-                ("teacher", self.teacher_eval_path),
-                ("student", self.student_eval_path),
-            ]:
-                if dist.is_initialized():
-                    dist.barrier()
-                all_results[label] = self._run_model_eval(
-                    path, label, workflow, initial_states, group_size
-                )
-            
-            # Restore student weights
-            logger.info("[Eval] Restoring student weights")
-            self._load_hf_checkpoint(self.actor, self.student_eval_path, "StudentRestore")
-            self.rollout.pause()
-            self.actor.update_weights(self.weight_update_meta)
-            self.rollout.resume()
-            
-            # Save comparison results
-            if is_dp_head:
-                comparison_path = os.path.join(
-                    config.saver.fileroot,
-                    f"eval_comparison_step_{eval_step}.json"
-                )
-                with open(comparison_path, 'w') as f:
-                    json.dump(all_results, f, indent=2, default=str)
-                logger.info(f"[Eval] Comparison results saved to {comparison_path}")
-                
-                # Print summary table
-                logger.info("\n" + "="*70)
-                logger.info("EVALUATION COMPARISON (Initial States)")
-                logger.info("="*70)
-                for label in ["base", "teacher", "student"]:
-                    r = all_results[label]
-                    logger.info(
-                        f"{label:10s} | max_reward={r['max_reward']:.4f} | "
-                        f"mean_reward={r['mean_reward']:.4f} | "
-                        f"rollouts={r['global_rollouts']} | "
-                        f"children={r['n_children']} | failed={r['n_failed']}"
-                    )
-                logger.info("="*70)
-                
-            # Ensure all ranks finish evaluation before returning
-            if dist.is_initialized():
-                dist.barrier()
+        from areal.api.io_struct import SaveLoadMeta
+        student_meta = SaveLoadMeta(
+            path=self.student_eval_path,
+            weight_format="hf",
+            with_optim=False,
+            tokenizer=None,
+            processor=None,
+        )
+        self.actor.save(student_meta)
+        if is_dp_head:
+            logger.info(f"[Distill] Saved student checkpoint to {self.student_eval_path}")
+        
+        if dist.is_initialized():
+            dist.barrier(group=self.actor.cpu_group)
     
     def _save_hf(self, epoch: int, epoch_step: int, global_step: int):
         """Override parent _save_hf to remove extra barrier."""
@@ -1203,7 +999,7 @@ def main(args):
         
         logger.info(f"[LoRA Check] LoRA adapter verified at {lora_output_path}")
     
-    # Create environment (needed for eval workflow)
+    # Create environment (needed for workflow)
     env = create_env_from_config(config)
     
     # Calculate local batch size
