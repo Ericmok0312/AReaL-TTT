@@ -1,155 +1,84 @@
-# TTT-Discover Distillation Config for AC1 (Inequality) with Qwen3-8B
-# Distills a trained teacher policy into a new student LoRA using KL divergence as reward.
-#
-# Prerequisites:
-#   1. Have a trained teacher checkpoint (LoRA adapter + sampler states)
-#   2. Run prepare_lora_init.py to create student initial LoRA
-#
-# Usage:
-#   python prepare_lora_init.py --config-path conf/fsdp_lora_vllm_ac1_qwen3_8b_distill.yaml
-#   torchrun --nproc_per_node=8 train_tttd_distill.py --config-path conf/fsdp_lora_vllm_ac1_qwen3_8b_distill.yaml
-
 experiment_name: tttd-distill-qwen3-8b-ac1
 trial_name: trial0
-
 is_tttd_config: true
-
 seed: 1
 enable_offload: false
-
-# Distillation steps (no verification during these steps)
 max_steps: 1
 total_train_epochs: 1
-
-path: Qwen/Qwen3-8B
 enable_thinking: true
 reset_puct_stats_on_resume: false
-init_from_scratch: false
-disable_dropout: true
-gradient_checkpointing: true
-dtype: bfloat16
-
-# =============================================================================
-# TEACHER CONFIGURATION (REQUIRED)
-# =============================================================================
-# Path to teacher LoRA adapter (HF PEFT format with adapter_config.json)
-# This should point to a finished TTT-Discover training run's LoRA output.
 teacher_path: ./outputs_ac1_async_v2/checkpoints/eric/tttd-async-qwen3-8b-ac1/trial0/default/epoch49epochstep49globalstep49
-
-# Path to teacher PUCTSampler checkpoint directory
-# The sampler contains the tree search state (states, n, m, Q, etc.)
 teacher_sampler_checkpoint: ./outputs_ac1_async_v2/tttd-async-qwen3-8b-ac1/trial0/sampler
-
-# Teacher checkpoint format: 'hf' (default) or 'dcp'
 teacher_weight_format: hf
-
-# =============================================================================
-# DISTILLATION HYPERPARAMETERS
-# =============================================================================
-# Number of distillation steps (each step = batch_size * n_samples rollouts,
-# no verification, KL divergence as reward)
 distill_steps: 1
-
-# Run evaluation with real verification after distillation
 run_eval_step: true
-
-# Scale factor for KL reward: reward = -kl_reward_scale * KL(student || teacher)
-# Higher = stronger pressure to match teacher
 kl_reward_scale: 1.0
-
-# KL estimator: k1 (default, unbiased), k2 (negative-biased), k3 (positive-biased)
 kl_estimator_type: k1
-
-# Total rollouts per step (batch_size * n_samples, validated by script)
 total_rollouts_per_step: 1
-
-# =============================================================================
-# OPTIMIZER (student LoRA)
-# =============================================================================
-mb_spec:
-  max_tokens_per_mb: 32768
-  n_mbs: 1
-  granularity: 1
-
-optimizer:
-  type: adam
-  lr: 4e-5
-  weight_decay: 0.01
-  beta1: 0.9
-  beta2: 0.95
-  eps: 1e-8
-  lr_scheduler_type: constant
-  gradient_clipping: 1.0
-  warmup_steps_proportion: 0.001
-
-# PPO settings (distillation still uses PPO update)
-eps_clip: 0.4
-temperature: ${gconfig.temperature}
-reward_scaling: 10.0
-reward_bias: -0.5
-
-# CRITICAL: kl_ctl MUST be 0 for distillation because KL itself is the reward
-kl_ctl: 0.0
-
-ppo_n_minibatches: 1
-recompute_logprob: true
-use_decoupled_loss: true
-rejection_sampling:
-  level: token
-  action: mask
-  metric: ratio
-  upper: 5.0
-
-# No reward normalization needed (KL is deterministic)
-reward_norm:
-  mean_level: group
-  std_level: group
-  group_size: ${gconfig.n_samples}
-
-adv_norm:
-  mean_level: batch
-  std_level: batch
-
-max_new_tokens: ${gconfig.max_new_tokens}
-
-# =============================================================================
-# STUDENT LoRA (should match teacher architecture)
-# =============================================================================
-use_lora: true
-peft_type: lora
-lora_rank: 32
-lora_alpha: 16
-target_modules: [all-linear]
-weight_update_mode: xccl
-
-# Simple mean_baseline advantage for distillation
-adv_estimator: mean_baseline
-adv_estimator_beta: 1.0
-adv_estimator_target_kl: 0.693
-adv_estimator_beta_max: 1000000.0
-adv_estimator_beta_iters: 60
-
-scheduling_spec:
+actor:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: Qwen/Qwen3-8B
+  dtype: bfloat16
+  mb_spec:
+    max_tokens_per_mb: 32768
+    n_mbs: 1
+    granularity: 1
+  scheduling_spec:
   - task_type: worker
     port_count: 2
     gpu: 1
     mem: 32
     cmd: python3 -m areal.infra.rpc.rpc_server
     env_vars: {}
-
-actor:
-  experiment_name: ${experiment_name}
-  trial_name: ${trial_name}
-  path: ${path}
-  dtype: ${dtype}
-  mb_spec:
-    max_tokens_per_mb: 32768
-    n_mbs: 1
-    granularity: 1
-  scheduling_spec: ${scheduling_spec}
-
-tokenizer_path: ${path}
-
+  backend: fsdp:d4p1t1
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  optimizer:
+    type: adam
+    lr: 4e-5
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.95
+    eps: 1e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.001
+  eps_clip: 0.4
+  temperature: ${gconfig.temperature}
+  reward_scaling: 10.0
+  reward_bias: -0.5
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  rejection_sampling:
+    level: token
+    action: mask
+    metric: ratio
+    upper: 5.0
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+  max_new_tokens: ${gconfig.max_new_tokens}
+  use_lora: true
+  peft_type: lora
+  lora_rank: 32
+  lora_alpha: 16
+  target_modules:
+  - all-linear
+  weight_update_mode: xccl
+  adv_estimator: mean_baseline
+  adv_estimator_beta: 1.0
+  adv_estimator_target_kl: 0.693
+  adv_estimator_beta_max: 1000000.0
+  adv_estimator_beta_iters: 60
+tokenizer_path: ${actor.path}
 cluster:
   n_nodes: 1
   n_gpus_per_node: 8
@@ -157,29 +86,24 @@ cluster:
   name_resolve:
     type: nfs
     nfs_record_root: /tmp/areal/name_resolve
-
 allocation_mode: vllm[rollout]:d4p1t1+fsdp[actor]:d4p1t1
-backend: fsdp:d4p1t1
-
 scheduler:
   type: null
-
 rollout:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 512
   queue_size: null
   consumer_batch_size: ${sampler.batch_size}
-  # Sync mode for distillation (simpler, no async complexity)
   max_head_offpolicyness: 0
   enable_rollout_tracing: false
   pause_grace_period: 1.0
-  scheduling_spec: ${scheduling_spec}
+  scheduling_spec: ${actor.scheduling_spec}
   fileroot: ${cluster.fileroot}
   tokenizer_path: ${tokenizer_path}
   dump_to_file: true
-  use_lora: ${use_lora}
-
+  use_lora: ${actor.use_lora}
+  backend: vllm:d4p1t1
 gconfig:
   n_samples: 1
   min_new_tokens: 0
@@ -189,18 +113,15 @@ gconfig:
   temperature: 1.0
   top_p: 0.95
   lora_name: tttd_lora_adapter
-
 max_prompt_thinking_tokens: 26000
-
-# Ref model not needed (kl_ctl=0), but keep for compatibility
 ref:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  path: ${path}
+  path: ${actor.path}
   init_from_scratch: false
   disable_dropout: true
   gradient_checkpointing: false
-  dtype: ${dtype}
+  dtype: ${actor.dtype}
   mb_spec:
     max_tokens_per_mb: 32768
     n_mbs: 1
@@ -208,21 +129,20 @@ ref:
   scheduling_strategy:
     type: colocation
     target: actor
-  scheduling_spec: ${scheduling_spec}
-
+  scheduling_spec: ${actor.scheduling_spec}
+  backend: fsdp:d4p1t1
 vllm:
-  model: ${path}
+  model: ${actor.path}
   seed: ${seed}
   skip_tokenizer_init: false
-  dtype: ${dtype}
+  dtype: ${actor.dtype}
   max_model_len: 32768
   gpu_memory_utilization: 0.85
   enforce_eager: false
-  enable_lora: ${use_lora}
+  enable_lora: ${actor.use_lora}
   max_lora_rank: 32
-  # Student's initial LoRA (created by prepare_lora_init.py)
-  lora_modules: '{"name": "${gconfig.lora_name}", "path": "./lora_init_ac1_distill", "base_model_name": "${path}"}'
-
+  lora_modules: '{"name": "${gconfig.lora_name}", "path": "./lora_init_ac1_distill",
+    "base_model_name": "${actor.path}"}'
 sampler:
   type: puct
   batch_size: 8
@@ -241,15 +161,12 @@ sampler:
   num_cpus: 2
   gpu_type: H100
   n: 100
-
 train_dataset:
   batch_size: ${sampler.batch_size}
   max_length: 32768
-
 valid_dataset:
   batch_size: 8
   max_length: 32768
-
 saver:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
@@ -257,16 +174,14 @@ saver:
   freq_epochs: 1
   freq_steps: 1
   freq_secs: null
-
 recover:
-  mode: "on"
+  mode: 'on'
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
   freq_epochs: 1
   freq_steps: 1
   freq_secs: 3600
-
 evaluator:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
@@ -274,7 +189,6 @@ evaluator:
   freq_epochs: 1
   freq_steps: null
   freq_secs: null
-
 stats_logger:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
@@ -283,7 +197,6 @@ stats_logger:
     mode: disabled
     project: tttd-distill-qwen3-8b-ac1
     entity: null
-
 perf_tracer:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}

@@ -1,13 +1,6 @@
-# vLLM Server Configuration (4 GPUs)
-# This is used ONLY for launching vLLM server
-# Training uses fsdp_lora_vllm.yaml with 8 GPUs
-
 experiment_name: tttd-lora-vllm
 trial_name: trial0
-
 seed: 1
-
-# Use 4 GPUs for vLLM inference
 cluster:
   n_nodes: 1
   n_gpus_per_node: 4
@@ -15,23 +8,17 @@ cluster:
   name_resolve:
     type: nfs
     nfs_record_root: /tmp/areal/name_resolve
-
-# vLLM allocation: 4 GPUs for inference
 allocation_mode: vllm[rollout]:d4p1t1+fsdp[actor]:d4p1t1
-backend: fsdp:d4p1t1
-
-# Minimal rollout config for vLLM server
 rollout:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   scheduling_spec:
-    - task_type: worker
-      port_count: 2
-      gpu: 1
-      mem: 32
-      cmd: python3 -m areal.infra.rpc.rpc_server
-
-# vLLM Configuration
+  - task_type: worker
+    port_count: 2
+    gpu: 1
+    mem: 32
+    cmd: python3 -m areal.infra.rpc.rpc_server
+  backend: vllm:d4p1t1
 vllm:
   model: Qwen/Qwen2.5-1.5B-Instruct
   seed: ${seed}
@@ -42,4 +29,7 @@ vllm:
   enforce_eager: true
   enable_lora: true
   max_lora_rank: 32
-  lora_modules: '{"name": "tttd_lora_adapter", "path": "./lora_init", "base_model_name": "Qwen/Qwen2.5-1.5B-Instruct"}'
+  lora_modules:
+  - '{"name": "tttd_lora_adapter", "path": "./lora_init", "base_model_name": "Qwen/Qwen2.5-1.5B-Instruct"}'
+actor:
+  backend: fsdp:d4p1t1

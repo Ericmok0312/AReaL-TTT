@@ -22,7 +22,7 @@ from areal.utils.saver import Saver
 from areal.utils.stats_logger import StatsLogger
 
 from areal.experimental.ttt_discover.config import (
-    TTTDPPOActorConfig,
+    TTTDPPOConfig,
     create_env_from_config,
 )
 from areal.experimental.ttt_discover.actor import TTTDActor
@@ -99,13 +99,13 @@ def _format_sampler_summary(sampler, title: str = "Sampler State") -> str:
 
 
 def main(args):
-    config, _ = load_expr_config(args, TTTDPPOActorConfig)
-    config: TTTDPPOActorConfig
+    config, _ = load_expr_config(args, TTTDPPOConfig)
+    config: TTTDPPOConfig
     
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
     
     # Create actor first to get correct dp_rank
-    actor = TTTDActor(config=config)
+    actor = TTTDActor(config=config.actor)
     allocation_mode = AllocationMode.from_str(config.allocation_mode)
     parallel_strategy = allocation_mode["actor"].parallel
     assert parallel_strategy is not None
@@ -199,7 +199,7 @@ def main(args):
     # ============================================================
     # Verify LoRA adapter exists
     # ============================================================
-    if config.use_lora and not config.skip_lora_check:
+    if config.actor.use_lora and not config.skip_lora_check:
         import json
         lora_output_path = "./lora_init"
         # Support both dict (legacy) and vLLMConfig dataclass
@@ -240,23 +240,23 @@ def main(args):
             logger.info(f"[LoRA Check] ✓ LoRA adapter verified at {lora_output_path}")
     
     # Weight update meta
-    if config.weight_update_mode == "disk":
+    if config.actor.weight_update_mode == "disk":
         weight_update_meta = WeightUpdateMeta.from_disk(
             config.saver.experiment_name,
             config.saver.trial_name,
             config.saver.fileroot,
-            use_lora=config.use_lora,
+            use_lora=config.actor.use_lora,
             lora_name=config.gconfig.lora_name,
             lora_int_id=1,
-            base_model_name=config.path,
+            base_model_name=config.actor.path,
         )
     else:
         weight_update_meta = WeightUpdateMeta.from_fsdp_xccl(
             allocation_mode,
-            use_lora=config.use_lora,
+            use_lora=config.actor.use_lora,
             lora_name=config.gconfig.lora_name,
             lora_int_id=1,
-            base_model_name=config.path,
+            base_model_name=config.actor.path,
         )
     
     rollout = RemotevLLMEngine(config.rollout)
@@ -266,7 +266,7 @@ def main(args):
     actor.connect_sampler(sampler)  # Connect sampler to actor for internal use and synchronization
 
     ref = None
-    if config.kl_ctl > 0 and config.ref is not None:
+    if config.actor.kl_ctl > 0 and config.ref is not None:
         # Reference model uses DP-only strategy to avoid TP + torch.compile issues
         from areal.api.alloc_mode import ParallelStrategy
         ref_parallel_strategy = ParallelStrategy(
@@ -728,7 +728,7 @@ def main(args):
         }
         
         # Training (same as V1)
-        if config.should_compute_prox_logp():
+        if config.actor.should_compute_prox_logp():
             with stats_tracker.record_timing("recompute_logp"):
                 batch["prox_logp"] = actor.compute_logp(batch)
         

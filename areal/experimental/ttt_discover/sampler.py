@@ -1198,14 +1198,14 @@ def create_sampler_from_config(
     max_version_history: int | None = None,
 ) -> StateSampler:
     """
-    Create sampler from TTTDPPOActorConfig.sampler configuration.
+    Create sampler from TTTDPPOConfig.sampler configuration.
     
     TTT-Discover does not require a traditional dataset as PUCTSampler
     manages states internally. Initial states are created based on
     config.initial_exp_type and config.env_type.
     
     Args:
-        config: SamplerConfig dataclass from TTTDPPOActorConfig
+        config: SamplerConfig dataclass from TTTDPPOConfig
         log_path: Optional override for log path (defaults to config.checkpoint_dir)
         env_type: Environment type identifier
         max_version_history: Maximum number of PUCT version snapshots to keep.

@@ -24,10 +24,10 @@ sys.path.insert(0, str(project_root))
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from areal.api.cli_args import load_expr_config
-from areal.experimental.ttt_discover.config import TTTDPPOActorConfig
+from areal.experimental.ttt_discover.config import TTTDPPOConfig
 
 
-def create_initial_lora(config: TTTDPPOActorConfig) -> str:
+def create_initial_lora(config: TTTDPPOConfig) -> str:
     """Create initial LoRA adapter for vLLM to load at startup."""
     
     # Extract lora_modules path from vllm config
@@ -61,9 +61,9 @@ def create_initial_lora(config: TTTDPPOActorConfig) -> str:
         return lora_output_path
     
     print(f"Creating initial LoRA adapter...")
-    print(f"  Base model: {config.path}")
+    print(f"  Base model: {config.actor.path}")
     print(f"  Output path: {lora_output_path}")
-    print(f"  LoRA rank: {config.lora_rank}, alpha: {config.lora_alpha}")
+    print(f"  LoRA rank: {config.actor.lora_rank}, alpha: {config.actor.lora_alpha}")
     
     # Create parent directory
     parent_dir = os.path.dirname(lora_output_path)
@@ -73,23 +73,23 @@ def create_initial_lora(config: TTTDPPOActorConfig) -> str:
     # Load base model
     print("Loading base model...")
     model = AutoModelForCausalLM.from_pretrained(
-        config.path,
+        config.actor.path,
         torch_dtype="auto",
         device_map="cpu",
     )
     
     # Load tokenizer
-    tok_path = config.tokenizer_path or config.path
+    tok_path = config.tokenizer_path or config.actor.path
     print(f"Loading tokenizer from {tok_path}...")
     tokenizer = AutoTokenizer.from_pretrained(tok_path)
     
     # Configure LoRA
-    target_modules = config.target_modules if config.target_modules else ["all-linear"]
+    target_modules = config.actor.target_modules if config.actor.target_modules else ["all-linear"]
     target_mods = "all-linear" if target_modules == ["all-linear"] else target_modules
     
     lora_config = LoraConfig(
-        r=config.lora_rank,
-        lora_alpha=config.lora_alpha,
+        r=config.actor.lora_rank,
+        lora_alpha=config.actor.lora_alpha,
         target_modules=target_mods,
         bias="none",
         task_type="CAUSAL_LM",
@@ -125,14 +125,14 @@ def main():
     
     # Load config
     # Try TTTDDistillConfig first (for distillation configs with teacher_path),
-    # fall back to TTTDPPOActorConfig for standard training configs.
+    # fall back to TTTDPPOConfig for standard training configs.
     try:
         from areal.experimental.ttt_discover.config import TTTDDistillConfig
         config, _ = load_expr_config([f"--config={args.config_path}"], TTTDDistillConfig)
     except Exception:
-        config, _ = load_expr_config([f"--config={args.config_path}"], TTTDPPOActorConfig)
+        config, _ = load_expr_config([f"--config={args.config_path}"], TTTDPPOConfig)
     
-    if not config.use_lora:
+    if not config.actor.use_lora:
         print("LoRA is not enabled in config (use_lora=false). Nothing to do.")
         return
     

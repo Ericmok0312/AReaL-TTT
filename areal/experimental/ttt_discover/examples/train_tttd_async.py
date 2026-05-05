@@ -47,6 +47,7 @@ from areal.utils.recover import RecoverHandler
 from areal.experimental.ttt_discover.config import (
     SamplerConfig, 
     TTTDPPOActorConfig,
+    TTTDPPOConfig,
     create_env_from_config,
 )
 from areal.experimental.ttt_discover.sampler import create_sampler_from_config
@@ -71,7 +72,7 @@ class TTTDPPOTrainer(PPOTrainer):
     - Original recovery handling
     """
     
-    def __init__(self, config: TTTDPPOActorConfig):
+    def __init__(self, config: TTTDPPOConfig):
         # Initialize basic attributes first
         self.config = config
         rank = int(__import__('os').getenv("RANK", "0"))
@@ -113,13 +114,12 @@ class TTTDPPOTrainer(PPOTrainer):
         )
         
         # Create TTTDActor (no critic - TTT-Discover doesn't use value function)
-        # Pass full config (TTTDPPOActorConfig) instead of config.actor to enable
-        # entropic advantage computation with adv_estimator settings
-        self.actor = self._create_tttd_actor(config)
+        # Pass actor config for entropic advantage computation with adv_estimator settings
+        self.actor = self._create_tttd_actor(config.actor)
         # No critic - TTT-Discover uses entropic objective without value function
         self.ref = None
-        # Use top-level config.kl_ctl instead of config.actor.kl_ctl
-        if config.kl_ctl > 0 and config.ref is not None:
+        # Use actor-level kl_ctl
+        if config.actor.kl_ctl > 0 and config.ref is not None:
             # ref model only needs PPOActorConfig (no adv_estimator needed)
             self.ref = self._create_tttd_actor(config.ref)
         
@@ -222,9 +222,8 @@ class TTTDPPOTrainer(PPOTrainer):
         """Setup weight update meta and connect to inference engine."""
         config = self.config
         
-        # Use top-level config values (same as train_tttd_vllm_v2.py)
-        # because TTTDPPOActorConfig inherits these from PPOActorConfig
-        if config.weight_update_mode == "disk":
+        # Use actor-level config values
+        if config.actor.weight_update_mode == "disk":
             disk_kwargs = {
                 "experiment_name": config.experiment_name,
                 "trial_name": config.trial_name,
@@ -232,32 +231,32 @@ class TTTDPPOTrainer(PPOTrainer):
                 "name": "default",
                 "clear_checkpoint_after_load": True,
             }
-            if config.use_lora:
+            if config.actor.use_lora:
                 disk_kwargs.update({
-                    "use_lora": config.use_lora,
+                    "use_lora": config.actor.use_lora,
                     "lora_name": config.gconfig.lora_name,
                     "lora_int_id": 1,
-                    "base_model_name": config.path,
+                    "base_model_name": config.actor.path,
                 })
             self.weight_update_meta = WeightUpdateMeta.from_disk(**disk_kwargs)
-        elif config.weight_update_mode == "xccl":
+        elif config.actor.weight_update_mode == "xccl":
             if self.allocation_mode.train_backend == "megatron":
                 self.weight_update_meta = WeightUpdateMeta.from_megatron_xccl(
                     self.allocation_mode
                 )
             else:
                 xccl_kwargs = {"allocation_mode": self.allocation_mode}
-                if config.use_lora:
+                if config.actor.use_lora:
                     xccl_kwargs.update({
-                        "use_lora": config.use_lora,
+                        "use_lora": config.actor.use_lora,
                         "lora_name": config.gconfig.lora_name,
                         "lora_int_id": 1,
-                        "base_model_name": config.path,
+                        "base_model_name": config.actor.path,
                     })
                 self.weight_update_meta = WeightUpdateMeta.from_fsdp_xccl(**xccl_kwargs)
         else:
             raise ValueError(
-                f"Invalid weight update mode: {config.weight_update_mode}"
+                f"Invalid weight update mode: {config.actor.weight_update_mode}"
             )
         
         self.actor.connect_engine(self.rollout, self.weight_update_meta)
@@ -996,10 +995,7 @@ class TTTDPPOTrainer(PPOTrainer):
                 "reward/best_overall": best_reward,
             }
             
-            # FIX: Use config.should_compute_prox_logp() instead of config.actor.should_compute_prox_logp()
-            # because the actor config is nested and doesn't inherit top-level settings like
-            # use_decoupled_loss and recompute_logprob
-            if config.should_compute_prox_logp():
+            if config.actor.should_compute_prox_logp():
                 rollout_batch["prox_logp"] = self.actor.compute_logp(rollout_batch)
                 logger.info(f"[Rank {self.actor.dp_rank}][Step {global_step}] compute_logp done, prox_logp shape: {rollout_batch['prox_logp'].shape}, dtype: {rollout_batch['prox_logp'].dtype}")
             else:
@@ -1292,7 +1288,7 @@ def main(args):
     import os
     from areal.utils import logging
     
-    config, _ = load_expr_config(args, TTTDPPOActorConfig)
+    config, _ = load_expr_config(args, TTTDPPOConfig)
     
     # Ensure stop tokens are set
     if config.tokenizer_path:
@@ -1306,7 +1302,7 @@ def main(args):
     # ============================================================
     # Verify LoRA adapter exists (same as train_tttd_vllm_v2.py)
     # ============================================================
-    if config.use_lora and not config.skip_lora_check:
+    if config.actor.use_lora and not config.skip_lora_check:
         lora_output_path = "./lora_init"
         # Support both dict (legacy) and vLLMConfig dataclass
         if hasattr(config, 'vllm'):

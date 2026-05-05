@@ -28,6 +28,7 @@ from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 
 from areal.experimental.ttt_discover.config import (
     SamplerConfig,
+    TTTDPPOActorConfig,
     TTTDDistillConfig,
     create_env_from_config,
 )
@@ -125,7 +126,7 @@ class TTTDEvalTrainer(PPOTrainer):
         )
         
         # Create actor (no critic/ref - eval only)
-        self.actor = self._create_tttd_actor(config)
+        self.actor = self._create_tttd_actor(config.actor)
         self.ref = None
         
         # Create dataloader
@@ -160,11 +161,11 @@ class TTTDEvalTrainer(PPOTrainer):
         
         # Setup eval checkpoint paths
         eval_ckpt_dir = os.path.join(config.saver.fileroot, "eval_checkpoints")
-        self.base_eval_path = config.path  # base model path
+        self.base_eval_path = config.actor.path  # base model path
         self.teacher_eval_path = config.teacher_path
         self.student_eval_path = os.path.join(eval_ckpt_dir, "student")
     
-    def _create_tttd_actor(self, actor_config: TTTDDistillConfig):
+    def _create_tttd_actor(self, actor_config: TTTDPPOActorConfig):
         """Create TTTDActor."""
         actor = TTTDActor(config=actor_config)
         actor.create_process_group(parallel_strategy=self.allocation_mode.train)
@@ -182,7 +183,7 @@ class TTTDEvalTrainer(PPOTrainer):
     def _setup_weight_update_meta(self):
         """Setup weight update meta and connect to inference engine."""
         config = self.config
-        if config.weight_update_mode == "disk":
+        if config.actor.weight_update_mode == "disk":
             disk_kwargs = {
                 "experiment_name": config.experiment_name,
                 "trial_name": config.trial_name,
@@ -190,29 +191,29 @@ class TTTDEvalTrainer(PPOTrainer):
                 "name": "default",
                 "clear_checkpoint_after_load": True,
             }
-            if config.use_lora:
+            if config.actor.use_lora:
                 disk_kwargs.update({
-                    "use_lora": config.use_lora,
+                    "use_lora": config.actor.use_lora,
                     "lora_name": config.gconfig.lora_name,
                     "lora_int_id": 1,
-                    "base_model_name": config.path,
+                    "base_model_name": config.actor.path,
                 })
             self.weight_update_meta = WeightUpdateMeta.from_disk(**disk_kwargs)
-        elif config.weight_update_mode == "xccl":
+        elif config.actor.weight_update_mode == "xccl":
             if self.allocation_mode.train_backend == "megatron":
                 self.weight_update_meta = WeightUpdateMeta.from_megatron_xccl(self.allocation_mode)
             else:
                 xccl_kwargs = {"allocation_mode": self.allocation_mode}
-                if config.use_lora:
+                if config.actor.use_lora:
                     xccl_kwargs.update({
-                        "use_lora": config.use_lora,
+                        "use_lora": config.actor.use_lora,
                         "lora_name": config.gconfig.lora_name,
                         "lora_int_id": 1,
-                        "base_model_name": config.path,
+                        "base_model_name": config.actor.path,
                     })
                 self.weight_update_meta = WeightUpdateMeta.from_fsdp_xccl(**xccl_kwargs)
         else:
-            raise ValueError(f"Invalid weight update mode: {config.weight_update_mode}")
+            raise ValueError(f"Invalid weight update mode: {config.actor.weight_update_mode}")
         
         self.actor.connect_engine(self.rollout, self.weight_update_meta)
     

@@ -1,244 +1,139 @@
 # areal/experimental/ttt_discover/config.py
 from dataclasses import dataclass, field
-from typing import Optional, Any
+
 from areal.api.cli_args import (
     PPOActorConfig,
-    TeacherConfig,
-    ClusterSpecConfig,
-    StatsLoggerConfig,
-    SaverConfig,
-    InferenceEngineConfig,
-    EvaluatorConfig,
-    RecoverConfig,
-    GenerationHyperparameters,
-    MicroBatchSpec,
-    PPOCriticConfig,
-    vLLMConfig,
-    SGLangConfig,
-    PerfTracerConfig,
+    PPOConfig,
 )
 
 
 @dataclass
 class SamplerConfig:
     """Configuration for PUCTSampler"""
+
     type: str = field(
         default="puct",
-        metadata={"help": "Sampler type: 'puct' or 'random'"}
+        metadata={"help": "Sampler type: 'puct' or 'random'"},
     )
     batch_size: int = field(
         default=8,
-        metadata={"help": "Number of parent states to sample per step"}
+        metadata={"help": "Number of parent states to sample per step"},
     )
     # PUCT parameters
     c_puct: float = field(
         default=1.5,
-        metadata={"help": "PUCT exploration constant"}
+        metadata={"help": "PUCT exploration constant"},
     )
     gamma: float = field(
         default=0.95,
-        metadata={"help": "Discount factor for future rewards"}
+        metadata={"help": "Discount factor for future rewards"},
     )
     max_children: int = field(
         default=100,
-        metadata={"help": "Maximum children per state"}
+        metadata={"help": "Maximum children per state"},
     )
     # State management
     max_states: int = field(
         default=10000,
-        metadata={"help": "Maximum number of states to keep in memory"}
+        metadata={"help": "Maximum number of states to keep in memory"},
     )
     top_k: int = field(
         default=1000,
-        metadata={"help": "Keep top-k states after each iteration"}
+        metadata={"help": "Keep top-k states after each iteration"},
     )
     # Exploration
     temperature: float = field(
         default=1.0,
-        metadata={"help": "Temperature for state sampling"}
+        metadata={"help": "Temperature for state sampling"},
     )
     # Checkpointing
     save_freq: int = field(
         default=100,
-        metadata={"help": "Save sampler state every N steps"}
+        metadata={"help": "Save sampler state every N steps"},
     )
-    checkpoint_dir: Optional[str] = field(
+    checkpoint_dir: str | None = field(
         default=None,
-        metadata={"help": "Directory to save sampler checkpoints"}
+        metadata={"help": "Directory to save sampler checkpoints"},
     )
-    
+
     # Initial state
     initial_exp_type: str = field(
         default="best_available",
-        metadata={"help": "Initial experience type: 'best_available', 'none', 'random', 'random_no_code'"}
+        metadata={"help": "Initial experience type: 'best_available', 'none', 'random', 'random_no_code'"},
     )
-    
+
     # Environment type for initial state creation
     env_type: str = field(
         default="cp",
-        metadata={"help": "Environment type: 'cp', 'ac1', 'ac2', 'mla_decode_nvidia', 'trimul', 'erdos', 'denoising', 'ahc039', 'ahc058'"}
+        metadata={"help": "Environment type: 'cp', 'ac1', 'ac2', 'mla_decode_nvidia', 'trimul', 'erdos', 'denoising', 'ahc039', 'ahc058'"},
     )
-    
+
     # Environment-specific parameters
     # Circle Packing (cp)
     n_item: int = field(
         default=26,
-        metadata={"help": "Number of circles for Circle Packing: 26 or 32"}
+        metadata={"help": "Number of circles for Circle Packing: 26 or 32"},
     )
-    
+
     # GPU Mode (trimul, mla_decode_nvidia)
     gpu_type: str = field(
         default="H100",
-        metadata={"help": "GPU type for Modal execution: H100, H200, etc."}
+        metadata={"help": "GPU type for Modal execution: H100, H200, etc."},
     )
     eval_timeout: int = field(
         default=60,
-        metadata={"help": "Timeout for code execution (seconds)"}
+        metadata={"help": "Timeout for code execution (seconds)"},
     )
-    
+
     # Erdos (erdos)
     n: int = field(
         default=100,
-        metadata={"help": "Size parameter for Erdos construction"}
+        metadata={"help": "Size parameter for Erdos construction"},
     )
-    
+
     # Inequalities/AC1 (ac1)
     budget_s: int = field(
         default=1000,
-        metadata={"help": "Budget parameter for inequalities"}
+        metadata={"help": "Budget parameter for inequalities"},
     )
     num_cpus: int = field(
         default=2,
-        metadata={"help": "Number of CPUs per task for code execution"}
+        metadata={"help": "Number of CPUs per task for code execution"},
     )
-    
+
     # Lazy PUCT Sampling configuration
     lazy_puct_sampling: bool = field(
         default=True,
-        metadata={"help": "Enable lazy PUCT sampling: defer sampling until VLLM has capacity"}
+        metadata={"help": "Enable lazy PUCT sampling: defer sampling until VLLM has capacity"},
     )
-    vllm_concurrency: Optional[int] = field(
+    vllm_concurrency: int | None = field(
         default=None,
         metadata={"help": "Per-rank VLLM concurrency limit for lazy sampling. "
                          "If None, auto-computed as batch_size * group_size. "
                          "Each rank (VLLM instance) can have this many concurrent generations. "
-                         "Should match or be less than vllm.max_num_seqs."}
+                         "Should match or be less than vllm.max_num_seqs."},
     )
     execution_concurrency: int = field(
         default=64,
         metadata={"help": "Per-rank solution execution concurrency limit. "
                          "Each rank can have this many concurrent code executions. "
-                         "Should match AsyncRewardWrapper max_workers (default 64)."}
+                         "Should match AsyncRewardWrapper max_workers (default 64)."},
     )
     max_puct_version_history: int = field(
         default=5,
-        metadata={"help": "Maximum number of PUCT version snapshots to keep in memory"}
+        metadata={"help": "Maximum number of PUCT version snapshots to keep in memory"},
     )
 
 
 @dataclass
 class TTTDPPOActorConfig(PPOActorConfig):
     """
-    Extended PPO config for TTT-Discover with Entropic Objective support.
-    Inherits all standard PPO parameters while adding discovery-specific options.
+    TTT-Discover-specific extensions to PPOActorConfig for entropic advantage estimation.
+
+    This config only contains actor-level fields. Use TTTDPPOConfig for the top-level
+    experiment configuration.
     """
-    
-    # Basic configuration fields that YAML expects
-    seed: int = field(
-        default=1,
-        metadata={"help": "Random seed for reproducibility"}
-    )
-    enable_offload: bool = field(
-        default=False,
-        metadata={"help": "Enable parameter offloading to CPU"}
-    )
-    max_steps: int = field(
-        default=50,
-        metadata={"help": "Maximum training steps for TTT-Discover"}
-    )
-    total_train_epochs: int = field(
-        default=10,
-        metadata={"help": "Total training epochs (ignored for TTT-Discover)"}
-    )
-    tokenizer_path: Optional[str] = field(
-        default=None,
-        metadata={"help": "Path to tokenizer"}
-    )
-    
-    # Nested configuration objects
-    cluster: ClusterSpecConfig = field(
-        default_factory=ClusterSpecConfig,
-        metadata={"help": "Cluster configuration"}
-    )
-    allocation_mode: str = field(
-        default="sglang:d8p1t1+d8p1t1",
-        metadata={"help": "GPU allocation mode"}
-    )
-    scheduler: Optional[dict] = field(
-        default=None,
-        metadata={"help": "Scheduler configuration"}
-    )
-    rollout: InferenceEngineConfig = field(
-        default_factory=InferenceEngineConfig,
-        metadata={"help": "Rollout configuration"}
-    )
-    gconfig: GenerationHyperparameters = field(
-        default_factory=GenerationHyperparameters,
-        metadata={"help": "Generation configuration"}
-    )
-    eval_gconfig: GenerationHyperparameters | None = field(
-        default=None,
-        metadata={"help": "Generation hyperparameters for evaluation. If None, use gconfig."}
-    )
-    ref: PPOActorConfig | None = field(
-        default=None,
-        metadata={"help": "Reference model configuration"}
-    )
-    critic: PPOCriticConfig | None = field(
-        default=None,
-        metadata={"help": "Critic model configuration"}
-    )
-    sglang: SGLangConfig = field(
-        default_factory=SGLangConfig,
-        metadata={"help": "SGLang configuration"}
-    )
-    vllm: vLLMConfig = field(
-        default_factory=vLLMConfig,
-        metadata={"help": "vLLM configuration"}
-    )
-    sampler: SamplerConfig = field(
-        default_factory=SamplerConfig,
-        metadata={"help": "Configuration for PUCTSampler"}
-    )
-    train_dataset: dict = field(
-        default_factory=dict,
-        metadata={"help": "Training dataset configuration"}
-    )
-    valid_dataset: Optional[dict] = field(
-        default=None,
-        metadata={"help": "Validation dataset configuration"}
-    )
-    saver: SaverConfig = field(
-        default_factory=SaverConfig,
-        metadata={"help": "Model saver configuration"}
-    )
-    recover: RecoverConfig = field(
-        default_factory=RecoverConfig,
-        metadata={"help": "Recovery configuration"}
-    )
-    evaluator: EvaluatorConfig = field(
-        default_factory=EvaluatorConfig,
-        metadata={"help": "Evaluator configuration"}
-    )
-    stats_logger: StatsLoggerConfig = field(
-        default_factory=StatsLoggerConfig,
-        metadata={"help": "Stats logger configuration"}
-    )
-    perf_tracer: PerfTracerConfig = field(
-        default_factory=PerfTracerConfig,
-        metadata={"help": "Performance tracer configuration"}
-    )
-    
+
     # Advantage estimator selection
     adv_estimator: str = field(
         default="gae",
@@ -248,156 +143,131 @@ class TTTDPPOActorConfig(PPOActorConfig):
                     "'entropic': TTT-Discover with fixed beta, "
                     "'entropic_adaptive_beta': TTT-Discover with adaptive beta, "
                     "'mean_baseline': simple mean subtraction"
-        }
+        },
     )
-    
+
     # Entropic parameters
     adv_estimator_beta: float = field(
         default=1.0,
-        metadata={"help": "Beta (temperature) for entropic advantage. Higher = more exploration"}
+        metadata={"help": "Beta (temperature) for entropic advantage. Higher = more exploration"},
     )
-    
+
     # Adaptive beta parameters
     adv_estimator_target_kl: float = field(
         default=0.693,  # log(2)
-        metadata={"help": "Target KL divergence for adaptive beta (default: log(2))"}
+        metadata={"help": "Target KL divergence for adaptive beta (default: log(2))"},
     )
-    
+
     adv_estimator_beta_max: float = field(
         default=1e6,
-        metadata={"help": "Maximum beta value for adaptive search"}
+        metadata={"help": "Maximum beta value for adaptive search"},
     )
-    
+
     adv_estimator_beta_iters: int = field(
         default=60,
-        metadata={"help": "Binary search iterations for adaptive beta"}
+        metadata={"help": "Binary search iterations for adaptive beta"},
     )
-    
+
     # Grouping strategy
-    group_size: Optional[int] = field(
+    group_size: int | None = field(
         default=None,
         metadata={"help": "Number of samples per group for advantage calculation. "
-                         "If None, infer from batch structure or treat whole batch as one group"}
+                         "If None, infer from batch structure or treat whole batch as one group"},
     )
-    
-    # Compatibility flag (for type checking)
-    is_tttd_config: bool = field(
-        default=True,
-        repr=False,
-        metadata={"help": "Internal flag to identify TTT-D config"}
+
+    def __post_init__(self):
+        super().__post_init__()
+        valid_estimators = ["gae", "mean_baseline", "entropic", "entropic_adaptive_beta"]
+        if self.adv_estimator not in valid_estimators:
+            raise ValueError(
+                f"adv_estimator must be one of {valid_estimators}, got {self.adv_estimator}"
+            )
+        if self.adv_estimator == "entropic" and self.adv_estimator_beta <= 0:
+            raise ValueError(
+                f"adv_estimator_beta must be positive for entropic, got {self.adv_estimator_beta}"
+            )
+
+
+@dataclass
+class TTTDPPOConfig(PPOConfig):
+    """
+    TTT-Discover top-level experiment config following AReaL PPOConfig conventions.
+
+    Inherits all standard PPO experiment fields (rollout, ref, critic, gconfig, etc.)
+    and adds TTT-Discover-specific experiment-level fields.
+    """
+
+    actor: TTTDPPOActorConfig = field(default_factory=TTTDPPOActorConfig)
+
+    # TTT-Discover specific experiment fields
+    sampler: SamplerConfig = field(default_factory=SamplerConfig)
+    max_steps: int = field(
+        default=50,
+        metadata={"help": "Maximum training steps for TTT-Discover"},
     )
-    
-    # Actor field - contains the training engine configuration
-    # This is used by TTTDPPOTrainer to create the actor engine
-    actor: PPOActorConfig = field(
-        default_factory=PPOActorConfig,
-        metadata={"help": "Actor training engine configuration"}
-    )
-    
-    # Enable thinking mode for Qwen3 models
     enable_thinking: bool = field(
         default=False,
-        metadata={"help": "Enable thinking mode for Qwen3 models (adds enable_thinking=True to chat_template)"}
+        metadata={"help": "Enable thinking mode for Qwen3 models (adds enable_thinking=True to chat_template)"},
     )
-    
-    # Training history recording
+    max_prompt_thinking_tokens: int = field(
+        default=26000,
+        metadata={"help": "Maximum tokens for prompt + thinking phase. Paper: 26000 to leave room for final response. "
+                         "If model exceeds this without producing valid code, teacher forcing is applied."},
+    )
     save_steps: list[int] = field(
         default_factory=lambda: [0, 9, 24, 49],
-        metadata={"help": "Steps to save training history snapshots for visualization"}
+        metadata={"help": "Steps to save training history snapshots for visualization"},
     )
-    
-    # LoRA check control
     skip_lora_check: bool = field(
         default=False,
         metadata={"help": "Skip LoRA adapter existence check at training start. "
                          "Use only if you are certain the adapter exists at the configured path. "
                          "Note: The LoRA adapter must be created BEFORE training using prepare_lora_init.py "
-                         "because vLLM loads it at startup before the training script runs."}
+                         "because vLLM loads it at startup before the training script runs."},
     )
-    
-    # PUCT stats reset on resume
     reset_puct_stats_on_resume: bool = field(
         default=True,
         metadata={"help": "Reset PUCT statistics (_T, _n, _m) when resuming from checkpoint. "
                          "If True, exploration stats start from 0 (recommended for new experiments). "
                          "If False, stats continue from saved values (for continuing same experiment). "
-                         "Default is True to avoid _T inflation across different training runs."}
+                         "Default is True to avoid _T inflation across different training runs."},
     )
-    
-    # Teacher forcing for thinking tokens (paper: limit prompt + thinking to 26000)
-    max_prompt_thinking_tokens: int = field(
-        default=26000,
-        metadata={"help": "Maximum tokens for prompt + thinking phase. Paper: 26000 to leave room for final response. "
-                         "If model exceeds this without producing valid code, teacher forcing is applied."}
-    )
-    
-    # Dynamic batch size for async training
-    dynamic_bs: bool = field(
-        default=False,
-        metadata={"help": "Enable dynamic batch sizing for async training (skip slow rollouts)"}
-    )
-    
-    # Scheme 1 (sync-like) mode for async training
     use_scheme_1: bool = field(
         default=False,
         metadata={"help": "Enable Scheme 1 (sync-like) mode: wait for complete batch before PUCT update. "
                          "This ensures complete batch updates like sync mode but allows async rollout. "
-                         "Default is False (Scheme 2: streaming/async mode)"}
+                         "Default is False (Scheme 2: streaming/async mode)"},
     )
-    
+
+    # Compatibility flag (for type checking)
+    is_tttd_config: bool = field(
+        default=True,
+        repr=False,
+        metadata={"help": "Internal flag to identify TTT-D config"},
+    )
+
+    # Override train_dataset type for TTT-Discover compatibility
+    train_dataset: dict = field(default_factory=dict)
+    valid_dataset: dict | None = field(default=None)
+
     def __post_init__(self):
-        """Validate configuration consistency and convert nested dicts to objects"""
-        # Convert actor from dict to PPOActorConfig if needed
+        # Convert actor from dict if needed (e.g., manual construction or CLI overrides)
         if isinstance(self.actor, dict):
-            self.actor = PPOActorConfig(**self.actor)
-        
-        # Convert ref from dict to PPOActorConfig if needed
+            self.actor = TTTDPPOActorConfig(**self.actor)
+        # Convert ref from dict if needed
         if isinstance(self.ref, dict):
             self.ref = PPOActorConfig(**self.ref)
-        
-        # Convert vllm from dict to vLLMConfig if needed
-        if isinstance(self.vllm, dict):
-            self.vllm = vLLMConfig(**self.vllm)
-        
-        # Convert sglang from dict to SGLangConfig if needed
-        if isinstance(self.sglang, dict):
-            self.sglang = SGLangConfig(**self.sglang)
-        
-        # Convert perf_tracer from dict to PerfTracerConfig if needed
-        if isinstance(self.perf_tracer, dict):
-            self.perf_tracer = PerfTracerConfig(**self.perf_tracer)
-        
-        # Note: train_dataset and valid_dataset are kept as dict
-        # because TTT-Discover doesn't use standard dataset configuration
-        
-        # Convert mb_spec from dict to MicroBatchSpec if needed
-        if isinstance(self.mb_spec, dict):
-            self.mb_spec = MicroBatchSpec(**self.mb_spec)
-        
-        # Set default eval_gconfig if not provided
-        if self.eval_gconfig is None:
-            self.eval_gconfig = self.gconfig.new()
-        
-        # Call parent validation
+        # Convert sampler from dict if needed
+        if isinstance(self.sampler, dict):
+            self.sampler = SamplerConfig(**self.sampler)
+        # PPOConfig.__post_init__ handles eval_gconfig and BaseExperimentConfig validation
         super().__post_init__()
-        
-        # Validate adv_estimator value
-        valid_estimators = ["gae", "mean_baseline", "entropic", "entropic_adaptive_beta"]
-        if self.adv_estimator not in valid_estimators:
-            raise ValueError(f"adv_estimator must be one of {valid_estimators}, got {self.adv_estimator}")
-        
-        if self.adv_estimator in ["entropic", "entropic_adaptive_beta"]:
-            if self.adv_estimator_beta <= 0 and self.adv_estimator == "entropic":
-                raise ValueError(f"adv_estimator_beta must be positive, got {self.adv_estimator_beta}")
-            
-            # Optional: Warn or auto-adjust if using entropic with default reward scaling
-            if not hasattr(self, 'reward_scaling') or self.reward_scaling == 1.0:
-                pass
 
 
 @dataclass
-class TTTDDistillConfig(TTTDPPOActorConfig):
-    """Extended config for TTT-Discover distillation and evaluation.
+class TTTDDistillConfig(TTTDPPOConfig):
+    """
+    Extended config for TTT-Discover distillation and evaluation.
 
     Used by both training (train_tttd_distill.py) and evaluation
     (eval_tttd_distill.py) scripts.
@@ -406,51 +276,37 @@ class TTTDDistillConfig(TTTDPPOActorConfig):
     # Teacher model settings
     teacher_path: str = field(
         default="",
-        metadata={"help": "Path to teacher model checkpoint (HF format or DCP)"}
+        metadata={"help": "Path to teacher model checkpoint (HF format or DCP)"},
     )
     teacher_sampler_checkpoint: str = field(
         default="",
-        metadata={"help": "Path to teacher PUCTSampler checkpoint directory"}
+        metadata={"help": "Path to teacher PUCTSampler checkpoint directory"},
     )
     teacher_weight_format: str = field(
         default="hf",
-        metadata={"help": "Teacher checkpoint format: 'hf' or 'dcp'", "choices": ["hf", "dcp"]}
+        metadata={"help": "Teacher checkpoint format: 'hf' or 'dcp'", "choices": ["hf", "dcp"]},
     )
 
     # Distillation settings
     distill_steps: int = field(
         default=3,
-        metadata={"help": "Number of distillation steps (no verification)"}
+        metadata={"help": "Number of distillation steps (no verification)"},
     )
     kl_reward_scale: float = field(
         default=1.0,
-        metadata={"help": "Scale factor for KL-based reward"}
+        metadata={"help": "Scale factor for KL-based reward (legacy, kept for compatibility)"},
     )
     kl_estimator_type: str = field(
         default="k1",
-        metadata={"help": "KL estimator: k1, k2, or k3", "choices": ["k1", "k2", "k3"]}
+        metadata={"help": "KL estimator: k1, k2, or k3", "choices": ["k1", "k2", "k3"]},
     )
     total_rollouts_per_step: int = field(
         default=512,
-        metadata={"help": "Total number of rollouts per step across all ranks"}
-    )
-    adv_estimator: str = field(
-        default="mean_baseline",
-        metadata={"help": "Advantage estimator for distillation"}
-    )
-    kl_ctl: float = field(
-        default=0.0,
-        metadata={"help": "KL penalty coefficient (should be 0 for distillation)"}
-    )
-    teacher: TeacherConfig | None = field(
-        default=None,
-        metadata={"help": "Teacher configuration for native AReaL KDRL. "
-                         "If set, uses rl_loss_weight and distill_loss_weight for joint KD+RL. "
-                         "rl_loss_weight=0 means pure distillation (reverse KL)."}
+        metadata={"help": "Total number of rollouts per step across all ranks"},
     )
     run_eval_step: bool = field(
         default=True,
-        metadata={"help": "Run evaluation with real verification after distillation"}
+        metadata={"help": "Run evaluation with real verification after distillation"},
     )
 
 
@@ -458,23 +314,23 @@ class TTTDDistillConfig(TTTDPPOActorConfig):
 def create_env_from_config(config):
     """
     Create environment based on config's sampler.env_type.
-    
+
     Supports:
     - 'cp': Circle Packing
     - 'ac1', 'ac2': Inequalities (AC1/AC2)
-    
+
     Args:
         config: Config object with sampler and saver attributes
-        
+
     Returns:
         Environment instance
     """
     # Import here to avoid circular imports
-    from .envs import CirclePackingEnv, InequalitiesEnv, ErdosEnv, DenoisingEnv
-    
+    from .envs import CirclePackingEnv, DenoisingEnv, ErdosEnv, InequalitiesEnv
+
     env_type = getattr(config.sampler, 'env_type', 'ac1')
     eval_timeout = getattr(config.sampler, 'eval_timeout', 600)
-    
+
     if env_type == 'cp':
         return CirclePackingEnv(
             n_item=getattr(config.sampler, 'n_item', 26),

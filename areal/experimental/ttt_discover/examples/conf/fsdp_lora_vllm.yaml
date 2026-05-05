@@ -1,126 +1,82 @@
-# TTT-Discover FSDP + LoRA + vLLM Configuration
-# vLLM uses distributed rollout - each DP rank handles its own parents
-
 experiment_name: tttd-lora-vllm
 trial_name: trial0
-
-# Required for TTT-Discover entropic advantages
 is_tttd_config: true
-
 seed: 1
 enable_offload: false
-
-# TTT-Discover uses fixed number of steps (not epochs)
-# Paper: 50 steps with 512 rollouts per step (8 parents × 64 group_size)
 max_steps: 2
-total_train_epochs: 10  # Ignored for TTT-Discover, use max_steps instead
-
-# ============================================================================
-# Actor (FSDP + LoRA) Configuration - Top level fields for TTTDPPOActorConfig
-# ============================================================================
-# These fields map to TTTDPPOActorConfig which inherits from PPOActorConfig/TrainEngineConfig
-path: Qwen/Qwen2.5-1.5B-Instruct
-init_from_scratch: false
-disable_dropout: true
-gradient_checkpointing: true
-dtype: bfloat16
-
-mb_spec:
-  max_tokens_per_mb: 10240
-
-optimizer:
-  type: adam
-  lr: 3e-5
-  weight_decay: 0.01
-  beta1: 0.9
-  beta2: 0.999
-  eps: 1e-8
-  lr_scheduler_type: constant
-  gradient_clipping: 1.0
-  warmup_steps_proportion: 0.001
-
-# PPO parameters
-eps_clip: 0.4
-temperature: ${gconfig.temperature}
-reward_scaling: 10.0
-reward_bias: -0.5
-kl_ctl: 0.0
-ppo_n_minibatches: 1
-recompute_logprob: true
-use_decoupled_loss: true
-rejection_sampling:
-  level: token
-  action: mask
-  metric: ratio
-  upper: 5.0
-
-# Reward normalization
-reward_norm:
-  mean_level: group
-  std_level: group
-  group_size: ${gconfig.n_samples}
-
-# Advantage normalization
-adv_norm:
-  mean_level: batch
-  std_level: batch
-
-max_new_tokens: ${gconfig.max_new_tokens}
-
-# LoRA configuration
-use_lora: true
-peft_type: lora
-lora_rank: 32
-lora_alpha: 16
-target_modules: [all-linear]
-weight_update_mode: xccl
-
-# TTT-Discover specific: Entropic Advantage
-adv_estimator: entropic
-adv_estimator_beta: 1.0
-adv_estimator_target_kl: 0.693
-adv_estimator_beta_max: 1000000.0
-adv_estimator_beta_iters: 60
-
-scheduling_spec:
+total_train_epochs: 10
+actor:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: Qwen/Qwen2.5-1.5B-Instruct
+  dtype: bfloat16
+  scheduling_spec:
   - task_type: worker
     port_count: 2
     gpu: 1
     mem: 32
     cmd: python3 -m areal.infra.rpc.rpc_server
     env_vars: {}
-
-# Actor reference for launcher validation (TTTDPPOActorConfig inherits from PPOActorConfig)
-actor:
-  experiment_name: ${experiment_name}
-  trial_name: ${trial_name}
-  path: ${path}
-  dtype: ${dtype}
-  scheduling_spec: ${scheduling_spec}
-
-# ============================================================================
-# Other Configurations
-# ============================================================================
-tokenizer_path: ${path}
-
+  backend: fsdp:d4p1t1
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  mb_spec:
+    max_tokens_per_mb: 10240
+  optimizer:
+    type: adam
+    lr: 3e-5
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.001
+  eps_clip: 0.4
+  temperature: ${gconfig.temperature}
+  reward_scaling: 10.0
+  reward_bias: -0.5
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  rejection_sampling:
+    level: token
+    action: mask
+    metric: ratio
+    upper: 5.0
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+  max_new_tokens: ${gconfig.max_new_tokens}
+  use_lora: true
+  peft_type: lora
+  lora_rank: 32
+  lora_alpha: 16
+  target_modules:
+  - all-linear
+  weight_update_mode: xccl
+  adv_estimator: entropic
+  adv_estimator_beta: 1.0
+  adv_estimator_target_kl: 0.693
+  adv_estimator_beta_max: 1000000.0
+  adv_estimator_beta_iters: 60
+tokenizer_path: ${actor.path}
 cluster:
   n_nodes: 1
   n_gpus_per_node: 8
-  fileroot: ./outputs  # Output directory under project root
+  fileroot: ./outputs
   name_resolve:
     type: nfs
     nfs_record_root: /tmp/areal/name_resolve
-
-# FSDP + vLLM for LoRA (4 GPUs for vLLM inference, 4 GPUs for FSDP training)
 allocation_mode: vllm[rollout]:d4p1t1+fsdp[actor]:d4p1t1
-backend: fsdp:d4p1t1
-
 scheduler:
   type: null
-
-# ============================================================================
-# Rollout Configuration (vLLM)
-# ============================================================================
 rollout:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
@@ -130,117 +86,69 @@ rollout:
   max_head_offpolicyness: 0
   enable_rollout_tracing: false
   pause_grace_period: 1.0
-  scheduling_spec: ${scheduling_spec}
+  scheduling_spec: ${actor.scheduling_spec}
   fileroot: ${cluster.fileroot}
   tokenizer_path: ${tokenizer_path}
   dump_to_file: true
-  use_lora: ${use_lora}
-
-# ============================================================================
-# Generation Configuration
-# ============================================================================
+  use_lora: ${actor.use_lora}
+  backend: vllm:d4p1t1
 gconfig:
-  # Group rollout: 64 samples per parent state
   n_samples: 1
   min_new_tokens: 0
-  max_new_tokens: 16384  # Increased from 1024 to handle longer code generation
+  max_new_tokens: 16384
   greedy: false
   temperature: 1.0
   top_p: 0.95
-  # LoRA configuration
   lora_name: tttd_lora_adapter
-
-# ============================================================================
-# Reference Model Configuration
-# ============================================================================
 ref:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  path: ${path}
+  path: ${actor.path}
   init_from_scratch: false
   disable_dropout: true
-  dtype: ${dtype}
+  dtype: ${actor.dtype}
   mb_spec:
     max_tokens_per_mb: 10240
   optimizer: null
   scheduling_strategy:
     type: colocation
     target: actor
-  scheduling_spec: ${scheduling_spec}
-
-# ============================================================================
-# vLLM Configuration
-# ============================================================================
-# IMPORTANT: For LoRA training, you must first run the preparation script
-# to create the initial LoRA adapter before starting training:
-#   python prepare_lora_init.py --config-path conf/fsdp_lora_vllm.yaml
-#
-# This is required because vLLM loads the LoRA adapter at startup,
-# before the training script can create it.
-# ============================================================================
+  scheduling_spec: ${actor.scheduling_spec}
+  backend: fsdp:d4p1t1
 vllm:
-  model: ${path}
+  model: ${actor.path}
   seed: ${seed}
   skip_tokenizer_init: false
-  dtype: ${dtype}
+  dtype: ${actor.dtype}
   max_model_len: 32768
   gpu_memory_utilization: 0.9
   enforce_eager: false
-  # LoRA support
-  enable_lora: ${use_lora}
-  max_lora_rank: 32  # Must be >= lora_rank
-  # Initial LoRA module - MUST exist before training starts
-  # Run prepare_lora_init.py first to create it
-  lora_modules: '{"name": "${gconfig.lora_name}", "path": "./lora_init", "base_model_name": "${path}"}'
-
-# ============================================================================
-# PUCT Sampler Configuration
-# ============================================================================
+  enable_lora: ${actor.use_lora}
+  max_lora_rank: 32
+  lora_modules: '{"name": "${gconfig.lora_name}", "path": "./lora_init", "base_model_name":
+    "${actor.path}"}'
 sampler:
   type: puct
-  batch_size: 4  # Parents per DP rank (total = 8 × dp_size)
-
-  # PUCT parameters
+  batch_size: 4
   c_puct: 1.5
   gamma: 0.95
   max_children: 100
-
-  # State management
   max_states: 10000
   top_k: 1000
-
-  # Exploration
   temperature: 1.0
-
-  # Checkpointing
   save_freq: 100
   checkpoint_dir: ${cluster.fileroot}/${experiment_name}/${trial_name}/sampler
-
-  # Initial state
   initial_exp_type: best_available
-
-  # Environment type for initial state creation
   env_type: cp
-
-  # Environment-specific parameters
   n_item: 26
   gpu_type: H100
   eval_timeout: 60
   n: 100
   budget_s: 1000
-
-# ============================================================================
-# Dataset Configuration
-# ============================================================================
 train_dataset:
-  batch_size: 8  # Parents per DP rank (each expanded to 64 rollouts)
-
+  batch_size: 8
 valid_dataset:
   batch_size: 8
-
-# ============================================================================
-# Utilities Configuration
-# ============================================================================
 saver:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
@@ -248,7 +156,6 @@ saver:
   freq_epochs: 1
   freq_steps: null
   freq_secs: null
-
 recover:
   mode: disabled
   experiment_name: ${experiment_name}
@@ -257,7 +164,6 @@ recover:
   freq_epochs: 1
   freq_steps: null
   freq_secs: 3600
-
 evaluator:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
@@ -265,7 +171,6 @@ evaluator:
   freq_epochs: 1
   freq_steps: null
   freq_secs: null
-
 stats_logger:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
@@ -274,7 +179,6 @@ stats_logger:
     mode: disabled
     project: tttd-lora-vllm
     entity: null
-
 perf_tracer:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}

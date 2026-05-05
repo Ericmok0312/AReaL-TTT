@@ -174,7 +174,7 @@ class TTTDDistillTrainer(PPOTrainer):
         # =====================================================================
         # Create student actor (with LoRA)
         # =====================================================================
-        self.actor = self._create_tttd_actor(config)
+        self.actor = self._create_tttd_actor(config.actor)
         self.ref = None  # No ref model needed (kl_ctl=0)
         
         # =====================================================================
@@ -311,7 +311,7 @@ class TTTDDistillTrainer(PPOTrainer):
         set_model_state_dict(engine.model, fixed_state, options=options)
         logger.info(f"[Load-{model_name}] Loaded LoRA adapter from {path}")
     
-    def _create_tttd_actor(self, actor_config: TTTDDistillConfig):
+    def _create_tttd_actor(self, actor_config: TTTDPPOActorConfig):
         """Create student TTTDActor."""
         actor = TTTDActor(config=actor_config)
         actor.create_process_group(parallel_strategy=self.allocation_mode.train)
@@ -343,7 +343,7 @@ class TTTDDistillTrainer(PPOTrainer):
             # Read base model from adapter config
             with open(adapter_config_path, "r") as f:
                 adapter_cfg = json.load(f)
-            base_model = adapter_cfg.get("base_model_name_or_path", config.path)
+            base_model = adapter_cfg.get("base_model_name_or_path", config.actor.path)
             
             # If base_model is a HF Hub ID (not a local path), use student's base model
             # or the teacher checkpoint dir itself (which has config.json/tokenizer)
@@ -353,23 +353,23 @@ class TTTDDistillTrainer(PPOTrainer):
                     base_model = config.teacher_path
                     logger.info(f"[Teacher] Using teacher checkpoint dir as base model: {base_model}")
                 else:
-                    base_model = config.path
+                    base_model = config.actor.path
                     logger.info(f"[Teacher] Using student's base model as fallback: {base_model}")
             
-            teacher_config.path = base_model
-            teacher_config.use_lora = True
+            teacher_config.actor.path = base_model
+            teacher_config.actor.use_lora = True
             # Inherit LoRA params from student config (assumes same architecture)
             
             logger.info(
                 f"[Teacher] Will initialize LoRA teacher: base={base_model}, "
-                f"rank={teacher_config.lora_rank}, alpha={teacher_config.lora_alpha}"
+                f"rank={teacher_config.actor.lora_rank}, alpha={teacher_config.actor.lora_alpha}"
             )
         else:
             # ================================================================
             # Teacher is a full model (HF or DCP)
             # ================================================================
-            teacher_config.path = config.teacher_path
-            teacher_config.use_lora = False
+            teacher_config.actor.path = config.teacher_path
+            teacher_config.actor.use_lora = False
             logger.info(f"[Teacher] Detected full model checkpoint at {config.teacher_path}")
         
         # Create teacher actor
@@ -399,7 +399,7 @@ class TTTDDistillTrainer(PPOTrainer):
             teacher.load(meta)
             logger.info(f"[Teacher] Loaded DCP weights from {config.teacher_path}")
         else:
-            logger.info(f"[Teacher] Using HF weights loaded during initialize() from {teacher_config.path}")
+            logger.info(f"[Teacher] Using HF weights loaded during initialize() from {teacher_config.actor.path}")
         
         # Freeze teacher parameters
         for param in teacher.model.parameters():
@@ -446,7 +446,7 @@ class TTTDDistillTrainer(PPOTrainer):
         """Setup weight update meta and connect to inference engine."""
         config = self.config
         
-        if config.weight_update_mode == "disk":
+        if config.actor.weight_update_mode == "disk":
             disk_kwargs = {
                 "experiment_name": config.experiment_name,
                 "trial_name": config.trial_name,
@@ -454,31 +454,31 @@ class TTTDDistillTrainer(PPOTrainer):
                 "name": "default",
                 "clear_checkpoint_after_load": True,
             }
-            if config.use_lora:
+            if config.actor.use_lora:
                 disk_kwargs.update({
-                    "use_lora": config.use_lora,
+                    "use_lora": config.actor.use_lora,
                     "lora_name": config.gconfig.lora_name,
                     "lora_int_id": 1,
-                    "base_model_name": config.path,
+                    "base_model_name": config.actor.path,
                 })
             self.weight_update_meta = WeightUpdateMeta.from_disk(**disk_kwargs)
-        elif config.weight_update_mode == "xccl":
+        elif config.actor.weight_update_mode == "xccl":
             if self.allocation_mode.train_backend == "megatron":
                 self.weight_update_meta = WeightUpdateMeta.from_megatron_xccl(
                     self.allocation_mode
                 )
             else:
                 xccl_kwargs = {"allocation_mode": self.allocation_mode}
-                if config.use_lora:
+                if config.actor.use_lora:
                     xccl_kwargs.update({
-                        "use_lora": config.use_lora,
+                        "use_lora": config.actor.use_lora,
                         "lora_name": config.gconfig.lora_name,
                         "lora_int_id": 1,
-                        "base_model_name": config.path,
+                        "base_model_name": config.actor.path,
                     })
                 self.weight_update_meta = WeightUpdateMeta.from_fsdp_xccl(**xccl_kwargs)
         else:
-            raise ValueError(f"Invalid weight update mode: {config.weight_update_mode}")
+            raise ValueError(f"Invalid weight update mode: {config.actor.weight_update_mode}")
         
         self.actor.connect_engine(self.rollout, self.weight_update_meta)
     
@@ -698,7 +698,7 @@ class TTTDDistillTrainer(PPOTrainer):
             )
             
             # Compute prox_logp if needed (wrap dict in list for PPOActor.compute_logp)
-            if config.should_compute_prox_logp():
+            if config.actor.should_compute_prox_logp():
                 prox_logps = self.actor.compute_logp([rollout_batch])
                 rollout_batch["prox_logp"] = prox_logps[0]
             
@@ -867,7 +867,7 @@ def main(args):
             config.gconfig.stop_token_ids.append(tokenizer.eos_token_id)
     
     # Verify LoRA adapter exists
-    if config.use_lora and not config.skip_lora_check:
+    if config.actor.use_lora and not config.skip_lora_check:
         lora_output_path = "./lora_init"
         if hasattr(config, 'vllm'):
             if isinstance(config.vllm, dict):
