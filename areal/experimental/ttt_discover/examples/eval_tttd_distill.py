@@ -286,7 +286,7 @@ class TTTDDistillEvaluator:
         from areal.infra import RolloutController
         from areal.engine.vllm_remote import RemotevLLMEngine
         from copy import deepcopy
-        from areal.api.cli_args import InferenceEngineConfig, SchedulingStrategy, SchedulingStrategyType
+        from areal.api.cli_args import InferenceEngineConfig, SchedulingStrategy, SchedulingStrategyType, vLLMConfig
 
         config = deepcopy(rollout_config)
         if is_eval:
@@ -299,6 +299,11 @@ class TTTDDistillEvaluator:
 
         if self.allocation_mode.gen_backend == "vllm":
             engine_cls = RemotevLLMEngine
+            server_args = vLLMConfig.build_args(
+                vllm_config=self.config.vllm,
+                tp_size=self.allocation_mode.gen.tp_size,
+                pp_size=self.allocation_mode.gen.pp_size,
+            )
         else:
             raise ValueError(f"Unsupported gen backend: {self.allocation_mode.gen_backend}")
 
@@ -309,6 +314,7 @@ class TTTDDistillEvaluator:
         controller.initialize(
             role="rollout",
             alloc_mode=self.allocation_mode,
+            server_args=server_args,
         )
         return controller
 
