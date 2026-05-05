@@ -137,11 +137,17 @@ async def evaluate_model(
     tokenizer,
     workflow: TTTDiscoverWorkflowV2,
     initial_states: list,
+    batch_size: int,
     group_size: int,
     model_name: str,
     model_path: str | None,
 ) -> dict[str, Any]:
-    """Evaluate a single model on the LOCAL shard of initial states."""
+    """Evaluate a single model on the LOCAL shard of initial states.
+
+    Batching follows AReaL conventions:
+      - batch_size = number of parent states per batch (from config.sampler.batch_size)
+      - group_size = n_samples per parent     (from config.gconfig.n_samples)
+    """
     from vllm.lora.request import LoRARequest
 
     logger.info(f"[Eval-{model_name}] path={model_path}")
@@ -162,17 +168,40 @@ async def evaluate_model(
     workflow.reset()
     workflow.set_current_version(0)
 
+    # AReaL-style batch sizing: never exceed actual number of states
+    eval_batch_size = min(len(initial_states), batch_size)
+    eval_batch_size = max(eval_batch_size, 1)
+    num_batches = (len(initial_states) + eval_batch_size - 1) // eval_batch_size
+
+    logger.info(
+        f"[Eval-{model_name}] batch_size={eval_batch_size}, group_size={group_size}, "
+        f"states={len(initial_states)}, batches={num_batches}"
+    )
+
     eval_start = time.perf_counter()
     rewards: list[float] = []
 
-    for state in initial_states:
-        for _ in range(group_size):
-            data = {"_state_obj": state}
-            trajectory = await workflow.arun_episode(engine, data)
-            if trajectory is None:
-                continue
-            reward = float(trajectory["rewards"][0])
-            rewards.append(reward)
+    for batch_idx in range(num_batches):
+        batch_start = batch_idx * eval_batch_size
+        batch_end = min(batch_start + eval_batch_size, len(initial_states))
+        batch_states = initial_states[batch_start:batch_end]
+
+        batch_begin_time = time.perf_counter()
+        for state in batch_states:
+            for _ in range(group_size):
+                data = {"_state_obj": state}
+                trajectory = await workflow.arun_episode(engine, data)
+                if trajectory is None:
+                    continue
+                reward = float(trajectory["rewards"][0])
+                rewards.append(reward)
+        batch_elapsed = time.perf_counter() - batch_begin_time
+
+        logger.info(
+            f"[Eval-{model_name}] Batch {batch_idx + 1}/{num_batches} done | "
+            f"parents={len(batch_states)} rollouts={len(batch_states) * group_size} "
+            f"time={batch_elapsed:.1f}s"
+        )
 
     eval_rollout_time = time.perf_counter() - eval_start
 
@@ -344,9 +373,16 @@ async def main_async(args):
     logger.info(f"[Rank {rank}] vLLM instance ready")
 
     # ------------------------------------------------------------------
-    # 6. Workflow
+    # 6. Workflow – batch_size / group_size read exactly like AReaL
     # ------------------------------------------------------------------
+    batch_size = config.sampler.batch_size
     group_size = config.gconfig.n_samples
+
+    if rank == 0:
+        logger.info(
+            f"[EvalConfig] sampler.batch_size={batch_size}, "
+            f"gconfig.n_samples={group_size}"
+        )
 
     workflow = TTTDiscoverWorkflowV2(
         env=env,
@@ -356,7 +392,7 @@ async def main_async(args):
         reward_fn=tttd_reward_fn,
         enable_thinking=getattr(config, "enable_thinking", False),
         max_prompt_thinking_tokens=getattr(config, "max_prompt_thinking_tokens", 26000),
-        batch_size=len(my_states),
+        batch_size=batch_size,
         group_size=group_size,
         lazy_sampling=False,
         dp_rank=rank,
@@ -378,6 +414,7 @@ async def main_async(args):
             tokenizer=tokenizer,
             workflow=workflow,
             initial_states=my_states,
+            batch_size=batch_size,
             group_size=group_size,
             model_name=label,
             model_path=path,
