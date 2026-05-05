@@ -24,12 +24,17 @@ import os
 import sys
 
 # ---------------------------------------------------------------------------
-# CRITICAL: set GPU visibility BEFORE any CUDA init (torch / vllm imports).
+# CRITICAL: set GPU visibility and vLLM spawn mode BEFORE any CUDA init.
 # ---------------------------------------------------------------------------
 _local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 _world_size = int(os.environ.get("WORLD_SIZE", "1"))
 if _world_size > 1:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(_local_rank)
+
+# vLLM V1 engine defaults to fork() on Linux, which copies the parent's
+# NCCL/CUDA state and deadlocks when PyTorch DDP is also used.
+# Force spawn so workers start from a clean slate.
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 import asyncio
 import copy
@@ -240,9 +245,9 @@ def _gather_eval_results(local: dict, rank: int, world_size: int) -> dict:
     dist.all_gather_object(all_rewards_gathered, local["rewards"])
     all_rewards = [r for rank_list in all_rewards_gathered for r in rank_list]
 
-    # 2. scalar reductions
+    # 2. scalar reductions (gloo backend -> keep tensors on CPU)
     def _red(val, op):
-        t = torch.tensor([val], dtype=torch.float32, device="cuda")
+        t = torch.tensor([val], dtype=torch.float32, device="cpu")
         dist.all_reduce(t, op=op)
         return t.item()
 
@@ -271,14 +276,6 @@ def _gather_eval_results(local: dict, rank: int, world_size: int) -> dict:
 async def main_async(args):
     rank = _local_rank
     world_size = _world_size
-
-    # ------------------------------------------------------------------
-    # 0. Init distributed (no-op when world_size == 1)
-    # ------------------------------------------------------------------
-    if world_size > 1:
-        dist.init_process_group(backend="nccl")
-        torch.cuda.set_device(0)  # CUDA_VISIBLE_DEVICES already restricted to 1 GPU
-        logger.info(f"[Rank {rank}/{world_size}] Distributed init done")
 
     # ------------------------------------------------------------------
     # 1. Parse config (structured + raw for extra keys)
@@ -371,6 +368,13 @@ async def main_async(args):
         trust_remote_code=True,
     )
     logger.info(f"[Rank {rank}] vLLM instance ready")
+
+    # ------------------------------------------------------------------
+    # 0. Init PyTorch distributed AFTER vLLM (avoid NCCL/CUDA fork issues)
+    # ------------------------------------------------------------------
+    if world_size > 1:
+        dist.init_process_group(backend="gloo")
+        logger.info(f"[Rank {rank}/{world_size}] Distributed init done (gloo)")
 
     # ------------------------------------------------------------------
     # 6. Workflow – batch_size / group_size read exactly like AReaL
