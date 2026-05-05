@@ -18,6 +18,7 @@ cluster:
 
 # vLLM allocation: 4 GPUs for inference
 allocation_mode: vllm[rollout]:d4p1t1+fsdp[actor]:d4p1t1
+backend: fsdp:d4p1t1
 
 # Minimal rollout config for vLLM server
 rollout:

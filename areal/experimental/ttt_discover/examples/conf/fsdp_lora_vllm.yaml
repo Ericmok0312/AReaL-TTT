@@ -48,7 +48,11 @@ kl_ctl: 0.0
 ppo_n_minibatches: 1
 recompute_logprob: true
 use_decoupled_loss: true
-behav_imp_weight_cap: 5.0
+rejection_sampling:
+  level: token
+  action: mask
+  metric: ratio
+  upper: 5.0
 
 # Reward normalization
 reward_norm:
@@ -109,6 +113,7 @@ cluster:
 
 # FSDP + vLLM for LoRA (4 GPUs for vLLM inference, 4 GPUs for FSDP training)
 allocation_mode: vllm[rollout]:d4p1t1+fsdp[actor]:d4p1t1
+backend: fsdp:d4p1t1
 
 scheduler:
   type: null

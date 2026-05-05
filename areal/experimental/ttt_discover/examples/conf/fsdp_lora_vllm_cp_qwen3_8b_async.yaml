@@ -51,7 +51,11 @@ kl_ctl: 0.1
 ppo_n_minibatches: 1
 recompute_logprob: true
 use_decoupled_loss: true
-behav_imp_weight_cap: 5.0
+rejection_sampling:
+  level: token
+  action: mask
+  metric: ratio
+  upper: 5.0
 
 reward_norm:
   mean_level: group
@@ -108,6 +112,7 @@ cluster:
     nfs_record_root: /tmp/areal/name_resolve
 
 allocation_mode: vllm[rollout]:d4p1t1+fsdp[actor]:d4p1t1
+backend: fsdp:d4p1t1
 
 scheduler:
   type: null

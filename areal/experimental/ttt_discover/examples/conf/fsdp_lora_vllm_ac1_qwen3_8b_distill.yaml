@@ -159,6 +159,7 @@ cluster:
     nfs_record_root: /tmp/areal/name_resolve
 
 allocation_mode: vllm[rollout]:d4p1t1+fsdp[actor]:d4p1t1
+backend: fsdp:d4p1t1
 
 scheduler:
   type: null

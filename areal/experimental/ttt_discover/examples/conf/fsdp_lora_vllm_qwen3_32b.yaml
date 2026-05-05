@@ -48,7 +48,11 @@ kl_ctl: 0.01
 ppo_n_minibatches: 1
 recompute_logprob: true
 use_decoupled_loss: true
-behav_imp_weight_cap: 5.0
+rejection_sampling:
+  level: token
+  action: mask
+  metric: ratio
+  upper: 5.0
 
 # Reward normalization
 reward_norm:
@@ -111,6 +115,7 @@ cluster:
 # Allocation: 6 GPUs for vLLM inference (32B needs more), 2 GPUs for FSDP training
 # Adjust based on your actual memory constraints
 allocation_mode: vllm[rollout]:d6p1t1+fsdp[actor]:d2p1t1
+backend: fsdp:d2p1t1
 
 scheduler:
   type: null

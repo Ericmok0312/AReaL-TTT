@@ -45,7 +45,11 @@ kl_ctl: 0.01
 ppo_n_minibatches: 1
 recompute_logprob: true
 use_decoupled_loss: true
-behav_imp_weight_cap: 5.0
+rejection_sampling:
+  level: token
+  action: mask
+  metric: ratio
+  upper: 5.0
 
 # Reward normalization
 reward_norm:
@@ -98,6 +102,7 @@ cluster:
 
 # FSDP + SGLang for LoRA (4 GPUs for SGLang inference, 4 GPUs for FSDP training)
 allocation_mode: sglang:d4+fsdp:d4
+backend: fsdp:d4
 
 scheduler:
   type: null
