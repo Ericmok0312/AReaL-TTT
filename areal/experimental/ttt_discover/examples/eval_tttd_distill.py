@@ -307,6 +307,10 @@ class TTTDEvalTrainer(PPOTrainer):
         self._load_hf_checkpoint(self.actor, model_path, model_name)
         
         logger.info(f"[Eval-{model_name}] Weights loaded, synchronizing...")
+        version = hash(model_path) & 0x7FFFFFFF  # 正整数
+        self.actor.set_version(version)
+        self.rollout.set_version(version)
+        logger.info(f"[Eval-{model_name}] Set version to {version}")
         # 2. Push to vLLM
         self.rollout.pause()
         self.actor.update_weights(self.weight_update_meta)
