@@ -130,6 +130,12 @@ class TTTDDistillConfig(TTTDPPOActorConfig):
         default=0.0,
         metadata={"help": "KL penalty coefficient (should be 0 for distillation)"}
     )
+    
+    # Run evaluation with real verification after distillation
+    run_eval_step: bool = field(
+        default=True,
+        metadata={"help": "Run evaluation with real verification after distillation"}
+    )
 
 
 # =============================================================================

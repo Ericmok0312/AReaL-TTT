@@ -109,6 +109,7 @@ class TTTDDistillConfig(TTTDPPOActorConfig):
     )
     adv_estimator: str = field(default="mean_baseline", metadata={"help": "Advantage estimator"})
     kl_ctl: float = field(default=0.0, metadata={"help": "KL penalty coefficient"})
+    run_eval_step: bool = field(default=True, metadata={"help": "Run evaluation with real verification after distillation"})
 
 
 # =============================================================================
