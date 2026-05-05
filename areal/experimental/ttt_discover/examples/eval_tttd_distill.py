@@ -303,14 +303,17 @@ class TTTDEvalTrainer(PPOTrainer):
         # 1. Load model weights into actor
         self._load_hf_checkpoint(self.actor, model_path, model_name)
         
+        logger.info(f"[Eval-{model_name}] Weights loaded, synchronizing...")
         # 2. Push to vLLM
         self.rollout.pause()
         self.actor.update_weights(self.weight_update_meta)
         self.rollout.resume()
         
+        logger.info(f"[Eval-{model_name}] Weights updated, waiting for rollout to sync...")
         # Give vLLM time to load new LoRA
         time.sleep(2)
         
+        logger.info(f"[Eval-{model_name}] Starting evaluation rollout on {len(initial_states)} initial states")
         # 3. Create temp dataloader with initial states only
         temp_sampler = _InitialStateSampler(initial_states)
         eval_batch_size = min(len(initial_states), self.config.sampler.batch_size)
@@ -323,7 +326,7 @@ class TTTDEvalTrainer(PPOTrainer):
             batch_size=eval_batch_size,
             lazy_sampling=False,
         )
-        
+        logger.info(f"[Eval-{model_name}] Created temporary dataloader with batch size {eval_batch_size}")
         # 4. Create eval workflow with verification
         eval_kwargs = self._workflow_kwargs.copy()
         eval_kwargs['reward_fn'] = tttd_reward_fn
