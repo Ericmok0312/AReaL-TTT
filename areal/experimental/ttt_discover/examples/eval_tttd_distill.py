@@ -164,9 +164,23 @@ class TTTDEvalTrainer(PPOTrainer):
         # Setup eval checkpoint paths
         eval_ckpt_dir = os.path.join(config.saver.fileroot, "eval_checkpoints")
         self.base_eval_path = config.actor.path  # base model path
-        self.teacher_eval_path = config.teacher_path
-        self.student_eval_path = os.path.join(eval_ckpt_dir, "student")
-    
+        self.teacher_eval_path = getattr(
+            getattr(config, 'eval', None), 
+            'teacher_lora_path', 
+            config.teacher_path
+        )
+        self.student_eval_path = getattr(
+            getattr(config, 'eval', None), 
+            'student_lora_path', 
+            os.path.join(eval_ckpt_dir, "student")
+        )
+
+        self._eval_version = 0
+        self.actor.set_version(0)
+        self.rollout.set_version(0)
+        logger.info(f"[Eval] Initialized with teacher={self.teacher_eval_path}, student={self.student_eval_path}")
+
+
     def _create_tttd_actor(self, actor_config: TTTDPPOActorConfig):
         """Create TTTDActor."""
         actor = TTTDActor(config=actor_config)
@@ -307,12 +321,14 @@ class TTTDEvalTrainer(PPOTrainer):
         self._load_hf_checkpoint(self.actor, model_path, model_name)
         
         logger.info(f"[Eval-{model_name}] Weights loaded, synchronizing...")
-        version = hash(model_path) & 0x7FFFFFFF  # 正整数
-        self.actor.set_version(version)
-        self.rollout.set_version(version)
-        logger.info(f"[Eval-{model_name}] Set version to {version}")
+        self._eval_version += 1
+        self.actor.set_version(self._eval_version)
+        self.rollout.set_version(self._eval_version)
+        logger.info(f"[Eval-{model_name}] Set version to {self._eval_version}")
+        
         # 2. Push to vLLM
         self.rollout.pause()
+        time.sleep(1.0)
         self.actor.update_weights(self.weight_update_meta)
         self.rollout.resume()
         
