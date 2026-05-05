@@ -168,12 +168,24 @@ def _worker_main(
                 stop_token_ids=req.gconfig.stop_token_ids or [],
                 ignore_eos=req.gconfig.ignore_eos,
             )
-            outputs = self.llm.generate(
-                prompts=None,
-                sampling_params=sp,
-                prompt_token_ids=[req.input_ids],
-                lora_request=self.lora_request,
-            )
+            # vLLM 0.17.0+ (V1 engine) removed the legacy prompt_token_ids kwarg.
+            # Use TokensPrompt via the new ``inputs`` parameter instead.
+            try:
+                from vllm.inputs import TokensPrompt
+                inputs = TokensPrompt(prompt_token_ids=req.input_ids)
+                outputs = self.llm.generate(
+                    inputs,
+                    sampling_params=sp,
+                    lora_request=self.lora_request,
+                )
+            except Exception:
+                # Fallback for older vLLM versions
+                outputs = self.llm.generate(
+                    prompts=None,
+                    sampling_params=sp,
+                    prompt_token_ids=[req.input_ids],
+                    lora_request=self.lora_request,
+                )
             out = outputs[0].outputs[0]
             output_tokens = list(out.token_ids)
             stop_reason = "length" if out.finish_reason == "length" else "stop"
