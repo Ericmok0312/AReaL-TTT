@@ -218,6 +218,7 @@ class TTTDEvalTrainer(PPOTrainer):
             raise ValueError(f"Invalid weight update mode: {config.actor.weight_update_mode}")
         
         self.actor.connect_engine(self.rollout, self.weight_update_meta)
+        logger.info(f"[Rank {dist.get_rank()}] connect_engine done")
     
     def _setup_stats_logger(self):
         """Setup stats logger only (no saver/recover/evaluator for eval)."""
