@@ -325,6 +325,18 @@ def main(args):
     # 3. Read extra YAML fields (teacher/student lora, vllm settings)
     # ------------------------------------------------------------------
     config_dict = OmegaConf.to_container(raw_cfg, resolve=True)
+
+    # Fix: YAML writes vllm.lora_modules as a JSON string, but vLLMConfig
+    # expects a list. Parse it so to_structured_cfg doesn't crash in workers.
+    vllm_section = config_dict.get("vllm", {})
+    lora_modules_raw = vllm_section.get("lora_modules")
+    if isinstance(lora_modules_raw, str):
+        import json as _json
+        try:
+            vllm_section["lora_modules"] = _json.loads(lora_modules_raw)
+        except Exception:
+            vllm_section["lora_modules"] = None
+
     teacher_lora_path = config_dict.get("teacher_lora_path", config.teacher_path)
     student_lora_path = config_dict.get("student_lora_path", "")
     models_to_eval = [("teacher", teacher_lora_path), ("student", student_lora_path)]
