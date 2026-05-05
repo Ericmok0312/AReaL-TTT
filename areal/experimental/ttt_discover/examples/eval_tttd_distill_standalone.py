@@ -8,33 +8,39 @@ class directly for generation.  It reuses TTTDiscoverWorkflowV2 for prompt
 construction, teacher-forcing, code verification, reward computation, and child-state
 creation.
 
-It reads the **same YAML config** as the original eval script
-(e.g. ``fsdp_lora_vllm_ac1_qwen3_8b_distill.yaml``) and respects the
-``vllm.*``, ``cluster.n_gpus_per_node``, ``teacher_lora_path`` and
-``student_lora_path`` fields defined there.
+**Multi-DP support** – launch with ``torchrun`` to get multiple independent vLLM
+instances (one per rank), exactly like AReaL training::
 
-Usage:
-    python -m areal.experimental.ttt_discover.examples.eval_tttd_distill_standalone \
+    torchrun --nproc_per_node=4 \
+        -m areal.experimental.ttt_discover.examples.eval_tttd_distill_standalone \
         --config areal/experimental/ttt_discover/examples/conf/fsdp_lora_vllm_ac1_qwen3_8b_distill.yaml
 
-Output:
-    ``${saver.fileroot}/eval_comparison_standalone.json``
+When ``WORLD_SIZE > 1`` each rank sees only its own GPU via ``CUDA_VISIBLE_DEVICES``,
+creates a single-GPU vLLM instance, evaluates its shard of the initial states, and
+finally rank 0 gathers the results.
 """
 
-import asyncio
-import json
 import os
 import sys
+
+# ---------------------------------------------------------------------------
+# CRITICAL: set GPU visibility BEFORE any CUDA init (torch / vllm imports).
+# ---------------------------------------------------------------------------
+_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+if _world_size > 1:
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(_local_rank)
+
+import asyncio
+import copy
+import json
 import time
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
-from areal.api.cli_args import (
-    load_expr_config,
-    parse_cli_args,
-    to_structured_cfg,
-)
+from areal.api.cli_args import parse_cli_args, to_structured_cfg
 from areal.api.io_struct import ModelRequest, ModelResponse
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 from areal.utils import logging
@@ -50,16 +56,14 @@ from areal.experimental.ttt_discover.sampler import (
 from areal.experimental.ttt_discover.workflow_v2 import TTTDiscoverWorkflowV2
 from areal.experimental.ttt_discover.reward import tttd_reward_fn
 
+from omegaconf import OmegaConf
+from vllm import LLM
+
 logger = logging.getLogger("eval_tttd_distill_standalone")
 
 
 class SimplevLLMEngine:
-    """Minimal vLLM wrapper compatible with TTTDiscoverWorkflowV2.
-
-    Only implements the two methods that WorkflowV2 actually calls:
-    - ``agenerate(req) -> ModelResponse``
-    - ``get_version() -> int``
-    """
+    """Minimal vLLM wrapper compatible with TTTDiscoverWorkflowV2."""
 
     def __init__(self, llm, tokenizer, lora_request=None):
         self.llm = llm
@@ -83,7 +87,6 @@ class SimplevLLMEngine:
     def _generate_sync(self, req: ModelRequest) -> ModelResponse:
         from vllm import SamplingParams
 
-        # vLLM 0.4.x+ uses SamplingParams; map AReaL gconfig fields
         temperature = 0.0 if req.gconfig.greedy else req.gconfig.temperature
         sp = SamplingParams(
             temperature=temperature,
@@ -119,6 +122,16 @@ def _is_lora_adapter(path: str) -> bool:
     return os.path.isfile(os.path.join(path, "adapter_model.safetensors"))
 
 
+def _shard_states(states: list, rank: int, world_size: int) -> list:
+    """Simple contiguous shard – same convention AReaL dataloader uses."""
+    n = len(states)
+    per_rank = n // world_size
+    rem = n % world_size
+    start = rank * per_rank + min(rank, rem)
+    end = start + per_rank + (1 if rank < rem else 0)
+    return states[start:end]
+
+
 async def evaluate_model(
     llm,
     tokenizer,
@@ -128,12 +141,11 @@ async def evaluate_model(
     model_name: str,
     model_path: str | None,
 ) -> dict[str, Any]:
-    """Evaluate a single model on the given initial states."""
+    """Evaluate a single model on the LOCAL shard of initial states."""
     from vllm.lora.request import LoRARequest
 
     logger.info(f"[Eval-{model_name}] path={model_path}")
 
-    # Setup LoRA if needed
     engine = SimplevLLMEngine(llm, tokenizer)
     if model_path and _is_lora_adapter(model_path):
         lora_req = LoRARequest(model_name, 1, model_path)
@@ -147,7 +159,6 @@ async def evaluate_model(
     else:
         logger.warning(f"[Eval-{model_name}] No path provided; using base model.")
 
-    # Reset workflow buffers so each model starts fresh
     workflow.reset()
     workflow.set_current_version(0)
 
@@ -160,68 +171,99 @@ async def evaluate_model(
             trajectory = await workflow.arun_episode(engine, data)
             if trajectory is None:
                 continue
-            # trajectory["rewards"] is a 1-D torch.Tensor of shape [1]
             reward = float(trajectory["rewards"][0])
             rewards.append(reward)
 
     eval_rollout_time = time.perf_counter() - eval_start
 
-    # Gather pending updates for statistics (children, failed, etc.)
     updates = workflow.get_pending_updates(clear=True)
     if len(updates) == 5:
-        eval_children, eval_parents, eval_failed, eval_metadata, _ = updates
+        eval_children, eval_parents, eval_failed, _eval_metadata, _ = updates
     else:
-        eval_children, eval_parents, eval_failed, eval_metadata = updates
+        eval_children, eval_parents, eval_failed, _eval_metadata = updates
 
-    max_reward = max(rewards) if rewards else 0.0
-    mean_reward = sum(rewards) / len(rewards) if rewards else 0.0
-
-    result = {
-        "model": model_name,
-        "global_rollouts": len(rewards),
-        "max_reward": max_reward,
-        "mean_reward": mean_reward,
-        "all_rewards": rewards,
+    return {
+        "rewards": rewards,
         "n_children": len(eval_children),
         "n_parents": len(eval_parents),
         "n_failed": len(eval_failed),
         "rollout_time_s": eval_rollout_time,
-        "children": [],
     }
 
-    for child in eval_children:
-        result["children"].append({
-            "id": child.id,
-            "timestep": child.timestep,
-            "value": child.value,
-            "code": getattr(child, "code", None),
-        })
 
-    logger.info(
-        f"[Eval-{model_name}] max={max_reward:.4f}, mean={mean_reward:.4f}, "
-        f"rollouts={len(rewards)}, children={len(eval_children)}, failed={len(eval_failed)}"
-    )
-    return result
+def _gather_eval_results(local: dict, rank: int, world_size: int) -> dict:
+    """All-gather / all-reduce evaluation stats across DP ranks."""
+    if world_size <= 1:
+        rewards = local["rewards"]
+        return {
+            "global_rollouts": len(rewards),
+            "max_reward": max(rewards) if rewards else 0.0,
+            "mean_reward": sum(rewards) / len(rewards) if rewards else 0.0,
+            "all_rewards": rewards,
+            "n_children": local["n_children"],
+            "n_parents": local["n_parents"],
+            "n_failed": local["n_failed"],
+            "rollout_time_s": local["rollout_time_s"],
+        }
+
+    # 1. all_gather_object rewards lists
+    all_rewards_gathered = [None] * world_size
+    dist.all_gather_object(all_rewards_gathered, local["rewards"])
+    all_rewards = [r for rank_list in all_rewards_gathered for r in rank_list]
+
+    # 2. scalar reductions
+    def _red(val, op):
+        t = torch.tensor([val], dtype=torch.float32, device="cuda")
+        dist.all_reduce(t, op=op)
+        return t.item()
+
+    max_reward = _red(max(local["rewards"]) if local["rewards"] else 0.0, dist.ReduceOp.MAX)
+    sum_reward = _red(sum(local["rewards"]), dist.ReduceOp.SUM)
+    count_reward = _red(len(local["rewards"]), dist.ReduceOp.SUM)
+    mean_reward = sum_reward / count_reward if count_reward > 0 else 0.0
+
+    n_children = int(_red(local["n_children"], dist.ReduceOp.SUM))
+    n_parents = int(_red(local["n_parents"], dist.ReduceOp.SUM))
+    n_failed = int(_red(local["n_failed"], dist.ReduceOp.SUM))
+    rollout_time = _red(local["rollout_time_s"], dist.ReduceOp.MAX)  # wall-clock
+
+    return {
+        "global_rollouts": len(all_rewards),
+        "max_reward": max_reward,
+        "mean_reward": mean_reward,
+        "all_rewards": all_rewards,
+        "n_children": n_children,
+        "n_parents": n_parents,
+        "n_failed": n_failed,
+        "rollout_time_s": rollout_time,
+    }
 
 
 async def main_async(args):
-    # ------------------------------------------------------------------
-    # 0. Parse config – keep both structured config and raw DictConfig so
-    #    we can read extra keys (teacher_lora_path, student_lora_path, vllm, …)
-    #    that are not declared in TTTDDistillConfig.
-    # ------------------------------------------------------------------
-    from omegaconf import OmegaConf
+    rank = _local_rank
+    world_size = _world_size
 
+    # ------------------------------------------------------------------
+    # 0. Init distributed (no-op when world_size == 1)
+    # ------------------------------------------------------------------
+    if world_size > 1:
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(0)  # CUDA_VISIBLE_DEVICES already restricted to 1 GPU
+        logger.info(f"[Rank {rank}/{world_size}] Distributed init done")
+
+    # ------------------------------------------------------------------
+    # 1. Parse config (structured + raw for extra keys)
+    # ------------------------------------------------------------------
     raw_cfg, _config_file = parse_cli_args(args)
     config = OmegaConf.to_object(to_structured_cfg(raw_cfg, TTTDDistillConfig))
 
     if not config.teacher_path:
-        raise ValueError("teacher_path must be provided. Add +teacher_path=<path> to your command.")
+        raise ValueError("teacher_path must be provided.")
     if not config.teacher_sampler_checkpoint:
         raise ValueError("teacher_sampler_checkpoint must be provided.")
 
     # ------------------------------------------------------------------
-    # 1. Load tokenizer & env
+    # 2. Tokenizer & env (all ranks do it – they need the same objects)
     # ------------------------------------------------------------------
     processor, tokenizer = load_hf_processor_and_tokenizer(config.tokenizer_path)
     if tokenizer.pad_token_id not in config.gconfig.stop_token_ids:
@@ -232,9 +274,8 @@ async def main_async(args):
     env = create_env_from_config(config)
 
     # ------------------------------------------------------------------
-    # 2. Load sampler (teacher checkpoint)
+    # 3. Sampler – only rank 0 loads from disk, then broadcast
     # ------------------------------------------------------------------
-    import copy
     teacher_sampler_config = copy.deepcopy(config.sampler)
     if config.teacher_sampler_checkpoint:
         teacher_sampler_config.checkpoint_dir = config.teacher_sampler_checkpoint
@@ -251,53 +292,48 @@ async def main_async(args):
             getattr(config.sampler, "type", "puct"),
         )
         if latest_step is not None:
-            logger.info(f"[TeacherSampler] Loading latest checkpoint at step {latest_step}")
+            if rank == 0:
+                logger.info(f"[TeacherSampler] Loading latest checkpoint at step {latest_step}")
             sampler._load(latest_step)
             sampler._current_step = 0
         else:
-            logger.warning(f"[TeacherSampler] No checkpoint found. Using fresh sampler state.")
+            if rank == 0:
+                logger.warning(f"[TeacherSampler] No checkpoint found. Using fresh sampler state.")
 
     initial_states = sampler._initial_states
     if not initial_states:
         initial_states = [s for s in sampler._states if getattr(s, "timestep", 0) == 0]
     if not initial_states:
         initial_states = sampler._states[:1]
-        logger.warning("[Eval] No initial states found, using first available state")
+        if rank == 0:
+            logger.warning("[Eval] No initial states found, using first available state")
 
-    logger.info(f"[Eval] Using {len(initial_states)} initial states for evaluation")
+    if rank == 0:
+        logger.info(f"[Eval] {len(initial_states)} initial states total, DP={world_size}")
+
+    # Shard states per rank
+    my_states = _shard_states(initial_states, rank, world_size)
+    if rank == 0:
+        logger.info(f"[Eval] Rank 0 shard size = {len(my_states)}")
 
     # ------------------------------------------------------------------
-    # 3. Read vLLM / GPU settings from the raw YAML config
+    # 4. Read vLLM / GPU settings from raw YAML
     # ------------------------------------------------------------------
     vllm_cfg = OmegaConf.to_container(raw_cfg.get("vllm", {}), resolve=True)
-    cluster_cfg = OmegaConf.to_container(raw_cfg.get("cluster", {}), resolve=True)
-
-    # GPU count – default to all visible GPUs if not specified in YAML
-    n_gpus = cluster_cfg.get("n_gpus_per_node", torch.cuda.device_count())
-    if n_gpus <= 0:
-        n_gpus = 1
-
-    # Teacher / student LoRA paths – read from raw config (may be omitted in TTTDDistillConfig)
     teacher_lora_path = raw_cfg.get("teacher_lora_path", config.teacher_path)
     student_lora_path = raw_cfg.get("student_lora_path", "")
 
-    logger.info(
-        f"[Config] GPUs={n_gpus}, teacher_lora={teacher_lora_path}, "
-        f"student_lora={student_lora_path}"
-    )
-
     # ------------------------------------------------------------------
-    # 4. Initialize vLLM
+    # 5. Each rank creates its OWN vLLM instance (TP=1, bound to 1 GPU)
     # ------------------------------------------------------------------
-    from vllm import LLM
-
     base_model_path = config.actor.path
-    logger.info(f"[vLLM] Loading base model from {base_model_path} (TP={n_gpus})")
+    if rank == 0:
+        logger.info(f"[vLLM] Loading base model {base_model_path} on {world_size} ranks")
 
     llm = LLM(
         model=base_model_path,
         tokenizer=config.tokenizer_path,
-        tensor_parallel_size=n_gpus,
+        tensor_parallel_size=1,  # one GPU per instance
         gpu_memory_utilization=vllm_cfg.get("gpu_memory_utilization", 0.85),
         max_model_len=vllm_cfg.get("max_model_len", 32768),
         enforce_eager=vllm_cfg.get("enforce_eager", False),
@@ -305,10 +341,10 @@ async def main_async(args):
         max_lora_rank=vllm_cfg.get("max_lora_rank", getattr(config.actor, "lora_rank", 64)),
         trust_remote_code=True,
     )
-    logger.info("[vLLM] Base model loaded")
+    logger.info(f"[Rank {rank}] vLLM instance ready")
 
     # ------------------------------------------------------------------
-    # 5. Create workflow (eager mode, no lazy sampling)
+    # 6. Workflow
     # ------------------------------------------------------------------
     group_size = config.gconfig.n_samples
 
@@ -320,15 +356,15 @@ async def main_async(args):
         reward_fn=tttd_reward_fn,
         enable_thinking=getattr(config, "enable_thinking", False),
         max_prompt_thinking_tokens=getattr(config, "max_prompt_thinking_tokens", 26000),
-        batch_size=len(initial_states),
+        batch_size=len(my_states),
         group_size=group_size,
         lazy_sampling=False,
-        dp_rank=0,
-        dp_world_size=1,
+        dp_rank=rank,
+        dp_world_size=world_size,
     )
 
     # ------------------------------------------------------------------
-    # 6. Evaluate teacher & student
+    # 7. Evaluate teacher & student on local shard
     # ------------------------------------------------------------------
     models_to_eval = [
         ("teacher", teacher_lora_path),
@@ -337,40 +373,49 @@ async def main_async(args):
 
     all_results = {}
     for label, path in models_to_eval:
-        all_results[label] = await evaluate_model(
+        local_result = await evaluate_model(
             llm=llm,
             tokenizer=tokenizer,
             workflow=workflow,
-            initial_states=initial_states,
+            initial_states=my_states,
             group_size=group_size,
             model_name=label,
             model_path=path,
         )
+        # Synchronize across ranks
+        gathered = _gather_eval_results(local_result, rank, world_size)
+        all_results[label] = gathered
 
     # ------------------------------------------------------------------
-    # 7. Save results
+    # 8. Rank 0 writes JSON & prints summary
     # ------------------------------------------------------------------
-    comparison_path = os.path.join(config.saver.fileroot, "eval_comparison_standalone.json")
-    with open(comparison_path, "w") as f:
-        json.dump(all_results, f, indent=2, default=str)
-    logger.info(f"[Eval] Comparison results saved to {comparison_path}")
+    if rank == 0:
+        comparison_path = os.path.join(config.saver.fileroot, "eval_comparison_standalone.json")
+        os.makedirs(os.path.dirname(comparison_path), exist_ok=True)
+        with open(comparison_path, "w") as f:
+            json.dump(all_results, f, indent=2, default=str)
+        logger.info(f"[Eval] Results saved to {comparison_path}")
 
-    logger.info("\n" + "=" * 70)
-    logger.info("EVALUATION COMPARISON (Initial States) – Standalone vLLM")
-    logger.info("=" * 70)
-    for label in ["teacher", "student"]:
-        r = all_results[label]
-        logger.info(
-            f"{label:10s} | max_reward={r['max_reward']:.4f} | "
-            f"mean_reward={r['mean_reward']:.4f} | "
-            f"rollouts={r['global_rollouts']} | "
-            f"children={r['n_children']} | failed={r['n_failed']}"
-        )
-    logger.info("=" * 70)
+        logger.info("\n" + "=" * 70)
+        logger.info("EVALUATION COMPARISON (Initial States) – Standalone vLLM Multi-DP")
+        logger.info("=" * 70)
+        for label in ["teacher", "student"]:
+            r = all_results[label]
+            logger.info(
+                f"{label:10s} | max_reward={r['max_reward']:.4f} | "
+                f"mean_reward={r['mean_reward']:.4f} | "
+                f"rollouts={r['global_rollouts']} | "
+                f"children={r['n_children']} | failed={r['n_failed']}"
+            )
+        logger.info("=" * 70)
 
     # Cleanup
     workflow.shutdown()
-    logger.info("[Eval] Done.")
+    if world_size > 1:
+        dist.barrier()
+        dist.destroy_process_group()
+    if rank == 0:
+        logger.info("[Eval] Done.")
 
 
 def main(args):
