@@ -280,7 +280,7 @@ class TTTDDistillEvaluator:
 
     def _init_scheduler(self):
         from areal.infra import LocalScheduler
-        return LocalScheduler()
+        return LocalScheduler(exp_config=self.config)
 
     def _init_rollout(self, rollout_config, is_eval=False):
         from areal.infra import RolloutController
