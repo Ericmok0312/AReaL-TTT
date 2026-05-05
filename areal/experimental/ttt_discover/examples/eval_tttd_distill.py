@@ -17,7 +17,7 @@ import torch.distributed as dist
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal import PPOTrainer
-from areal.api.alloc_mode import _AllocationMode as AllocationMode
+from areal.api.alloc_mode import _AllocationMode as AllocationMode, ModelAllocation
 from areal.api.cli_args import load_expr_config
 from areal.api.io_struct import FinetuneSpec, WeightUpdateMeta
 from areal.infra import current_platform
@@ -84,6 +84,8 @@ class TTTDEvalTrainer(PPOTrainer):
         
         # Parse allocation mode
         self.allocation_mode = AllocationMode.from_str(config.allocation_mode)
+        self.actor_alloc = ModelAllocation.from_str(config.actor.backend, name="actor")
+        self.rollout_alloc = ModelAllocation.from_str(config.rollout.backend, name="rollout")
         self._amend_xccl_weight_update_envvar()
         
         # Create sampler from teacher checkpoint
