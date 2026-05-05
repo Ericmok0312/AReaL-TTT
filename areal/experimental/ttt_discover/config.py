@@ -308,6 +308,15 @@ class TTTDDistillConfig(TTTDPPOConfig):
         default=True,
         metadata={"help": "Run evaluation with real verification after distillation"},
     )
+    teacher_lora_path: str = field(
+        default="",
+        metadata={"help": "Path to teacher LoRA adapter for eval (defaults to teacher_path if empty)"},
+    )
+    student_lora_path: str = field(
+        default="",
+        metadata={"help": "Path to student LoRA adapter for eval"},
+    )
+
 
 
 # Import envs here to avoid circular imports

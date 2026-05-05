@@ -204,6 +204,6 @@ perf_tracer:
   enabled: false
   session_tracer:
     enabled: false
-eval:
-  teacher_lora_path: ${teacher_path}
-  student_lora_path: ./outputs_ac1_distill/eval_checkpoints/student
+
+teacher_lora_path: ${teacher_path}
+student_lora_path: ./outputs_ac1_distill/eval_checkpoints/student
