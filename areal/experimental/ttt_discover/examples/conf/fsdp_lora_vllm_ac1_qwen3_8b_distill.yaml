@@ -72,7 +72,7 @@ actor:
   lora_alpha: 16
   target_modules:
   - all-linear
-  weight_update_mode: xccl
+  weight_update_mode: disk
   adv_estimator: mean_baseline
   adv_estimator_beta: 1.0
   adv_estimator_target_kl: 0.693
