@@ -442,7 +442,7 @@ class TTTDEvalTrainer(PPOTrainer):
         # Evaluate three models
         all_results = {}
         for label, path in [
-            ("base", self.base_eval_path),
+            # ("base", self.base_eval_path),
             ("teacher", self.teacher_eval_path),
             ("student", self.student_eval_path),
         ]:
