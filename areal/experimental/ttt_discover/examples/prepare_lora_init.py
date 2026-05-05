@@ -127,7 +127,7 @@ def main():
     # Try TTTDDistillConfig first (for distillation configs with teacher_path),
     # fall back to TTTDPPOActorConfig for standard training configs.
     try:
-        from train_tttd_distill import TTTDDistillConfig
+        from areal.experimental.ttt_discover.config import TTTDDistillConfig
         config, _ = load_expr_config([f"--config={args.config_path}"], TTTDDistillConfig)
     except Exception:
         config, _ = load_expr_config([f"--config={args.config_path}"], TTTDPPOActorConfig)

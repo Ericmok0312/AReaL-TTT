@@ -394,6 +394,59 @@ class TTTDPPOActorConfig(PPOActorConfig):
                 pass
 
 
+@dataclass
+class TTTDDistillConfig(TTTDPPOActorConfig):
+    """Extended config for TTT-Discover distillation and evaluation.
+
+    Used by both training (train_tttd_distill.py) and evaluation
+    (eval_tttd_distill.py) scripts.
+    """
+
+    # Teacher model settings
+    teacher_path: str = field(
+        default="",
+        metadata={"help": "Path to teacher model checkpoint (HF format or DCP)"}
+    )
+    teacher_sampler_checkpoint: str = field(
+        default="",
+        metadata={"help": "Path to teacher PUCTSampler checkpoint directory"}
+    )
+    teacher_weight_format: str = field(
+        default="hf",
+        metadata={"help": "Teacher checkpoint format: 'hf' or 'dcp'", "choices": ["hf", "dcp"]}
+    )
+
+    # Distillation settings
+    distill_steps: int = field(
+        default=3,
+        metadata={"help": "Number of distillation steps (no verification)"}
+    )
+    kl_reward_scale: float = field(
+        default=1.0,
+        metadata={"help": "Scale factor for KL-based reward"}
+    )
+    kl_estimator_type: str = field(
+        default="k1",
+        metadata={"help": "KL estimator: k1, k2, or k3", "choices": ["k1", "k2", "k3"]}
+    )
+    total_rollouts_per_step: int = field(
+        default=512,
+        metadata={"help": "Total number of rollouts per step across all ranks"}
+    )
+    adv_estimator: str = field(
+        default="mean_baseline",
+        metadata={"help": "Advantage estimator for distillation"}
+    )
+    kl_ctl: float = field(
+        default=0.0,
+        metadata={"help": "KL penalty coefficient (should be 0 for distillation)"}
+    )
+    run_eval_step: bool = field(
+        default=True,
+        metadata={"help": "Run evaluation with real verification after distillation"}
+    )
+
+
 # Import envs here to avoid circular imports
 def create_env_from_config(config):
     """

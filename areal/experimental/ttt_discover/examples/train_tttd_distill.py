@@ -46,6 +46,7 @@ from areal.utils.data import KLEstimator
 from areal.experimental.ttt_discover.config import (
     SamplerConfig,
     TTTDPPOActorConfig,
+    TTTDDistillConfig,
     create_env_from_config,
 )
 from areal.experimental.ttt_discover.sampler import (
@@ -76,66 +77,6 @@ def dummy_reward_fn(prompt, completions, prompt_ids, completion_ids, **data):
     return 0.0, result, "", 0.0
 
 
-
-
-# =============================================================================
-# Distillation Config
-# =============================================================================
-@dataclass
-class TTTDDistillConfig(TTTDPPOActorConfig):
-    """Extended config for TTT-Discover distillation."""
-    
-    # Teacher model settings
-    teacher_path: str = field(
-        default="",
-        metadata={"help": "Path to teacher model checkpoint (HF format or DCP)"}
-    )
-    teacher_sampler_checkpoint: str = field(
-        default="",
-        metadata={"help": "Path to teacher PUCTSampler checkpoint directory"}
-    )
-    teacher_weight_format: str = field(
-        default="hf",
-        metadata={"help": "Teacher checkpoint format: 'hf' or 'dcp'", "choices": ["hf", "dcp"]}
-    )
-    
-    # Distillation settings
-    distill_steps: int = field(
-        default=3,
-        metadata={"help": "Number of distillation steps (no verification)"}
-    )
-    kl_reward_scale: float = field(
-        default=1.0,
-        metadata={"help": "Scale factor for KL-based reward"}
-    )
-    kl_estimator_type: str = field(
-        default="k1",
-        metadata={"help": "KL estimator: k1, k2, or k3", "choices": ["k1", "k2", "k3"]}
-    )
-    
-    # Total rollouts per step (will validate batch_size * n_samples == this)
-    total_rollouts_per_step: int = field(
-        default=512,
-        metadata={"help": "Total number of rollouts per step across all ranks"}
-    )
-    
-    # Use mean_baseline for advantage to get relative KL signal
-    adv_estimator: str = field(
-        default="mean_baseline",
-        metadata={"help": "Advantage estimator for distillation"}
-    )
-    
-    # Disable KL penalty since KL is the reward itself
-    kl_ctl: float = field(
-        default=0.0,
-        metadata={"help": "KL penalty coefficient (should be 0 for distillation)"}
-    )
-    
-    # Run evaluation with real verification after distillation
-    run_eval_step: bool = field(
-        default=True,
-        metadata={"help": "Run evaluation with real verification after distillation"}
-    )
 
 
 # =============================================================================

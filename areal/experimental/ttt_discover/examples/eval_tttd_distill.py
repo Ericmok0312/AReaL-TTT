@@ -41,6 +41,7 @@ from areal.utils.recover import RecoverHandler
 from areal.experimental.ttt_discover.config import (
     SamplerConfig,
     TTTDPPOActorConfig,
+    TTTDDistillConfig,
     create_env_from_config,
 )
 from areal.experimental.ttt_discover.sampler import (
@@ -73,43 +74,6 @@ class _InitialStateSampler:
             result.append(self._initial_states[self._idx % len(self._initial_states)])
             self._idx += 1
         return result
-
-
-# =============================================================================
-# Eval Config (reuse distillation config)
-# =============================================================================
-@dataclass
-class TTTDDistillConfig(TTTDPPOActorConfig):
-    """Config for TTT-Discover distillation and evaluation."""
-
-    teacher_path: str = field(
-        default="",
-        metadata={"help": "Path to teacher model checkpoint (HF format or DCP)"}
-    )
-    teacher_sampler_checkpoint: str = field(
-        default="",
-        metadata={"help": "Path to teacher PUCTSampler checkpoint directory"}
-    )
-    teacher_weight_format: str = field(
-        default="hf",
-        metadata={"help": "Teacher checkpoint format: 'hf' or 'dcp'", "choices": ["hf", "dcp"]}
-    )
-    distill_steps: int = field(
-        default=3,
-        metadata={"help": "Number of distillation steps (unused in eval)"}
-    )
-    kl_reward_scale: float = field(default=1.0, metadata={"help": "Scale factor for KL-based reward"})
-    kl_estimator_type: str = field(
-        default="k1",
-        metadata={"help": "KL estimator: k1, k2, or k3", "choices": ["k1", "k2", "k3"]}
-    )
-    total_rollouts_per_step: int = field(
-        default=512,
-        metadata={"help": "Total number of rollouts per step across all ranks"}
-    )
-    adv_estimator: str = field(default="mean_baseline", metadata={"help": "Advantage estimator"})
-    kl_ctl: float = field(default=0.0, metadata={"help": "KL penalty coefficient"})
-    run_eval_step: bool = field(default=True, metadata={"help": "Run evaluation with real verification after distillation"})
 
 
 # =============================================================================
