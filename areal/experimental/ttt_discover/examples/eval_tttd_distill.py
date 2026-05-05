@@ -261,13 +261,15 @@ class TTTDEvalTrainer(PPOTrainer):
             return
 
         logger.info(f"[Load-{model_name}] Loading LoRA adapter from {path}")
+        lora_name = self.config.gconfig.lora_name
+        logger.info(f"[Load-{model_name}] Detected LoRA adapter checkpoint. Loading adapter '{lora_name}' from {adapter_path}")
         if dist.get_rank() == 0:
             lora_state = load_file(adapter_path)
             fixed_state = {}
             for k, v in lora_state.items():
                 if "lora_A" in k or "lora_B" in k:
-                    k = k.replace(".lora_A.weight", ".lora_A.default.weight")
-                    k = k.replace(".lora_B.weight", ".lora_B.default.weight")
+                    k = k.replace(".lora_A.weight", f".lora_A.{lora_name}.weight")
+                    k = k.replace(".lora_B.weight", f".lora_B.{lora_name}.weight")
                 fixed_state[k] = v
         else:
             fixed_state = {}
@@ -276,7 +278,7 @@ class TTTDEvalTrainer(PPOTrainer):
             full_state_dict=True,
             cpu_offload=False,
             broadcast_from_rank0=True,
-            strict=True,
+            strict=False,
         )
         set_model_state_dict(engine.model, fixed_state, options=options)
         logger.info(f"[Load-{model_name}] Loaded LoRA adapter from {path}")
