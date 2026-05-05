@@ -252,7 +252,7 @@ def main(args):
         )
     else:
         weight_update_meta = WeightUpdateMeta.from_fsdp_xccl(
-            allocation_mode,
+            allocation_mode["rollout"],
             use_lora=config.actor.use_lora,
             lora_name=config.gconfig.lora_name,
             lora_int_id=1,

@@ -245,7 +245,7 @@ class TTTDPPOTrainer(PPOTrainer):
                     self.allocation_mode
                 )
             else:
-                xccl_kwargs = {"allocation_mode": self.allocation_mode}
+                xccl_kwargs = {"gen_allocation": self.rollout_alloc}
                 if config.actor.use_lora:
                     xccl_kwargs.update({
                         "use_lora": config.actor.use_lora,
