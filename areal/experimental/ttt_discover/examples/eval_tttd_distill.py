@@ -276,7 +276,7 @@ class TTTDEvalTrainer(PPOTrainer):
             full_state_dict=True,
             cpu_offload=False,
             broadcast_from_rank0=True,
-            strict=False,
+            strict=True,
         )
         set_model_state_dict(engine.model, fixed_state, options=options)
         logger.info(f"[Load-{model_name}] Loaded LoRA adapter from {path}")
