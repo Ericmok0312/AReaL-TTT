@@ -1,9 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import argparse
 import asyncio
+import hmac
 import inspect
 import os
+import secrets
 import threading
 import time
 from collections.abc import AsyncGenerator
@@ -18,14 +22,13 @@ from litellm.llms.anthropic.experimental_pass_through.adapters.transformation im
     AnthropicAdapter,
 )
 from litellm.types.utils import ModelResponse as LitellmModelResponse
-from pydantic import BaseModel
-
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.responses import Response
 from openai.types.responses.response_create_params import ResponseCreateParams
+from pydantic import BaseModel
 
-from areal.api.cli_args import NameResolveConfig, OpenAIProxyConfig
+from areal.api.cli_args import NameResolveConfig
 from areal.experimental.openai.client import ArealOpenAI
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.utils import name_resolve, names, seeding
@@ -37,6 +40,9 @@ from areal.utils.network import find_free_ports, gethostip
 from .server import (
     ANTHROPIC_MESSAGES_PATHNAME,
     CHAT_COMPLETIONS_PATHNAME,
+    DEFAULT_ADMIN_API_KEY,
+    EXPORT_TRAJECTORIES_PATHNAME,
+    GRANT_CAPACITY_PATHNAME,
     RESPONSES_PATHNAME,
     RL_END_SESSION_PATHNAME,
     RL_SET_REWARD_PATHNAME,
@@ -51,7 +57,7 @@ from .server import (
 )
 
 if TYPE_CHECKING:
-    from areal.api.engine_api import InferenceEngine
+    from areal.api import InferenceEngine
 
 
 logger = getLogger("ProxyRolloutServer")
@@ -96,6 +102,13 @@ _capacity = 0
 _last_cleanup_time: float = 0
 _session_timeout_seconds: int = 3600  # Default timeout (overridden by config)
 
+# API key authentication
+# Initialized to a random value so pre-configuration requests cannot bypass auth.
+# Overwritten by _setup_openai_client() once the engine is configured.
+_admin_api_key: str = secrets.token_urlsafe(32)
+_api_key_to_session: dict[str, str] = {}
+_session_to_api_key: dict[str, str] = {}  # Reverse mapping for O(1) cleanup
+
 # Server address (set at startup)
 _server_host: str = "0.0.0.0"
 _server_port: int = 8000
@@ -133,6 +146,64 @@ async def validate_json_request(raw_request: Request):
                 }
             ]
         )
+
+
+# =============================================================================
+# API Key Authentication
+# =============================================================================
+
+
+def _extract_bearer_token(request: Request) -> str:
+    """Extract API token from Authorization header or x-api-key header.
+
+    Supports both 'Authorization: Bearer <token>' (OpenAI SDK, case-insensitive
+    per RFC 6750) and 'x-api-key: <token>' (Anthropic SDK) for cross-SDK
+    compatibility.
+    """
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()  # len("Bearer ") == 7
+    # Fallback to x-api-key header (used by Anthropic SDK)
+    x_api_key = request.headers.get("x-api-key", "")
+    if x_api_key:
+        return x_api_key
+    raise HTTPException(
+        status_code=401,
+        detail="Missing or malformed Authorization header. Expected 'Bearer <token>' or 'x-api-key: <token>'.",
+    )
+
+
+def _require_admin_key(request: Request) -> str:
+    """Validate that the request carries the admin API key.
+
+    Uses constant-time comparison to prevent timing attacks.
+    """
+    token = _extract_bearer_token(request)
+    if not hmac.compare_digest(token, _admin_api_key):
+        raise HTTPException(status_code=403, detail="Invalid admin API key.")
+    return token
+
+
+def _require_session_key(request: Request) -> str:
+    """Resolve session_id from the session API key in the Authorization header."""
+    token = _extract_bearer_token(request)
+    with _lock:
+        session_id = _api_key_to_session.get(token)
+    if session_id is None:
+        raise HTTPException(
+            status_code=401, detail="Invalid or expired session API key."
+        )
+    return session_id
+
+
+def _remove_api_keys_for_session(session_id: str) -> None:
+    """Remove the API key mapping for the given session.
+
+    Must be called with _lock held.
+    """
+    api_key = _session_to_api_key.pop(session_id, None)
+    if api_key:
+        _api_key_to_session.pop(api_key, None)
 
 
 # =============================================================================
@@ -189,20 +260,26 @@ async def alloc_ports(raw_request: Request):
 
 
 def _setup_openai_client():
-    global _openai_client, _session_timeout_seconds
+    global _openai_client, _session_timeout_seconds, _admin_api_key
     config = _engine.config
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
-    openai_cfg = config.openai or OpenAIProxyConfig()
+    agent_cfg = config.agent
     _openai_client = ArealOpenAI(
         engine=_engine,
         tokenizer=tokenizer,
-        tool_call_parser=openai_cfg.tool_call_parser,
-        reasoning_parser=openai_cfg.reasoning_parser,
-        engine_max_tokens=openai_cfg.engine_max_tokens,
-        chat_template_type=openai_cfg.chat_template_type,
+        tool_call_parser=agent_cfg.tool_call_parser,
+        reasoning_parser=agent_cfg.reasoning_parser,
+        engine_max_tokens=agent_cfg.engine_max_tokens,
+        chat_template_type=agent_cfg.chat_template_type,
     )
-    # Set session timeout from config
-    _session_timeout_seconds = openai_cfg.session_timeout_seconds
+    _session_timeout_seconds = agent_cfg.session_timeout_seconds
+    with _lock:
+        _admin_api_key = agent_cfg.admin_api_key
+        if _admin_api_key == DEFAULT_ADMIN_API_KEY:
+            logger.warning(
+                "Using default admin API key. Change 'admin_api_key' in "
+                "AgentConfig for non-local deployments."
+            )
 
 
 @app.post("/configure")
@@ -260,7 +337,7 @@ async def call_engine_method(raw_request: Request):
 # =============================================================================
 
 
-@app.post("/grant_capacity")
+@app.post(f"/{GRANT_CAPACITY_PATHNAME}", dependencies=[Depends(_require_admin_key)])
 def grant_capacity():
     """Grant capacity for a new session."""
     global _capacity
@@ -275,10 +352,16 @@ def grant_capacity():
 
 
 def _cleanup_stale_sessions():
-    """Remove stale sessions from the cache.
+    """Remove stale sessions and orphaned API key mappings.
 
     Called periodically (at most once per minute) during start_session to clean up
     sessions that were started but never finished.
+
+    Also sweeps orphaned API key mappings whose session_id is no longer in
+    _session_cache (e.g. if a client crashes after end_session but before
+    export_trajectories).
+
+    Must be called with _lock held.
     """
     global _last_cleanup_time
 
@@ -298,13 +381,31 @@ def _cleanup_stale_sessions():
         logger.warning(f"Removing stale session: {session_id}")
         _session_cache.pop(session_id, None)
 
+    # Clean up API key mappings for stale sessions
     if stale_sessions:
+        for sid in stale_sessions:
+            _remove_api_keys_for_session(sid)
         logger.info(f"Cleaned up {len(stale_sessions)} stale sessions")
 
+    # Sweep orphaned API key mappings whose session_id is no longer in cache.
+    # Handles edge case where client crashes after end_session but before
+    # export_trajectories, leaving key mappings with no cleanup path.
+    orphaned_sids = [sid for sid in _session_to_api_key if sid not in _session_cache]
+    for sid in orphaned_sids:
+        _remove_api_keys_for_session(sid)
+    if orphaned_sids:
+        logger.info(f"Cleaned up {len(orphaned_sids)} orphaned API key mappings")
 
-@app.post(f"/{RL_START_SESSION_PATHNAME}")
+
+@app.post(f"/{RL_START_SESSION_PATHNAME}", dependencies=[Depends(_require_admin_key)])
 def start_session(request: StartSessionRequest) -> StartSessionResponse:
-    """Start a new RL session."""
+    """Start a new RL session and allocate a unique session API key.
+
+    If ``request.api_key`` is provided, reuse that key instead of generating
+    a new one.  When the key already maps to a *finished* session on this
+    worker, the stale mapping is cleaned up first.  If it maps to an
+    *active* (unfinished) session, the request is rejected with HTTP 409.
+    """
     global _capacity
     task_id = request.task_id
 
@@ -323,26 +424,67 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
         while (session_id := f"{task_id}-{idx}") in _session_cache:
             idx += 1
 
+        # Resolve session API key
+        if request.api_key:
+            # Gateway requested a specific key (refresh / reuse).
+            session_api_key = request.api_key
+            if session_api_key == _admin_api_key:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cannot use the admin API key as a session key.",
+                )
+            existing_sid = _api_key_to_session.get(session_api_key)
+            if existing_sid is not None:
+                existing_session = _session_cache.get(existing_sid)
+                if existing_session is not None and not existing_session.is_completed:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"API key is already bound to active session {existing_sid}.",
+                    )
+                # Finished or orphaned — clean up the stale mapping.
+                _remove_api_keys_for_session(existing_sid)
+        else:
+            # Generate unique session API key (current behaviour).
+            session_api_key = secrets.token_urlsafe(32)
+            while (
+                session_api_key in _api_key_to_session
+                or session_api_key == _admin_api_key
+            ):
+                session_api_key = secrets.token_urlsafe(32)
+
         _capacity -= 1
         _session_cache[session_id] = SessionData(session_id=session_id)
+        _api_key_to_session[session_api_key] = session_id
+        _session_to_api_key[session_id] = session_api_key
 
-    return StartSessionResponse(session_id=session_id)
+    return StartSessionResponse(session_id=session_id, api_key=session_api_key)
 
 
-@app.post("/{session_id}/" + RL_END_SESSION_PATHNAME)
-def end_session(session_id: str):
-    """End an RL session."""
+@app.post(f"/{RL_END_SESSION_PATHNAME}")
+def end_session(session_id: str = Depends(_require_session_key)):
+    """End an RL session.
+
+    Returns the number of recorded interactions so callers (e.g. the proxy
+    gateway refresh path) can decide whether meaningful trajectory data
+    exists.
+    """
     with _lock:
         if session_id not in _session_cache:
-            raise HTTPException(status_code=400, detail="Session not found")
+            raise HTTPException(
+                status_code=410, detail="Session already ended or expired"
+            )
         session = _session_cache[session_id]
+        interaction_count = len(session.completions)
 
+    # finish() outside lock to avoid holding lock during potential I/O
     session.finish()
-    return {"message": "success"}
+    return {"message": "success", "interaction_count": interaction_count}
 
 
-@app.post("/{session_id}/" + RL_SET_REWARD_PATHNAME)
-def set_reward(request: SetRewardRequest, session_id: str):
+@app.post(f"/{RL_SET_REWARD_PATHNAME}")
+def set_reward(
+    request: SetRewardRequest, session_id: str = Depends(_require_session_key)
+):
     """Set reward for an interaction in a session."""
     interaction_id = request.interaction_id
     reward = request.reward
@@ -350,7 +492,7 @@ def set_reward(request: SetRewardRequest, session_id: str):
     with _lock:
         if session_id not in _session_cache:
             raise HTTPException(
-                status_code=400, detail=f"Session {session_id} not found"
+                status_code=410, detail=f"Session {session_id} already ended or expired"
             )
         session_data = _session_cache[session_id]
 
@@ -394,7 +536,7 @@ async def _call_client_create(
     with _lock:
         if session_id not in _session_cache:
             raise HTTPException(
-                status_code=400, detail=f"Session {session_id} not found"
+                status_code=410, detail=f"Session {session_id} already ended or expired"
             )
         session_data = _session_cache[session_id]
 
@@ -444,7 +586,11 @@ async def _call_client_create(
         kwargs["top_p"] = 1.0
         _warn_once("top_p not set in request, defaulting to 1.0")
 
-    # Add stream parameter if requested
+    # Strip stream from request body to prevent it from bypassing the explicit
+    # `stream` parameter.  Without this, a request with {"stream": true} would
+    # leak through kwargs and cause the client to return an AsyncGenerator even
+    # when the caller did not ask for streaming.
+    kwargs.pop("stream", None)
     if stream:
         kwargs["stream"] = True
 
@@ -457,18 +603,63 @@ async def _call_client_create(
 
 
 @app.post(
-    "/{session_id}/" + CHAT_COMPLETIONS_PATHNAME,
+    f"/{CHAT_COMPLETIONS_PATHNAME}",
     dependencies=[Depends(validate_json_request)],
+    response_model=None,
 )
 async def chat_completions(
-    request: CompletionCreateParams, session_id: str
-) -> ChatCompletion:
-    """OpenAI-compatible chat completions endpoint."""
+    request: CompletionCreateParams, session_id: str = Depends(_require_session_key)
+) -> ChatCompletion | StreamingResponse:
+    """OpenAI-compatible chat completions endpoint.
+
+    Supports both streaming (stream=True) and non-streaming requests.
+    For streaming requests, returns a StreamingResponse with Server-Sent Events
+    in the OpenAI streaming format (data: {json}\\n\\n ... data: [DONE]\\n\\n).
+    """
     if _openai_client is None:
         raise HTTPException(
             status_code=500,
             detail='Proxy server not initialized. Send requests to /create_engine then /call "initialize" first.',
         )
+
+    # CompletionCreateParams is a TypedDict (dict subclass), so use dict access.
+    is_streaming = request.get("stream") is True
+
+    if is_streaming:
+        openai_stream = None
+        try:
+            openai_stream = await _call_client_create(
+                create_fn=_openai_client.chat.completions.create,
+                request=request,
+                session_id=session_id,
+                stream=True,
+            )
+
+            # Convert ChatCompletionChunk objects to OpenAI SSE format
+            async def _openai_sse_generator(
+                chunk_stream: AsyncGenerator[ChatCompletionChunk, None],
+            ) -> AsyncGenerator[str, None]:
+                async for chunk in chunk_stream:
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+                yield "data: [DONE]\n\n"
+
+            safe_stream = _safe_stream_wrapper(_openai_sse_generator(openai_stream))
+
+            return StreamingResponse(
+                safe_stream,
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        except Exception as e:
+            if openai_stream is not None and hasattr(openai_stream, "aclose"):
+                await openai_stream.aclose()
+            logger.error(f"Error setting up streaming response: {e}")
+            raise HTTPException(status_code=500, detail=f"Streaming setup failed: {e}")
+
     return await _call_client_create(
         create_fn=_openai_client.chat.completions.create,
         request=request,
@@ -477,10 +668,12 @@ async def chat_completions(
 
 
 @app.post(
-    "/{session_id}/" + RESPONSES_PATHNAME,
+    f"/{RESPONSES_PATHNAME}",
     dependencies=[Depends(validate_json_request)],
 )
-async def responses(request: ResponseCreateParams, session_id: str) -> Response:
+async def responses(
+    request: ResponseCreateParams, session_id: str = Depends(_require_session_key)
+) -> Response:
     """OpenAI-compatible responses endpoint."""
     if _openai_client is None:
         raise HTTPException(
@@ -547,12 +740,12 @@ async def _safe_stream_wrapper(
 
 
 @app.post(
-    "/{session_id}/" + ANTHROPIC_MESSAGES_PATHNAME,
+    f"/{ANTHROPIC_MESSAGES_PATHNAME}",
     dependencies=[Depends(validate_json_request)],
     response_model=None,
 )
 async def anthropic_messages(
-    raw_request: Request, session_id: str
+    raw_request: Request, session_id: str = Depends(_require_session_key)
 ) -> Message | StreamingResponse:
     """Anthropic Messages API compatible endpoint.
 
@@ -672,11 +865,19 @@ async def anthropic_messages(
 # =============================================================================
 
 
-@app.post("/export_trajectories")
+@app.post(
+    f"/{EXPORT_TRAJECTORIES_PATHNAME}",
+    dependencies=[Depends(_require_admin_key)],
+)
 async def export_trajectories(
     request: ExportTrajectoriesRequest,
 ) -> ExportTrajectoriesResponse:
-    """Export interactions for a session."""
+    """Export interactions for a completed session.
+
+    The caller must supply an explicit ``session_id`` in the request body
+    and authenticate with the admin key.  This avoids routing ambiguity
+    when an API key has been reused across sessions.
+    """
     session_id = request.session_id
 
     with _lock:
@@ -695,9 +896,10 @@ async def export_trajectories(
         style=request.style,
     )
 
-    # Remove session from cache
+    # Remove session from cache and clean up API key mapping
     with _lock:
         _session_cache.pop(session_id, None)
+        _remove_api_keys_for_session(session_id)
 
     # Serialize for HTTP transport
     serialized = serialize_interactions(interactions)

@@ -164,13 +164,13 @@ Adapt the model architecture to match the target model.
    - `init_weights()`: Match initialization scheme from HF
    - `init_buffers()`: RoPE cache + MoE buffers
    - `forward()`: Must follow `BaseArchonModel` signature:
-     `(tokens, positions, cu_seqlens, max_seqlen) -> Tensor`
+     `(tokens, positions, cu_seqlens, max_seqlen, tree_attn_meta=None) -> Tensor`
 
 **Base class contract** (`BaseArchonModel`):
 
 ```python
 class <Model>Model(BaseArchonModel):
-    def forward(self, tokens, positions, cu_seqlens, max_seqlen) -> torch.Tensor: ...
+    def forward(self, tokens, positions, cu_seqlens, max_seqlen, tree_attn_meta=None) -> torch.Tensor: ...
     def init_weights(self) -> None: ...
     def init_buffers(self, buffer_device) -> None: ...
 ```
@@ -325,13 +325,13 @@ This triggers auto-registration when the module is imported.
 ### Step 10: Verify and Test
 
 Verification should be done in stages, adapting based on available hardware and the test
-patterns in `areal/tests/experimental/archon/`.
+patterns in `tests/experimental/archon/`.
 
 **Before writing tests**, examine the existing test files to understand current
 patterns:
 
 ```
-areal/tests/experimental/archon/
+tests/experimental/archon/
   conftest.py             -- Pytest configuration (version checks)
   utils.py                -- Shared utilities (model loading, comparison)
   test_qwen3_args.py      -- Args unit tests (CPU-only)
@@ -406,9 +406,9 @@ def test_forward_matches_hf():
 ```
 
 **Important**: Do NOT hardcode the test categories. Inspect the existing test files in
-`areal/tests/experimental/archon/` and follow the same patterns, fixtures, and markers.
-Adapt test scope to the model's specific features (e.g., add MoE-specific tests only if
-the model has MoE).
+`tests/experimental/archon/` and follow the same patterns, fixtures, and markers. Adapt
+test scope to the model's specific features (e.g., add MoE-specific tests only if the
+model has MoE).
 
 ## Reference Implementations
 
@@ -457,7 +457,7 @@ After completion, verify all files exist and are consistent:
 - [ ] `areal/experimental/models/archon/<model>/infra/parallelize.py` -- Parallel
   strategy
 - [ ] `areal/experimental/models/archon/__init__.py` -- Import line added
-- [ ] `areal/tests/experimental/archon/test_<model>_*.py` -- Tests
+- [ ] `tests/experimental/archon/test_<model>_*.py` -- Tests
 
 ______________________________________________________________________
 

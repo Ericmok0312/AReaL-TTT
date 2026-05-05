@@ -1,29 +1,174 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 from typing import Any
 
+import torch
 import torch.distributed as dist
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from areal.api.alloc_mode import ParallelStrategy
-from areal.api.cli_args import PerfTracerConfig, TrainEngineConfig
-from areal.api.engine_api import TrainEngine
-from areal.api.io_struct import (
-    AllocationMode,
+from areal.api import (
     FinetuneSpec,
+    Job,
+    ParallelStrategy,
     SaveLoadMeta,
+    Scheduler,
+    TrainEngine,
     WeightUpdateMeta,
+    Worker,
+    WorkflowLike,
 )
-from areal.api.scheduler_api import Job, Scheduler, Worker
-from areal.api.workflow_api import WorkflowLike
-from areal.infra.rpc.rtensor import RTensor
+from areal.api.alloc_mode import ModelAllocation
+from areal.api.cli_args import PerfTracerConfig, TrainEngineConfig
+from areal.infra.rpc.rtensor import RTensor, flatten_shard_ids
+from areal.infra.utils.concurrent import run_async_task
 from areal.utils import logging, stats_tracker
-from areal.utils.concurrent import run_async_task
+from areal.utils.data import make_dummy_eval_item
 from areal.utils.network import find_free_ports
+from areal.utils.seqpack import balanced_greedy_partition
 
 from .rollout_callback import RolloutCallback
 from .rollout_controller import RolloutController
 
 logger = logging.getLogger("TrainController")
+
+
+def _find_in_structure(obj: Any, type_: type) -> Any | None:
+    """Find first instance of type_ in a nested structure."""
+    if isinstance(obj, type_):
+        return obj
+    if isinstance(obj, dict):
+        for v in obj.values():
+            result = _find_in_structure(v, type_)
+            if result is not None:
+                return result
+    if isinstance(obj, (tuple, list)):
+        for item in obj:
+            result = _find_in_structure(item, type_)
+            if result is not None:
+                return result
+    return None
+
+
+def _is_tensor_like(obj: Any) -> bool:
+    """Check if obj contains tensors or rtensors."""
+    return (
+        _find_in_structure(obj, torch.Tensor) is not None
+        or _find_in_structure(obj, RTensor) is not None
+    )
+
+
+def _item_weight(d: dict[str, Any]) -> int:
+    attn_mask = d.get("attention_mask")
+    if isinstance(attn_mask, torch.Tensor):
+        return int(attn_mask.sum().item())
+    if isinstance(attn_mask, RTensor):
+        return attn_mask.data.numel()
+    # Fallback: first tensor's numel
+    for v in d.values():
+        if isinstance(v, RTensor):
+            return v.data.numel()
+        if isinstance(v, torch.Tensor) and v.ndim >= 2:
+            return v.numel()
+    return 1
+
+
+def _dispatch_tensors(
+    item_list: list[dict[str, Any]],
+    dp_size: int,
+    group_size: int = 1,
+) -> tuple[list[list[dict[str, Any]]], list[list[int]]]:
+    """Partition trajectories across DP groups by balanced token count.
+
+    Args:
+        group_size: number of consecutive items that form an atomic dispatch
+            unit (e.g. 2 for chosen/rejected RW pairs).  Groups are never
+            split across DP ranks.  ``group_size=1`` degenerates to per-item
+            partitioning.
+    """
+    n = len(item_list)
+    if n % group_size != 0:
+        raise ValueError(
+            f"item count ({n}) must be divisible by group_size ({group_size})"
+        )
+
+    token_weights = [_item_weight(d) for d in item_list]
+    n_groups = n // group_size
+
+    group_weights = [
+        sum(token_weights[g * group_size + k] for k in range(group_size))
+        for g in range(n_groups)
+    ]
+
+    gpart = balanced_greedy_partition(group_weights, K=dp_size)
+
+    group_indices: list[list[int]] = []
+    splits: list[list[dict[str, Any]]] = []
+    for gidxs in gpart:
+        item_idxs: list[int] = []
+        items: list[dict[str, Any]] = []
+        for g in gidxs:
+            for k in range(group_size):
+                idx = g * group_size + k
+                item_idxs.append(idx)
+                items.append(item_list[idx])
+        group_indices.append(item_idxs)
+        splits.append(items)
+
+    assert all(len(s) % group_size == 0 for s in splits), (
+        f"Post-dispatch invariant violated: shard sizes "
+        f"{[len(s) for s in splits]} not all divisible by group_size={group_size}"
+    )
+    return splits, group_indices
+
+
+def _pad_eval_batch(
+    args: tuple[Any, ...], dp_size: int, group_size: int = 1
+) -> tuple[Any, ...]:
+    """Pad the first tensor-like arg to a multiple of ``dp_size * group_size``.
+
+    Called before dispatch for explicit evaluation controller paths so that
+    ``balanced_greedy_partition`` always receives a divisible input.
+    Dummy items have zero attention/loss masks and contribute nothing
+    to metrics or loss.
+    """
+    result = list(args)
+    pad_target = dp_size * group_size
+    for i, arg in enumerate(result):
+        if isinstance(arg, list) and arg and _is_tensor_like(arg):
+            n = len(arg)
+            pad_count = (-n) % pad_target
+            if pad_count > 0:
+                padded = list(arg)
+                template = arg[0]
+                padded.extend(make_dummy_eval_item(template) for _ in range(pad_count))
+                result[i] = padded
+                logger.info(
+                    f"Eval dispatch: padded {pad_count} dummy items "
+                    f"(total {len(padded)}) for dp_size={dp_size}"
+                )
+            break  # only pad the first tensor-like arg
+    return tuple(result)
+
+
+def _merge_tensors(
+    results: list[Any], group_indices: list[list[int]]
+) -> list[Any] | None:
+    """Flatten per-DP-group results and reorder to original trajectory order."""
+    if all(r is None for r in results):
+        return None
+
+    n_total = sum(len(g) for g in group_indices)
+    reordered: list[Any] = [None] * n_total
+    for group_result, indices in zip(results, group_indices):
+        if not isinstance(group_result, list):
+            group_result = [group_result] * len(indices)
+        assert len(group_result) == len(indices), (
+            f"DP group returned {len(group_result)} results but expected {len(indices)}"
+        )
+        for result_item, orig_idx in zip(group_result, indices):
+            reordered[orig_idx] = result_item
+    return reordered
 
 
 class TrainController:
@@ -51,12 +196,13 @@ class TrainController:
         self.config = config
         self.scheduler = scheduler
 
-        self.alloc_mode: AllocationMode
+        # Parse allocation from config.backend
+        self.train_alloc = ModelAllocation.from_str(config.backend)
+
         self.workers: list[Worker] = []
         # Boolean list indicating which workers are data-parallel heads
         # Only DP head workers receive data slices; others get data via broadcast
         self.workers_is_dp_head: list[bool] = []
-        self.parallel_strategy: ParallelStrategy | None = None
 
         self._worker_role: str = "default"
         self._own_process_group = False
@@ -86,6 +232,11 @@ class TrainController:
             self._own_process_group = True
 
     @property
+    def parallel_strategy(self) -> ParallelStrategy:
+        """Parallel strategy derived from the parsed backend allocation."""
+        return self.train_alloc.parallel
+
+    @property
     def data_parallel_rank(self) -> int:
         return 0
 
@@ -103,7 +254,6 @@ class TrainController:
     def initialize(
         self,
         role: str,
-        alloc_mode: AllocationMode,
         ft_spec: FinetuneSpec,
         **kwargs,
     ):
@@ -113,8 +263,6 @@ class TrainController:
         ----------
         role : str
             Role identifier for the workers
-        alloc_mode : AllocationMode
-            Allocation mode configuration for distributed setup
         ft_spec : FinetuneSpec
             Finetune specification for model initialization
         **kwargs
@@ -122,15 +270,14 @@ class TrainController:
         """
         # Store configuration
         self._worker_role = role
-        self.alloc_mode = alloc_mode
 
-        self.parallel_strategy = alloc_mode.train
+        world_size = self.train_alloc.parallel.world_size
 
         # Create job specification for scheduler
         # Convert scheduling_spec tuple to list for scheduler compatibility
         # The scheduler will handle task replication across workers if needed
         job = Job(
-            replicas=alloc_mode.train.world_size,
+            replicas=world_size,
             tasks=list(self.config.scheduling_spec),
             scheduling_strategy=self.config.scheduling_strategy,
             role=self._worker_role,
@@ -257,6 +404,19 @@ class TrainController:
         """Destroy the controller and release GPU memory of models.
 
         Cleans up all resources including workers, engines, and internal state.
+
+        The teardown order is carefully chosen to avoid a noisy
+        ``TCPStore.recvValue failed`` warning from NCCL's HeartbeatMonitor
+        on non-zero ranks:
+
+        1. Remote engines' ``destroy()`` runs first so that every rank calls
+           ``dist.destroy_process_group()`` after a CPU barrier. This
+           guarantees all ranks finish NCCL abort together before any store
+           shuts down.
+        2. Workers are killed in reverse rank order so that rank-0 (owner
+           of the global TCPStore server) receives SIGTERM last. This
+           avoids the short window where non-zero ranks' HeartbeatMonitor
+           threads poll a store whose TCP listener has already been closed.
         """
         logger.info("Destroying TrainController...")
 
@@ -274,17 +434,28 @@ class TrainController:
                         )
                         for rank, worker in enumerate(self.workers)
                     ]
-                    await asyncio.gather(*tasks, return_exceptions=True)
+                    return await asyncio.gather(*tasks, return_exceptions=True)
 
-                run_async_task(_destroy_all_engines)
+                results = run_async_task(_destroy_all_engines)
+                # Surface per-worker failures instead of silently swallowing them.
+                for rank, res in enumerate(results or []):
+                    if isinstance(res, BaseException):
+                        logger.warning(
+                            f"Engine destroy on rank {rank} raised "
+                            f"{type(res).__name__}: {res}"
+                        )
                 logger.info("Engines destroyed")
             except Exception as e:
                 logger.error(f"Error destroying engines: {e}")
 
-        # Then delete workers via scheduler
+        # Then delete workers via scheduler. Pass reverse_order=True so
+        # that rank-0 (TCPStore owner) is killed last. All in-tree
+        # Scheduler implementations (Local/Ray/Slurm) accept this kwarg;
+        # third-party subclasses that override ``delete_workers`` must
+        # adopt the same signature.
         try:
-            logger.info("Deleting all workers...")
-            self.scheduler.delete_workers(role=self._worker_role)
+            logger.info("Deleting all workers (reverse rank order)...")
+            self.scheduler.delete_workers(role=self._worker_role, reverse_order=True)
             logger.info("Workers deleted")
         except Exception as e:
             logger.error(f"Error deleting workers: {e}")
@@ -297,80 +468,111 @@ class TrainController:
             dist.destroy_process_group()
         logger.info("TrainController destroyed")
 
-    def _custom_function_call(self, method: str, *args, **kwargs):
-        """Dispatch method call to workers: split batches, replicate args, merge results."""
-        dp_split_args, dp_split_kwargs, group_indices = self._dispatch_inputs(
-            *args, **kwargs
-        )
+    def _custom_function_call(
+        self,
+        method: str,
+        *args,
+        rpc_meta: dict[str, Any] | None = None,
+        **kwargs,
+    ):
+        """Dispatch method call to workers via the appropriate path."""
+        dp_args, dp_kwargs, group_indices = self._prepare_dispatch(*args, **kwargs)
         results = run_async_task(
-            self._call_with_dispatched_inputs, method, dp_split_args, dp_split_kwargs
+            self._call_workers, method, dp_args, dp_kwargs, rpc_meta=rpc_meta
         )
-        # Filter to only keep results from DP head workers
-        results = [r for idx, r in enumerate(results) if self.workers_is_dp_head[idx]]
-        merged = self._merge_results(results, group_indices)
-        return merged
+        return self._collect_results(results, group_indices)
 
-    async def _async_custom_function_call(self, method: str, *args, **kwargs):
+    async def _async_custom_function_call(
+        self,
+        method: str,
+        *args,
+        rpc_meta: dict[str, Any] | None = None,
+        **kwargs,
+    ):
         """Async version of _custom_function_call."""
-        dp_split_args, dp_split_kwargs, group_indices = self._dispatch_inputs(
-            *args, **kwargs
+        dp_args, dp_kwargs, group_indices = self._prepare_dispatch(*args, **kwargs)
+        results = await self._call_workers(
+            method, dp_args, dp_kwargs, rpc_meta=rpc_meta
         )
-        results = await self._call_with_dispatched_inputs(
-            method, dp_split_args, dp_split_kwargs
+        return self._collect_results(results, group_indices)
+
+    def _pad_eval_dispatch_args(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        *,
+        group_size: int,
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """Pad eval batches for explicit algorithm-level evaluation dispatch."""
+        kwargs = dict(kwargs)
+        args = _pad_eval_batch(
+            args, self.parallel_strategy.dp_size, group_size=group_size
         )
-        # Filter to only keep results from DP head workers
-        results = [r for idx, r in enumerate(results) if self.workers_is_dp_head[idx]]
-        return self._merge_results(results, group_indices)
+        return args, kwargs
 
-    def _dispatch_inputs(self, *args, **kwargs):
-        """Split RTensors across DP groups, replicate other args."""
-        results, group_indices = RTensor.data_parallel_dispatch(
-            (args, kwargs), dp_size=self.parallel_strategy.dp_size
-        )
-        # results is list of (args_tuple, kwargs_dict) pairs, one per DP group
-        # Transpose to match _call_with_dispatched_inputs expectations:
-        # dp_split_args[arg_idx][dp_idx] = value for arg_idx-th arg on dp_idx-th group
-        # dp_worker_kwargs[key][dp_idx] = value for key kwarg on dp_idx-th group
+    def _prepare_dispatch(
+        self, *args, **kwargs
+    ) -> tuple[list[list[Any]], dict[str, list[Any]], list[list[int]] | None]:
+        """Route to tensor or scalar dispatch based on input type.
 
-        dp_size = len(results)
-        num_args = len(args)
+        Returns (dp_split_args, dp_split_kwargs, group_indices).
+        group_indices is non-None only for tensor dispatches.
+        """
+        group_size = kwargs.pop("group_size", 1)
+        if _is_tensor_like(args) or _is_tensor_like(kwargs):
+            return self._partition_inputs(group_size, *args, **kwargs)
+        return self._replicate_inputs(*args, **kwargs)
 
-        # Transpose args: from list of tuples to list of lists
-        dp_split_args = [
-            [results[dp_idx][0][arg_idx] for dp_idx in range(dp_size)]
-            for arg_idx in range(num_args)
-        ]
+    def _partition_inputs(
+        self, group_size: int, /, *args, **kwargs
+    ) -> tuple[list[list[Any]], dict[str, list[Any]], list[list[int]]]:
+        """Partition tensor args across DP groups; replicate others."""
+        dp_size = self.parallel_strategy.dp_size
+        group_indices: list[list[int]] | None = None
 
-        # Transpose kwargs: from list of dicts to dict of lists
-        dp_worker_kwargs = {}
-        if kwargs:
-            for key in kwargs.keys():
-                dp_worker_kwargs[key] = [
-                    results[dp_idx][1][key] for dp_idx in range(dp_size)
-                ]
+        def _split(item: Any) -> list[Any]:
+            nonlocal group_indices
+            if _is_tensor_like(item):
+                if group_indices is None:
+                    splits, group_indices = _dispatch_tensors(
+                        item, dp_size, group_size=group_size
+                    )
+                    return splits
+                return [[item[i] for i in idxs] for idxs in group_indices]
+            return [item] * dp_size
 
-        return dp_split_args, dp_worker_kwargs, group_indices
+        dp_args = [_split(a) for a in args]
+        dp_kwargs = {k: _split(v) for k, v in kwargs.items()}
+        assert group_indices is not None
+        return dp_args, dp_kwargs, group_indices
 
-    async def _call_with_dispatched_inputs(
+    def _replicate_inputs(
+        self, *args, **kwargs
+    ) -> tuple[list[list[Any]], dict[str, list[Any]], None]:
+        """Replicate all args to every DP group."""
+        dp_size = self.parallel_strategy.dp_size
+        dp_args = [[a] * dp_size for a in args]
+        dp_kwargs = {k: [v] * dp_size for k, v in kwargs.items()}
+        return dp_args, dp_kwargs, None
+
+    async def _call_workers(
         self,
         method: str,
         dp_split_args: list[list[Any]],
-        dp_worker_kwargs: list[dict[str, Any]],
+        dp_split_kwargs: dict[str, list[Any]],
+        rpc_meta: dict[str, Any] | None = None,
     ):
-        """Call method on all workers. DP heads get data slices, others get empty args (broadcast via RPC)."""
+        """Send dispatched inputs to workers. DP heads get slices, others empty."""
         tasks = []
         dp_idx = 0
         for idx, worker in enumerate(self.workers):
             if self.workers_is_dp_head[idx]:
-                # Get this DP head worker's slice of each argument
                 worker_args = [splits[dp_idx] for splits in dp_split_args]
                 worker_kwargs = {
-                    k: splits[dp_idx] for k, splits in dp_worker_kwargs.items()
+                    k: splits[dp_idx] for k, splits in dp_split_kwargs.items()
                 }
                 dp_idx += 1
             else:
-                # Non-DP-head workers get empty arguments
-                # They will receive data via broadcast in RPC server
                 worker_args = []
                 worker_kwargs = {}
 
@@ -380,14 +582,20 @@ class TrainController:
                     method,
                     self._engine_name(idx),
                     *worker_args,
+                    rpc_meta=rpc_meta,
                     **worker_kwargs,
                 )
             )
         return await asyncio.gather(*tasks)
 
-    def _merge_results(self, results, group_indices):
-        """Merge RTensor results from DP heads using RTensor.merge()."""
-        return RTensor.data_parallel_merge(results, group_indices)
+    def _collect_results(
+        self, results: list[Any], group_indices: list[list[int]] | None
+    ) -> Any:
+        """Filter to DP heads, then reorder (tensor) or merge (scalar)."""
+        results = [r for idx, r in enumerate(results) if self.workers_is_dp_head[idx]]
+        if group_indices is not None:
+            return _merge_tensors(results, group_indices)
+        return results[0]
 
     def connect_engine(self, rollout: RolloutController, meta: WeightUpdateMeta):
         if self.rollout is not None and self.rollout != rollout:
@@ -505,8 +713,22 @@ class TrainController:
         self._check_rollout_engine_connected()
         self._custom_function_call("update_weights", meta=meta)
 
+    def offload(self) -> None:
+        """Offload model parameters to CPU across all train workers."""
+        self._custom_function_call("offload")
+
+    def onload(self) -> None:
+        """Onload model parameters to GPU across all train workers."""
+        self._custom_function_call("onload")
+
     def get_device_stats(self):
         return self._custom_function_call("get_device_stats")
+
+    def start_memory_profile(self, max_entries: int = 100000):
+        return self._custom_function_call("start_memory_profile", max_entries)
+
+    def stop_memory_profile(self, snapshot_dir: str):
+        return self._custom_function_call("stop_memory_profile", snapshot_dir)
 
     def config_perf_tracer(self, config: PerfTracerConfig, role: str) -> None:
         async def _call():
@@ -536,7 +758,7 @@ class TrainController:
         should_accept_fn: str | None = None,
         group_size: int = 1,
         dynamic_bs: bool = False,
-    ) -> dict[str, Any]:
+    ) -> list[dict[str, Any]]:
         return self.rollout.prepare_batch(
             dataloader=dataloader,
             workflow=workflow,
@@ -553,7 +775,7 @@ class TrainController:
         workflow_kwargs: dict[str, Any],
         should_accept_fn: str | None = None,
         group_size: int = 1,
-    ) -> dict[str, Any]:
+    ) -> list[dict[str, Any]]:
         return self.rollout.rollout_batch(
             data=data,
             workflow=workflow,
@@ -571,7 +793,13 @@ class TrainController:
             )
 
     async def _async_clear_batches(self, *targets: dict[str, RTensor]):
-        """Extract shard IDs and clear tensors on each worker."""
+        """Extract shard IDs and clear tensors on each worker.
+
+        HTTP DELETEs to each storage node's ``/data/clear`` — this evicts
+        ``_storage`` (mandatory, otherwise HTTP storage grows unboundedly)
+        and, via :func:`rtensor.remove`, also pops the storage owner's own
+        ``_fetch_buffer`` (covers storage-owner-as-consumer). See #1209.
+        """
         shards_by_node = RTensor.collect_shards(targets)
 
         if not shards_by_node:
@@ -583,5 +811,58 @@ class TrainController:
         )
 
     def clear_batches(self, *targets: dict[str, RTensor]):
-        """Clear distributed batch shards from workers to free memory."""
+        """Clear distributed batch shards from workers to free memory.
+
+        Two fan-outs — see inclusionAI/AReaL#1209:
+
+        1. ``_async_clear_batches``: HTTP DELETE to each storage node,
+           dropping ``_storage`` entries (and the owner's ``_fetch_buffer``
+           via :func:`rtensor.remove`).
+        2. Replicated RPC to every DP head so cross-node consumer workers
+           drain their local ``_fetch_buffer``. Payload is a flat
+           ``list[str]`` of shard IDs — sending IDs (not RTensors)
+           side-steps the RPC's ``localize`` pass (no RTensor → no
+           re-fetch), and ``_is_tensor_like(list[str]) == False`` routes
+           dispatch through ``_replicate_inputs`` so every head sees the
+           full sid set.
+
+        After the second fan-out, a ``fetch_buffer_stats`` RPC logs the
+        drain result — WARNING on leak, DEBUG when clean.
+        """
         run_async_task(self._async_clear_batches, *targets)
+        sids = flatten_shard_ids(targets)
+        if not sids:
+            return
+        # broadcast=False → purely local per-head op (no NCCL collective).
+        # list[str] is not tensor-like → _replicate_inputs copies the full
+        # sid set to every DP head.
+        self._custom_function_call("clear_batches", sids, rpc_meta={"broadcast": False})
+        # Always observe post-drain state. _custom_function_call returns
+        # the first DP head's stats (scalar dispatch collapses via
+        # _collect_results[0]); all heads are symmetric in steady state,
+        # so head 0 is a sufficient leak signal. Best-effort: an RPC
+        # failure here is observability-only and must not break training.
+        try:
+            stats = self._custom_function_call(
+                "fetch_buffer_stats", rpc_meta={"broadcast": False}
+            )
+        except Exception as e:
+            logger.debug(
+                "fetch_buffer_stats RPC failed (observability only, role=%s): %s",
+                self._worker_role,
+                e,
+            )
+            return
+        n_entries = stats.get("num_entries", 0) if isinstance(stats, dict) else 0
+        if n_entries > 0:
+            logger.warning(
+                "clear_batches: _fetch_buffer non-empty on DP head 0 "
+                "(role=%s, num_entries=%d) — possible leak, see #1209",
+                self._worker_role,
+                n_entries,
+            )
+        else:
+            logger.debug(
+                "clear_batches: _fetch_buffer drained on DP head 0 (role=%s)",
+                self._worker_role,
+            )

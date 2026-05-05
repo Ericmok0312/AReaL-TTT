@@ -1,5 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
-import math
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -7,21 +8,19 @@ from typing import Any
 
 import ray
 import ray.exceptions
-import torch
 from ray.runtime_env import RuntimeEnv
 from ray.util.placement_group import (
     PlacementGroup,
-    placement_group,
     remove_placement_group,
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from areal.api import Job, Scheduler, Worker
 from areal.api.cli_args import (
     BaseExperimentConfig,
     SchedulingSpec,
     SchedulingStrategyType,
 )
-from areal.api.scheduler_api import Job, Scheduler, Worker
 from areal.infra.rpc.ray_rpc_server import RayRPCServer
 from areal.infra.scheduler.exceptions import (
     EngineCallError,
@@ -30,23 +29,19 @@ from areal.infra.scheduler.exceptions import (
     WorkerNotFoundError,
     WorkerTimeoutError,
 )
+from areal.infra.utils.launcher import get_env_vars, get_thread_env_vars
+from areal.infra.utils.ray import get_placement_group_master_ip_and_port
+from areal.infra.utils.ray_placement_group import (
+    DeferredDeviceRayPlacementStrategy,
+    RayPlacementStrategy,
+    SeparatedRayPlacementStrategy,
+    SharedRayPlacementStrategy,
+    ray_resource_type,
+)
 from areal.utils import logging
-from areal.utils.launcher import get_env_vars, get_thread_env_vars
-from areal.utils.ray import get_placement_group_master_ip_and_port
+from areal.utils.offload import get_tms_env_vars
 
 logger = logging.getLogger("RayScheduler")
-
-
-def ray_resource_type():
-    if torch.cuda.is_available():
-        return "GPU"
-
-    from areal.infra.platforms import is_npu_available
-
-    if is_npu_available:
-        return "NPU"
-
-    return "CPU"
 
 
 @dataclass
@@ -66,9 +61,15 @@ class RayScheduler(Scheduler):
         startup_timeout: float = 30.0,
         *,
         exp_config: BaseExperimentConfig | None = None,
+        n_gpus_per_node: int = 8,
     ):
         self.exp_config = exp_config
+        self._n_gpus_per_node = n_gpus_per_node
         self.startup_timeout = startup_timeout
+        self.enable_tms_offload = False
+        if exp_config is not None:
+            self.enable_tms_offload = exp_config.enable_offload
+            self._n_gpus_per_node = exp_config.cluster.n_gpus_per_node
 
         self._workers: dict[str, list[RayWorkerInfo]] = defaultdict(list)
         self._worker_info_by_id: dict[str, RayWorkerInfo] = {}
@@ -76,6 +77,10 @@ class RayScheduler(Scheduler):
 
         # Colocation tracking: colocated roles reuse workers from target role
         self._colocated_roles: dict[str, str] = {}  # colocated_role -> target_role
+
+    @property
+    def n_gpus_per_node(self) -> int:
+        return self._n_gpus_per_node
 
     def _prepare_worker_specs(
         self, role: str, num_workers: int, schedulings: list[SchedulingSpec] | None
@@ -95,99 +100,6 @@ class RayScheduler(Scheduler):
             "Invalid Configuration",
             f"schedulings length ({len(schedulings)}) must be 1 or equal to replicas ({num_workers})",
         )
-
-    def _bundle_spec(self, cpu: int, gpu: int, mem: int) -> dict:
-        """
-        define a bundle dict for a given cpu, gpu, mem requirement
-        """
-        device = ray_resource_type()
-        if device == "CPU" and gpu > 0:
-            raise ValueError(
-                f"Current detected device is CPU but specified number of GPUs is {gpu}"
-            )
-        device_resource = device
-        if device == "CPU":
-            return {
-                "CPU": cpu,
-                "memory": mem * 1024**3,  # convert gb to bytes
-            }
-        return {
-            "CPU": cpu,
-            device_resource: float(gpu),
-            "memory": mem * 1024**3,  # convert gb to bytes
-        }
-
-    def _create_bundle_list_gpu(self, cpu: int, gpu: int, mem: int) -> list[dict]:
-        """
-        for dividing out resources so that 1 bundle can be contained on 1 node and creates a list of bundles
-        """
-        bundle_list = []
-
-        n_gpus_per_node = self.exp_config.cluster.n_gpus_per_node
-
-        if n_gpus_per_node == 0 and gpu > 0:
-            raise ValueError(
-                f"Requested {gpu} GPUs but number of GPUs per node is {n_gpus_per_node}"
-            )
-
-        if gpu < n_gpus_per_node:
-            return [self._bundle_spec(cpu, gpu, mem)]
-
-        gpu_remaining_to_be_assigned = gpu
-
-        while gpu_remaining_to_be_assigned > 0:
-            # do not want to take all gpus in node if we do not need that many
-            gpu_in_bundle = min(gpu_remaining_to_be_assigned, n_gpus_per_node)
-
-            # for scaling the amount of cpu and memory relative to gpu in bundle
-            resource_per_node_multiplier = min(gpu_in_bundle / gpu, 1)
-            cpu_in_bundle = math.ceil(cpu * resource_per_node_multiplier)
-            mem_in_bundle = math.ceil(mem * resource_per_node_multiplier)
-
-            bundle_list.append(
-                self._bundle_spec(cpu_in_bundle, gpu_in_bundle, mem_in_bundle)
-            )
-            gpu_remaining_to_be_assigned -= gpu_in_bundle
-
-        return bundle_list
-
-    def _actor_resource_spec(self, cpu: int, gpu: int, mem: int) -> dict:
-        """
-        create a dictionary for passing into ray actor options specifying resource requirements
-        """
-
-        device = ray_resource_type()
-        if device == "CPU" and gpu > 0:
-            raise ValueError(
-                f"Current detected device is CPU but specified number of GPUs is {gpu}"
-            )
-
-        res = {
-            "num_cpus": cpu,
-            "memory": mem * 1024**3,
-        }
-        if device == "CPU":
-            return res
-
-        # Use 0.9 GPUs to allow forked workers
-        if device == "GPU":
-            res["num_gpus"] = float(gpu) * 0.9
-            return res
-
-        return {
-            "num_cpus": cpu,
-            "resources": {device: float(gpu) * 0.9},
-            "memory": mem * 1024**3,
-        }
-
-    def _sum_resource_spec(
-        self, schedulings: list[SchedulingSpec]
-    ) -> tuple[int, int, int]:
-        num_cpu = sum(spec.cpu for spec in schedulings)
-        num_gpu = sum(spec.gpu for spec in schedulings)
-        num_mem = sum(spec.mem for spec in schedulings)
-
-        return (num_cpu, num_gpu, num_mem)
 
     def _ping_workers(self, role: str, timeout: float | None = None):
         worker_info_list = self._workers[role]
@@ -215,33 +127,42 @@ class RayScheduler(Scheduler):
                 failed_worker = ref_to_worker[ref]
                 raise WorkerFailedError(failed_worker.worker.id, -1)
 
-    def _create_placement_group(self, role: str, bundles: list[dict]) -> PlacementGroup:
-        """Helper to create and wait for a placement group."""
-        pg = placement_group(bundles=bundles, strategy="PACK")
-        try:
-            ray.get(pg.ready(), timeout=self.startup_timeout)
-        except ray.exceptions.GetTimeoutError:
-            logger.error(
-                f"Ray placement group timeout for role {role}\n"
-                f"ray.nodes(): {ray.nodes()}"
-                f"bundles: {bundles}"
-            )
-            raise
-        self._placement_groups.append(pg)
-        return pg
-
     def _build_env_vars(self, spec: SchedulingSpec) -> dict[str, str]:
         """Helper to build environment variables for a worker."""
         additional_envs_str = None
         if spec.env_vars:
             additional_envs_str = ",".join(f"{k}={v}" for k, v in spec.env_vars.items())
         env = get_env_vars(additional_envs_str)
+        if self.enable_tms_offload:
+            env.update(get_tms_env_vars())
         thread_env = get_thread_env_vars(
             cpus_per_task=spec.cpu,
             existing_env_vars=spec.env_vars,
         )
         env.update(thread_env)
         return env
+
+    def _get_placement_strategy(
+        self, schedulings: list[SchedulingSpec]
+    ) -> RayPlacementStrategy:
+        placement_strategies = [spec.ray_placement_strategy for spec in schedulings]
+
+        if not all(ps == placement_strategies[0] for ps in placement_strategies):
+            raise RuntimeError(
+                f"Not every placement strategy in scheduling spec is the same: {placement_strategies}"
+            )
+
+        mode = placement_strategies[0]
+
+        strategy_map = {
+            "deferred": DeferredDeviceRayPlacementStrategy,
+            "separate": SeparatedRayPlacementStrategy,
+            "shared": SharedRayPlacementStrategy,
+        }
+        if mode in strategy_map:
+            return strategy_map[mode]()
+        else:
+            raise RuntimeError(f"Ray scheduling mode {mode} is not supported")
 
     def _create_ray_workers(
         self, role: str, schedulings: list[SchedulingSpec]
@@ -255,38 +176,27 @@ class RayScheduler(Scheduler):
         worker_info_list: list[RayWorkerInfo] = []
         worker_ids: list[str] = []
 
-        # Create one PG per worker with explicit bundle_index=0
-        placement_groups = []
-        bundle_indices: list[int] = []
-        for spec in schedulings:
-            bundles = [self._bundle_spec(spec.cpu, spec.gpu, spec.mem)]
-            pg = self._create_placement_group(role, bundles)
-            placement_groups.append(pg)
-            bundle_indices.append(0)  # Always use bundle_index=0
+        placement_strategy = self._get_placement_strategy(schedulings)
+        placement_groups = placement_strategy.create_placement_group(
+            role,
+            schedulings,
+            self.exp_config.cluster.n_gpus_per_node,
+            timeout=self.startup_timeout,
+        )
 
         master_ip, master_port = get_placement_group_master_ip_and_port(
             placement_groups[0], placement_group_bundle_index=0
         )
 
-        for idx, (spec, pg, bundle_idx) in enumerate(
-            zip(schedulings, placement_groups, bundle_indices)
-        ):
+        for idx, spec in enumerate(schedulings):
+            options, pg_scheduling_strategy = placement_strategy.actor_resources(spec)
             worker_id = f"{role}/{idx}"
             env = self._build_env_vars(spec)
-            options = self._actor_resource_spec(spec.cpu, spec.gpu, spec.mem)
-
-            # Build scheduling strategy with explicit bundle index
-            strategy_kwargs: dict[str, Any] = {
-                "placement_group": pg,
-                "placement_group_capture_child_tasks": True,
-                "placement_group_bundle_index": bundle_idx,  # Always 0
-            }
-
             actor = RayRPCServer.options(
                 **options,
                 name=worker_id,
                 runtime_env=RuntimeEnv(env_vars=env),
-                scheduling_strategy=PlacementGroupSchedulingStrategy(**strategy_kwargs),
+                scheduling_strategy=pg_scheduling_strategy,
             ).remote()
 
             # 0 needed to pad the list as the trainer takes index 1 for ports
@@ -299,8 +209,8 @@ class RayScheduler(Scheduler):
                 worker=worker,
                 actor=actor,
                 role=role,
-                placement_group=pg,
-                bundle_index=bundle_idx,
+                placement_group=pg_scheduling_strategy.placement_group,
+                bundle_index=pg_scheduling_strategy.placement_group_bundle_index,
                 created_at=time.time(),
                 env_vars=env,
             )
@@ -340,6 +250,7 @@ class RayScheduler(Scheduler):
         list[str]
             List of forked worker IDs
         """
+
         worker_info_list: list[RayWorkerInfo] = []
         worker_ids: list[str] = []
 
@@ -362,6 +273,10 @@ class RayScheduler(Scheduler):
             device = ray_resource_type()
             additional_options = {}
             if spec.gpu > 0:
+                if spec.gpu > 1:
+                    raise NotImplementedError(
+                        "Colocation of multi-GPU workers together is not supported by Ray"
+                    )
                 if device == "GPU":
                     additional_options = dict(num_gpus=0.01)
                 else:
@@ -435,16 +350,60 @@ class RayScheduler(Scheduler):
 
         Unlike _cleanup_workers, this doesn't remove placement groups since
         forked workers share placement groups with target workers.
+
+        Teardown is done in two phases so that peer ranks can finish their
+        pre-destroy CPU barrier inside ``engine.destroy()`` before any actor
+        process is forcibly killed:
+
+        1. Dispatch ``actor.destroy.remote()`` on every actor concurrently
+           and collect the ObjectRefs (fire but *don't* forget).
+        2. ``ray.wait`` on all of them with a bounded timeout so that all
+           ranks return together. Only then do we drop references / kill
+           stragglers.
         """
+        # Phase 1: concurrently dispatch destroy on all actors.
+        destroy_refs: list[tuple[RayWorkerInfo, Any]] = []
         for wi in workers:
-            actor = wi.actor
             try:
-                actor.destroy.remote()
+                ref = wi.actor.destroy.remote()
+                destroy_refs.append((wi, ref))
             except Exception:
                 logger.warning(
-                    f"Could not destroy forked actor {actor}, force killing actor"
+                    f"Could not dispatch destroy on forked actor {wi.actor}, "
+                    f"force killing actor"
                 )
-                ray.kill(actor, no_restart=True)
+                ray.kill(wi.actor, no_restart=True)
+
+        # Phase 2: wait for all destroys to finish (bounded). This lets the
+        # engine-side pre-destroy CPU barrier complete on every rank before
+        # we release references.
+        if destroy_refs:
+            refs = [r for _, r in destroy_refs]
+            try:
+                ray.wait(refs, num_returns=len(refs), timeout=30.0)
+            except Exception as e:
+                logger.warning(f"ray.wait on forked destroy refs failed: {e}")
+
+            # Surface per-actor failures; force-kill any that did not finish.
+            for wi, ref in destroy_refs:
+                try:
+                    ray.get(ref, timeout=0)
+                except ray.exceptions.GetTimeoutError:
+                    logger.warning(
+                        f"Forked actor {wi.actor} did not finish destroy in time, "
+                        f"force killing"
+                    )
+                    try:
+                        ray.kill(wi.actor, no_restart=True)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.warning(
+                        f"Forked actor {wi.actor} destroy raised "
+                        f"{type(e).__name__}: {e}"
+                    )
+
+        for wi in workers:
             # Remove from worker_info_by_id
             self._worker_info_by_id.pop(wi.worker.id, None)
 
@@ -584,7 +543,7 @@ class RayScheduler(Scheduler):
 
         return [wi.worker for wi in worker_info_list]
 
-    def delete_workers(self, role: str | None = None):
+    def delete_workers(self, role: str | None = None, reverse_order: bool = False):
         """
         Delete workers and clean up resources
 
@@ -592,16 +551,20 @@ class RayScheduler(Scheduler):
         --------
         role: str, optional
             Specific worker role to delete, or None to delete all
+        reverse_order: bool, optional
+            If True, iterate workers in reverse rank order when issuing
+            ``actor.destroy.remote()`` so that rank-0 is signalled last.
+            Note: Ray kills are asynchronous, so ordering here is best-effort.
         """
         if role is None:
             # Delete colocated roles first (they're just mappings)
             colocated_roles = list(self._colocated_roles.keys())
             for r in colocated_roles:
-                self.delete_workers(r)
+                self.delete_workers(r, reverse_order=reverse_order)
             # Then delete actual worker roles
             roles = list(self._workers.keys())
             for r in roles:
-                self.delete_workers(r)
+                self.delete_workers(r, reverse_order=reverse_order)
             return
 
         # Handle colocated role
@@ -613,6 +576,8 @@ class RayScheduler(Scheduler):
                 logger.info(
                     f"Cleaning up {len(workers)} forked actors for role '{role}'"
                 )
+                if reverse_order:
+                    workers = list(reversed(workers))
                 self._cleanup_forked_workers(workers)
                 del self._workers[role]
             else:
@@ -628,6 +593,8 @@ class RayScheduler(Scheduler):
         workers = self._workers[role]
         logger.info(f"Deleting {len(workers)} workers for role '{role}'")
 
+        if reverse_order:
+            workers = list(reversed(workers))
         self._cleanup_workers(workers)
 
         del self._workers[role]
@@ -643,24 +610,7 @@ class RayScheduler(Scheduler):
         """Fork new worker processes from existing workers.
 
         Creates new Ray actors colocated with existing workers of the target role.
-        The forked workers share the same placement groups as their target workers.
-
-        Note: The `command` parameter is ignored for RayScheduler since Ray actors
-        always run the RayRPCServer. For custom module behavior, use LocalScheduler.
-
-        Parameters
-        ----------
-        role : str
-            Role name for the new forked workers (e.g., "proxy")
-        target_role : str
-            Role of existing workers to fork from (e.g., "rollout")
-        command : str, optional
-            Custom module path (ignored for Ray - Ray actors always run RayRPCServer)
-
-        Returns
-        -------
-        list[str]
-            List of worker IDs created (e.g., ["proxy/0", "proxy/1"])
+        The ``command`` parameter is ignored — Ray actors always run RayRPCServer.
         """
         if command is not None:
             logger.warning(
@@ -684,19 +634,72 @@ class RayScheduler(Scheduler):
         return worker_ids
 
     def _cleanup_workers(self, workers: list[RayWorkerInfo]):
-        # Kill actors first
-        for wi in workers:
-            actor = wi.actor
-            try:
-                # Asynchronously destroy actor
-                actor.destroy.remote()
-            except Exception:
-                logger.warning(
-                    f"Could not destroy remote actor {actor}, force killing actor"
-                )
-                ray.kill(actor, no_restart=True)
+        """Tear down actors and their placement groups in three phases.
 
-        # Collect unique placement groups and remove them
+        The ordering matters for distributed teardown correctness:
+
+        1. Dispatch ``actor.destroy.remote()`` on every actor concurrently
+           and collect the ObjectRefs. ``destroy`` on the worker side runs
+           the engine's pre-destroy CPU barrier + ``dist.destroy_process_group``,
+           which requires all peer ranks to still be alive.
+        2. ``ray.wait`` on all destroy refs with a bounded timeout so that
+           every rank finishes the barrier together. Without this, rank-0
+           (TCPStore owner) may be torn down first and cause a noisy
+           ``TCPStore.recvValue failed`` on other ranks.
+        3. Only after the barrier phase, remove the placement groups. PG
+           removal hard-kills any still-alive actor process, so it must
+           come last.
+        """
+        # Phase 1: concurrently dispatch destroy on all actors.
+        destroy_refs: list[tuple[RayWorkerInfo, Any]] = []
+        for wi in workers:
+            try:
+                ref = wi.actor.destroy.remote()
+                destroy_refs.append((wi, ref))
+            except Exception:
+                try:
+                    wi.actor.__ray_terminate__.remote()
+                except Exception:
+                    logger.warning(
+                        f"Could not destroy remote actor {wi.actor}, "
+                        f"force killing actor"
+                    )
+                    ray.kill(wi.actor, no_restart=True)
+
+        # Phase 2: wait for destroys to finish so the engine-side CPU
+        # barrier has a chance to complete on every rank.
+        if destroy_refs:
+            ref_to_wi = {id(r): wi for wi, r in destroy_refs}
+            refs = [r for _, r in destroy_refs]
+
+            ready_refs, remaining_refs = ray.wait(
+                refs, num_returns=len(refs), timeout=30.0
+            )
+
+            # Completed: check whether destroy raised an exception.
+            for ref in ready_refs:
+                wi = ref_to_wi[id(ref)]
+                try:
+                    ray.get(ref)
+                except Exception as e:
+                    logger.warning(
+                        f"Actor {wi.actor} destroy raised {type(e).__name__}: {e}"
+                    )
+
+            # Timed-out: force kill actors that did not finish in time.
+            for ref in remaining_refs:
+                wi = ref_to_wi[id(ref)]
+                logger.warning(
+                    f"Actor {wi.actor} did not finish destroy in 30s, force killing"
+                )
+                try:
+                    ray.kill(wi.actor, no_restart=True)
+                except Exception:
+                    pass
+
+        # Phase 3: collect unique placement groups and remove them.
+        # This step hard-kills any actor still using the PG, so it MUST
+        # come after the barrier phase above.
         unique_pgs = {wi.placement_group for wi in workers}
         for pg in unique_pgs:
             try:
@@ -746,6 +749,7 @@ class RayScheduler(Scheduler):
         method: str,
         engine_name: str | None = None,
         *args,
+        rpc_meta: dict[str, Any] | None = None,
         http_timeout: float = 7200.0,
         max_retries: int = 3,
         retry_delay: float = 1.0,
@@ -761,7 +765,11 @@ class RayScheduler(Scheduler):
             try:
                 # Pass engine_name to support multiple engines per worker (colocation)
                 ref = wi.actor.call.remote(
-                    method, *args, engine_name=engine_name, **kwargs
+                    method,
+                    *args,
+                    engine_name=engine_name,
+                    rpc_meta=rpc_meta,
+                    **kwargs,
                 )
                 result = ray.get(ref, timeout=http_timeout)
                 if attempt > 1:
@@ -801,6 +809,7 @@ class RayScheduler(Scheduler):
         method: str,
         engine_name: str | None = None,
         *args,
+        rpc_meta: dict[str, Any] | None = None,
         http_timeout: float = 7200.0,
         max_retries: int = 3,
         retry_delay: float = 1.0,
@@ -816,7 +825,11 @@ class RayScheduler(Scheduler):
             try:
                 # Pass engine_name to support multiple engines per worker (colocation)
                 ref = wi.actor.call.remote(
-                    method, *args, engine_name=engine_name, **kwargs
+                    method,
+                    *args,
+                    engine_name=engine_name,
+                    rpc_meta=rpc_meta,
+                    **kwargs,
                 )
                 result = await ref
                 if attempt > 1:

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # Adapted from torchtitan: torchtitan/models/utils.py
 
 from __future__ import annotations
@@ -286,7 +288,7 @@ class MoEWeightConverter:
                 new_placements.append(placement)
 
         # Step 5: Extract local tensor and split into individual experts
-        local_grouped_weights = grouped_expert_weight._local_tensor
+        local_grouped_weights = grouped_expert_weight.to_local()
         expected_local_experts = end_index - start_index
 
         if local_grouped_weights.shape[0] != expected_local_experts:
@@ -356,7 +358,7 @@ class MoEWeightConverter:
         # Stack and get local tensor (input experts are DTensors)
         stacked = torch.stack(sorted_experts, dim=0)
         if isinstance(stacked, DTensor):
-            local_tensor = stacked._local_tensor
+            local_tensor = stacked.to_local()
         else:
             local_tensor = stacked
 

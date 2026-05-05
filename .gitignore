@@ -8,6 +8,12 @@
 .claude/sessions/
 .agent/
 
+# Codex repo-local skills live in `.agents/skills/`.
+
+# opencode
+.opencode/sessions/
+.sisyphus/
+
 # Ruff
 .ruff_cache/
 

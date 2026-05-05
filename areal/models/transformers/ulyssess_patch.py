@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # Adapted from verl
 
 import torch
@@ -147,6 +149,7 @@ def patch_vlm_for_ulysses_input_slicing(model_class: type):
 def apply_monkey_patch(
     model: PreTrainedModel,
     ulysses_sp_size: int = 1,
+    shard_vision_across_sp: bool = False,
 ):
     try:
         num_attention_heads, num_key_value_heads = (
@@ -230,6 +233,13 @@ def apply_monkey_patch(
 
         patch_vlm_for_ulysses_input_slicing(model_class)
         logger.info(f"Patched {model_class_name}.forward")
+
+        if shard_vision_across_sp:
+            from areal.models.transformers.vision_sp_shard import (
+                apply_vision_sp_shard_patch,
+            )
+
+            apply_vision_sp_shard_patch()
     else:
         from transformers.integrations import flash_attention
 

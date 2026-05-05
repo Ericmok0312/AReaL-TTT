@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # Adapted from torchtitan: torchtitan/models/qwen3/model/args.py
 
 from __future__ import annotations
@@ -70,6 +72,9 @@ class Qwen3ModelArgs(BaseModelArgs):
             # Override with additional fields from HF config
             if hasattr(hf_config, "num_shared_experts"):
                 moe_args.num_shared_experts = hf_config.num_shared_experts
+            router_dtype = kwargs.get("router_dtype", None)
+            if router_dtype is not None:
+                moe_args.router_dtype = router_dtype
 
         # Get decoder_sparse_step (default to 1 = all MoE layers)
         decoder_sparse_step = getattr(hf_config, "decoder_sparse_step", 1)

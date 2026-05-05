@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Triton-based tree attention kernel with sparse block iteration."""
 
 from dataclasses import dataclass
@@ -424,7 +426,6 @@ if TRITON_AVAILABLE:
         o,
         DO,
         Delta,
-        stride_ob,
         stride_oh,
         stride_on,
         stride_od,
@@ -817,7 +818,6 @@ if TRITON_AVAILABLE:
             output,
             dout,
             delta,
-            output.stride(0) * output.stride(1),
             output.stride(1),
             output.stride(2),
             output.stride(3),

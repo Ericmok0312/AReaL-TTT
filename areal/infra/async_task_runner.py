@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Generic asynchronous task runner for executing concurrent async Python functions.
 
 This module provides a reusable, thread-based async task executor that can run
@@ -14,9 +16,12 @@ import threading
 import time
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, Generic, TypeVar, cast
 
 import uvloop
+
+# Type variable for generic result types
+T = TypeVar("T")
 
 # Polling configuration
 DEFAULT_POLL_WAIT_TIME = 0.05  # 50ms
@@ -28,7 +33,7 @@ class TaskQueueFullError(RuntimeError):
 
 
 @dataclass
-class TimedResult[T]:
+class TimedResult(Generic[T]):
     """Wrapper for task results with creation timestamp.
 
     Attributes
@@ -47,7 +52,7 @@ class TimedResult[T]:
 
 
 @dataclass
-class _TaskInput[T]:
+class _TaskInput(Generic[T]):
     """Internal wrapper for task input with async function and arguments."""
 
     async_fn: Callable[..., Awaitable[T]]
@@ -57,7 +62,7 @@ class _TaskInput[T]:
 
 
 @dataclass
-class _Task[T]:
+class _Task(Generic[T]):
     """Internal wrapper for running task with metadata."""
 
     create_time: int  # nanoseconds from time.monotonic_ns()
@@ -65,7 +70,7 @@ class _Task[T]:
     task_input: _TaskInput[T]
 
 
-class AsyncTaskRunner[T]:
+class AsyncTaskRunner(Generic[T]):
     """Generic asynchronous task runner with queue management and pause/resume control.
 
     This class provides a reusable async task executor that runs a background thread

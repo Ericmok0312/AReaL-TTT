@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Staleness-aware capacity manager for rollout generation.
 
 This module provides the StalenessManager class which manages capacity
@@ -7,7 +9,7 @@ and staleness constraints for asynchronous rollout generation in RL training.
 from threading import Lock
 from typing import Protocol
 
-from areal.api.io_struct import RolloutStat
+from areal.api import RolloutStat
 
 
 class VersionProvider(Protocol):

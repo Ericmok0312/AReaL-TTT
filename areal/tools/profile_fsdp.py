@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Profiling tool for FSDP/HuggingFace models (forward + backward).
 
 A profiling tool to analyze op-level performance bottlenecks
@@ -39,6 +41,10 @@ import torch
 from torch.profiler import ProfilerActivity
 from transformers import AutoConfig, AutoModelForCausalLM
 
+from areal.engine.fsdp_utils.attn_impl import (
+    get_attn_impl_validation_error,
+    is_valid_attn_impl,
+)
 from areal.infra import current_platform
 
 
@@ -127,11 +133,13 @@ Examples:
     parser.add_argument(
         "--attn-impl",
         type=str,
-        choices=["sdpa", "flash_attention_2", "eager"],
         default="sdpa",
         help="Attention implementation (default: sdpa)",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not is_valid_attn_impl(args.attn_impl):
+        parser.error(get_attn_impl_validation_error(args.attn_impl))
+    return args
 
 
 def get_dtype(dtype_str: str) -> torch.dtype:
@@ -269,7 +277,7 @@ def run_profile(args: argparse.Namespace) -> None:
     dtype = get_dtype(args.dtype)
 
     # Get model path - use same default as Archon for fair comparison
-    from areal.tests.experimental.archon.utils import MODEL_PATHS
+    from areal.utils.testing_utils import MODEL_PATHS
 
     model_path = args.model_path or MODEL_PATHS.get(
         "qwen2", "Qwen/Qwen2.5-0.5B-Instruct"

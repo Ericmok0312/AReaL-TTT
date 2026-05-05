@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -6,12 +8,10 @@ import torch
 from transformers import PreTrainedTokenizerFast
 
 from areal import workflow_context
+from areal.api import AsyncRewardWrapper, InferenceEngine, ModelRequest, RolloutWorkflow
 from areal.api.cli_args import GenerationHyperparameters
-from areal.api.engine_api import InferenceEngine
-from areal.api.io_struct import ModelRequest
-from areal.api.reward_api import AsyncRewardWrapper
-from areal.api.workflow_api import RolloutWorkflow
 from areal.utils import logging, stats_tracker
+from areal.utils.hf_utils import apply_chat_template
 
 logger = logging.getLogger("MultiTurnWorkflow")
 
@@ -42,7 +42,7 @@ class MultiTurnWorkflow(RolloutWorkflow):
         # Create tokens that should be amended if the answer is incorrect.
         # This method eliminates the encode-decode inconsistency issue and cancels system prompts.
         messages = [{"role": "assistant", "content": "some random message."}]
-        s1 = list(self.tokenizer.apply_chat_template(messages, tokenize=True))
+        s1 = apply_chat_template(self.tokenizer, messages, tokenize=True)
         messages += [
             {
                 "role": "user",
@@ -50,10 +50,8 @@ class MultiTurnWorkflow(RolloutWorkflow):
                 "Please carefully read the original question, check the previous errors, and try to answer it again.",
             }
         ]
-        s2 = list(
-            self.tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True
-            )
+        s2 = apply_chat_template(
+            self.tokenizer, messages, tokenize=True, add_generation_prompt=True
         )
         self.multi_turn_prompt_ids = s2[len(s1) :]
 
@@ -63,12 +61,11 @@ class MultiTurnWorkflow(RolloutWorkflow):
         seq, logprobs, loss_mask, versions = [], [], [], []
         messages = data["messages"]
         # Convert the prompt into input_ids
-        input_ids: list[int] = list(
-            self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-            )
+        input_ids: list[int] = apply_chat_template(
+            self.tokenizer,
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
         )
         # Run multi-turn rollout until correct
         t = 0

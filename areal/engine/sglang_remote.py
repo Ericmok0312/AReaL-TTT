@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import subprocess
 import sys
@@ -6,33 +8,40 @@ from collections.abc import Callable
 from concurrent.futures import Future
 from typing import Any
 
+import numpy as np
+import pybase64
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from areal.api.cli_args import InferenceEngineConfig, PerfTracerConfig, SGLangConfig
-from areal.api.engine_api import InferenceEngine
-from areal.api.io_struct import (
-    HttpGenerationResult,
-    HttpRequest,
+from areal.api import (
+    InferenceEngine,
     LocalInfServerInfo,
+    ModelAllocation,
     ModelRequest,
     ModelResponse,
     ParamSpec,
+    Scheduler,
     WeightUpdateMeta,
-    WeightUpdateRequests,
+    WorkflowLike,
 )
-from areal.api.scheduler_api import Scheduler
-from areal.api.workflow_api import WorkflowLike
+from areal.api.cli_args import InferenceEngineConfig, PerfTracerConfig, SGLangConfig
+from areal.api.io_struct import (
+    HttpGenerationResult,
+    HttpRequest,
+    WeightUpdateRequests,
+    get_versioned_lora_name,
+)
 from areal.infra import RemoteInfEngine, RolloutController, WorkflowExecutor
 from areal.infra.platforms import current_platform
+from areal.infra.utils.launcher import TRITON_CACHE_PATH
 from areal.utils import perf_tracer, stats_tracker
-from areal.utils.launcher import TRITON_CACHE_PATH
+from areal.utils.network import format_host_for_url
 
 
 class SGLangBackend:
     """SGLang-specific backend implementation for remote inference."""
 
     def build_generation_request(
-        self, req: ModelRequest, with_lora: bool
+        self, req: ModelRequest, with_lora: bool, version: int
     ) -> HttpRequest:
         """Build SGLang generation request."""
         gconfig = req.gconfig
@@ -65,9 +74,17 @@ class SGLangBackend:
             "stream": False,
         }
 
+        # Add return_routed_experts to payload if set
+        if req.metadata.get("return_routed_experts", False):
+            payload["return_routed_experts"] = True
         # Add LoRA if initialized
         if with_lora:
-            payload["lora_path"] = "lora_1"
+            lora_name = gconfig.lora_name
+            if not lora_name:
+                raise ValueError(
+                    "LoRA name (gconfig.lora_name) is required when use_lora is enabled."
+                )
+            payload["lora_path"] = get_versioned_lora_name(lora_name, version)
 
         return HttpRequest(endpoint="/generate", payload=payload)
 
@@ -79,11 +96,24 @@ class SGLangBackend:
         finish_reason = meta_info["finish_reason"]
         stop_reason = finish_reason["type"]
         stop_message = finish_reason.get("message", "")
+
+        # Extract routed_experts information if available
+        routed_experts = meta_info.get("routed_experts", None)
+        if routed_experts is not None:
+            num_sgl_token = (
+                meta_info["prompt_tokens"] + meta_info["completion_tokens"] - 1
+            )
+            # Extract expert_id and reshape to (num_sgl_token, num_layers*expert_top_k)
+            routed_experts = np.frombuffer(
+                pybase64.b64decode(routed_experts.encode("utf-8")), dtype=np.int32
+            ).reshape(num_sgl_token, -1)
+
         if stop_reason == "abort" and stop_message.startswith("Abort before prefill"):
             return HttpGenerationResult(
                 output_tokens=[],
                 output_logprobs=[],
                 stop_reason=stop_reason,
+                routed_experts=routed_experts,
             )
 
         output_tokens = [x[1] for x in meta_info["output_token_logprobs"]]
@@ -93,32 +123,26 @@ class SGLangBackend:
             output_tokens=output_tokens,
             output_logprobs=output_logprobs,
             stop_reason=stop_reason,
+            routed_experts=routed_experts,
         )
 
     def build_disk_weight_update_requests(
-        self, meta: WeightUpdateMeta, lora_initialized: bool
+        self, meta: WeightUpdateMeta
     ) -> WeightUpdateRequests:
         """Build SGLang disk weight update requests."""
-        lora_name = "lora_1"
-
         if meta.use_lora:
-            # LoRA workflow
-            requests = []
-            if lora_initialized:
-                # Unload existing LoRA
-                requests.append(
-                    HttpRequest(
-                        endpoint="/unload_lora_adapter",
-                        payload={"lora_name": lora_name},
-                    )
-                )
+            if not meta.lora_name:
+                raise ValueError("LoRA name is required for LoRA update.")
+            if meta.version is None:
+                raise ValueError("Version is required for LoRA update.")
+            lora_name = get_versioned_lora_name(meta.lora_name, meta.version)
             # Load new LoRA
-            requests.append(
+            requests = [
                 HttpRequest(
                     endpoint="/load_lora_adapter",
                     payload={"lora_name": lora_name, "lora_path": str(meta.path)},
                 )
-            )
+            ]
             return WeightUpdateRequests(requests=requests)
         else:
             # Full model update
@@ -137,7 +161,16 @@ class SGLangBackend:
     def build_distributed_weight_update_requests(
         self, meta: WeightUpdateMeta, param_specs: list[ParamSpec]
     ) -> WeightUpdateRequests:
-        """Build SGLang distributed weight update requests."""
+        """Build SGLang distributed weight update requests.
+
+        Note: SGLang distributed weight update (NCCL-based) does not support LoRA.
+        For LoRA weight updates with SGLang, use disk-based update mode instead.
+        """
+        if meta.use_lora:
+            raise ValueError(
+                "SGLang distributed (XCCL/NCCL) weight update does not support LoRA. "
+                "Use weight_update_mode='disk' for LoRA weight updates with SGLang."
+            )
         return WeightUpdateRequests(
             requests=[
                 HttpRequest(
@@ -157,17 +190,18 @@ class SGLangBackend:
         self, addr: str, server_idx: int, meta: WeightUpdateMeta
     ) -> HttpRequest:
         """Build SGLang init weights group request."""
-        assert meta.alloc_mode is not None
-        if meta.alloc_mode.gen.pp_size != 1:
+        assert meta.gen_allocation is not None
+        gen_parallel = meta.gen_allocation.parallel
+        if gen_parallel.pp_size != 1:
             raise NotImplementedError(
                 "NCCL weight update with PP size > 1 is not implemented yet."
             )
-        rank_offset = 1 + server_idx * meta.alloc_mode.gen.tp_size
+        rank_offset = 1 + server_idx * gen_parallel.tp_size
         payload = {
-            "master_address": meta.nccl_master_address,
+            "master_address": format_host_for_url(meta.nccl_master_address),
             "master_port": str(meta.nccl_master_port),
             "rank_offset": rank_offset,
-            "world_size": meta.alloc_mode.gen.world_size + 1,
+            "world_size": gen_parallel.world_size + 1,
             "backend": current_platform.communication_backend,
             "group_name": meta.nccl_group_name,
         }
@@ -203,7 +237,6 @@ class SGLangBackend:
     def launch_server(self, server_args: dict[str, Any]) -> subprocess.Popen:
         """Launch SGLang server subprocess."""
         cmd = SGLangConfig.build_cmd_from_args(server_args)
-
         _env = os.environ.copy()
         triton_cache_path = _env.get("TRITON_CACHE_PATH", TRITON_CACHE_PATH)
         _env["TRITON_CACHE_PATH"] = os.path.join(triton_cache_path, str(uuid.uuid4()))
@@ -233,6 +266,45 @@ class RemoteSGLangEngine(InferenceEngine):
         # Pure composition - create internal engine with SGLang backend
         self._engine = RemoteInfEngine(config, SGLangBackend())
 
+    @classmethod
+    def from_pretrained(
+        cls,
+        tokenizer_path: str | None = None,
+        dp_size: int = 1,
+        max_concurrent_rollouts: int | None = None,
+        **kwargs,
+    ) -> "RemoteInfEngine":
+        """Create a RemoteInfEngine without kwargs instead of InferenceEngineConfig.
+
+        Parameters
+        ----------
+        tokenizer_path: str | None = None
+            Path to the tokenizer
+        dp_size : int
+            Data parallelism size
+        max_concurrent_rollouts : int | None
+            Maximum concurrent rollouts
+        **kwargs : dict
+            Additional config parameters passed to InferenceEngineConfig
+
+        Returns
+        -------
+        RemoteInfEngine
+        """
+
+        backend_str = f"sglang:d{dp_size}"
+
+        config = InferenceEngineConfig(
+            backend=backend_str,
+            max_concurrent_rollouts=max_concurrent_rollouts,
+            tokenizer_path=tokenizer_path,
+            **kwargs,
+        )
+
+        engine = cls(config)
+
+        return engine
+
     def initialize(
         self,
         engine_id: str | None = None,
@@ -240,6 +312,10 @@ class RemoteSGLangEngine(InferenceEngine):
         train_data_parallel_size: int | None = None,
     ):
         """Initialize the engine by discovering and connecting to servers."""
+        if train_data_parallel_size is None:
+            train_data_parallel_size = ModelAllocation.from_str(
+                self.config.backend, name="rollout"
+            ).parallel.data_parallel_size
         return self._engine.initialize(engine_id, addr, train_data_parallel_size)
 
     def destroy(self):
@@ -262,6 +338,9 @@ class RemoteSGLangEngine(InferenceEngine):
     def get_version(self) -> int:
         """Get the current weight version."""
         return self._engine.get_version()
+
+    def set_proxy_gateway_addr(self, addr: str) -> None:
+        return self._engine.set_proxy_gateway_addr(addr)
 
     async def agenerate(self, req: ModelRequest) -> ModelResponse:
         """Asynchronously generate a response for the given request."""
@@ -393,8 +472,23 @@ class RemoteSGLangEngine(InferenceEngine):
     ) -> RolloutController:
         return RolloutController(cls, config=config, scheduler=scheduler)
 
-    def clear_batches(self, *args):
-        """Placeholder method of single-controller API."""
+    def clear_batches(self, shard_ids: list[str]) -> None:
+        """Drain this worker's client-side RTensor fetch buffer.
+
+        Called via RPC by ``TrainController.clear_batches`` at step end so
+        cross-node consumer DP heads release cached tensors. See #1209.
+        Upstream ``TrainController.clear_batches`` guards against empty
+        input, so ``shard_ids`` is always a non-empty ``list[str]``.
+        """
+        from areal.infra.rpc.rtensor import clear_fetch_buffer
+
+        clear_fetch_buffer(shard_ids)
+
+    def fetch_buffer_stats(self) -> dict[str, int]:
+        """Expose local fetch-buffer stats for post-step drain verification."""
+        from areal.infra.rpc.rtensor import fetch_buffer_stats
+
+        return fetch_buffer_stats()
 
     def save_perf_tracer(self, step: int | None = None, force: bool = False) -> None:
         perf_tracer.save(step=step, force=force)

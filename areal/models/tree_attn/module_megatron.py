@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from contextlib import contextmanager
 
 import torch
@@ -27,7 +29,7 @@ from areal.models.tree_attn.triton_kernel import (
 )
 from areal.utils import logging
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("TreeAttentionMegatron")
 
 
 class PytorchFlexAttention(torch.nn.Module):

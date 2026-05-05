@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+
+import copy
 import os
 import subprocess
 import uuid
@@ -10,7 +13,7 @@ import torch.distributed as dist
 from PIL.Image import Image as ImageObject
 from transformers import PreTrainedTokenizerFast
 
-from areal.api.alloc_mode import AllocationMode
+from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import GenerationHyperparameters
 from areal.infra.platforms import current_platform
 from areal.utils import logging
@@ -75,6 +78,9 @@ class ModelResponse:
     latency: float = float("inf")
     ttft: float = float("inf")  # Time to first token
     itl: list[float] = field(default_factory=list)  # List of inter-token latencies
+
+    # MoE routing (only populated when return_routed_experts=True)
+    routed_experts: np.ndarray | None = None
 
     @property
     def input_len(self) -> int:
@@ -152,11 +158,32 @@ class ParamSpec:
         return getattr(torch, self.dtype).itemsize * np.prod(self.shape)
 
 
+def get_versioned_lora_name(lora_name: str, version: int) -> str:
+    """Get versioned LoRA adapter name (e.g., 'lora-v1')."""
+    return f"{lora_name}-v{version}"
+
+
+def detect_image_mime(base64_data: str) -> str:
+    """Detect image MIME type from the first bytes of base64-encoded data.
+
+    Examines base64 magic byte prefixes to determine the actual image format.
+    """
+    if base64_data.startswith("iVBOR"):  # PNG: \x89PNG
+        return "image/png"
+    if base64_data.startswith("/9j/"):  # JPEG: \xff\xd8\xff
+        return "image/jpeg"
+    if base64_data.startswith("R0lGOD"):  # GIF: GIF8
+        return "image/gif"
+    if base64_data.startswith("UklGR"):  # WebP: RIFF
+        return "image/webp"
+    return "image/jpeg"
+
+
 @dataclass
 class WeightUpdateMeta:
-    type: Literal["disk", "nccl"]
+    type: Literal["disk", "xccl", "awex"]
     path: str | None = None
-    alloc_mode: AllocationMode | None = None
+    gen_allocation: ModelAllocation | None = None
 
     nccl_master_address: str | None = None
     nccl_master_port: int | None = None
@@ -170,6 +197,22 @@ class WeightUpdateMeta:
     peft_config: dict = field(default_factory=dict)
 
     clear_checkpoint_after_load: bool = True
+
+    version: int | None = None
+
+    def with_version(self, version: int) -> "WeightUpdateMeta":
+        """Return a copy of this meta with versioned path.
+
+        Changes path from 'weight_update' to 'weight_update_v{version}'.
+        """
+        if version < 0:
+            raise ValueError(f"version must be non-negative, got {version}")
+        new_meta = copy.copy(self)
+        new_meta.version = version
+        if self.path is not None:
+            base_dir = os.path.dirname(self.path)
+            new_meta.path = os.path.join(base_dir, f"weight_update_v{version}")
+        return new_meta
 
     @classmethod
     def from_disk(
@@ -203,19 +246,7 @@ class WeightUpdateMeta:
     @classmethod
     def from_megatron_xccl(
         cls,
-        allocation_mode: AllocationMode,
-        weight_chunked_mem_mb: int = 1024,
-    ):
-        return cls(
-            type="xccl",
-            alloc_mode=allocation_mode,
-            weight_chunked_mem_mb=weight_chunked_mem_mb,
-        )
-
-    @classmethod
-    def from_fsdp_xccl(
-        cls,
-        allocation_mode: AllocationMode,
+        gen_allocation: ModelAllocation,
         weight_chunked_mem_mb: int = 1024,
         use_lora: bool = False,
         lora_name: str = "",
@@ -224,8 +255,44 @@ class WeightUpdateMeta:
     ):
         return cls(
             type="xccl",
-            alloc_mode=allocation_mode,
+            gen_allocation=gen_allocation,
             weight_chunked_mem_mb=weight_chunked_mem_mb,
+            use_lora=use_lora,
+            lora_name=lora_name,
+            lora_int_id=lora_int_id,
+            base_model_name=base_model_name,
+        )
+
+    @classmethod
+    def from_fsdp_xccl(
+        cls,
+        gen_allocation: ModelAllocation,
+        weight_chunked_mem_mb: int = 1024,
+        use_lora: bool = False,
+        lora_name: str = "",
+        lora_int_id: int = 1,
+        base_model_name: str = "",
+    ):
+        return cls(
+            type="xccl",
+            gen_allocation=gen_allocation,
+            weight_chunked_mem_mb=weight_chunked_mem_mb,
+            use_lora=use_lora,
+            lora_name=lora_name,
+            lora_int_id=lora_int_id,
+            base_model_name=base_model_name,
+        )
+
+    @classmethod
+    def from_awex(
+        cls,
+        use_lora: bool = False,
+        lora_name: str = "",
+        lora_int_id: int = 1,
+        base_model_name: str = "",
+    ):
+        return cls(
+            type="awex",
             use_lora=use_lora,
             lora_name=lora_name,
             lora_int_id=lora_int_id,
@@ -249,6 +316,7 @@ class HttpGenerationResult:
     output_tokens: list[int]
     output_logprobs: list[float]
     stop_reason: str
+    routed_experts: np.ndarray | None = None
 
 
 @dataclass
@@ -303,7 +371,7 @@ class LocalInfServerInfo:
 
     host: str
     port: int
-    process: subprocess.Popen
+    process: subprocess.Popen | None
 
 
 @dataclass

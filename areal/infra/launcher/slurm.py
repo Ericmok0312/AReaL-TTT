@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 import getpass
 import os
@@ -5,11 +7,13 @@ import re
 import subprocess
 import sys
 import time
+import warnings
 
 import areal.utils.logging as logging
-from areal.api.alloc_mode import AllocationMode, AllocationType
+from areal.api.alloc_mode import AllocationType, _AllocationMode
 from areal.api.cli_args import (
     ClusterSpecConfig,
+    InferenceEngineConfig,
     RecoverConfig,
     SGLangConfig,
     parse_cli_args,
@@ -17,9 +21,8 @@ from areal.api.cli_args import (
     vLLMConfig,
 )
 from areal.infra.platforms import current_platform
-from areal.utils import name_resolve, names
-from areal.utils.exp_metadata import save_experiment_metadata
-from areal.utils.launcher import (
+from areal.infra.utils.exp_metadata import save_experiment_metadata
+from areal.infra.utils.launcher import (
     BASE_ENVIRONS,
     JobException,
     JobInfo,
@@ -29,15 +32,16 @@ from areal.utils.launcher import (
     validate_config_for_distributed_launcher,
     wait_llm_server_addrs,
 )
-from areal.utils.offload import get_tms_env_vars
-from areal.utils.recover import check_if_recover
-from areal.utils.slurm import (
+from areal.infra.utils.slurm import (
     APPTAINER_CMD_TEMPLATE,
     SBATCH_SCRIPT_TEMPLATE,
     SRUN_CMD_TEMPLATE,
     cancel_jobs,
     query_jobs,
 )
+from areal.utils import name_resolve, names
+from areal.utils.offload import get_tms_env_vars
+from areal.utils.recover import check_if_recover
 
 logger = logging.getLogger("SlurmLauncher")
 
@@ -407,6 +411,16 @@ def slurm_main(config, run_id: int = 0):
     config.cluster = to_structured_cfg(config.cluster, ClusterSpecConfig)
     config.recover = to_structured_cfg(config.recover, RecoverConfig)
     is_recover_run = check_if_recover(config.recover, run_id)
+    warnings.warn(
+        "SPMD launchers use the deprecated _AllocationMode parser which will be removed. "
+        "Bare dimension strings (e.g., 'd4t2') are NO LONGER ACCEPTED. "
+        "All allocation strings must include an explicit backend prefix "
+        "(e.g., 'fsdp:d4', 'sglang:d4t2'). "
+        "Migrate to single-controller mode (scheduler.type=local) with per-engine 'backend' "
+        "fields (e.g., actor.backend='fsdp:d4'). See docs/en/reference/alloc_mode.md.",
+        FutureWarning,
+        stacklevel=2,
+    )
     validate_config_for_distributed_launcher(config)
     logger.info(
         f"SlurmLauncher: experiment_name={config.experiment_name}, "
@@ -434,7 +448,7 @@ def slurm_main(config, run_id: int = 0):
     n_nodes = config.cluster.n_nodes
     n_gpus_per_node = config.cluster.n_gpus_per_node
     allocation_mode = config.allocation_mode
-    allocation_mode = AllocationMode.from_str(allocation_mode)
+    allocation_mode = _AllocationMode.from_str(allocation_mode)
 
     if not is_recover_run:
         metadata_file = save_experiment_metadata(
@@ -456,6 +470,7 @@ def slurm_main(config, run_id: int = 0):
             config.vllm = to_structured_cfg(config.vllm, vLLMConfig)
             random_seed = config.vllm.seed
 
+        config.rollout = to_structured_cfg(config.rollout, InferenceEngineConfig)
         # Get rollout scheduling spec
         rollout_spec = get_scheduling_spec(config.rollout)
 

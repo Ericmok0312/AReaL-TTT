@@ -1,13 +1,15 @@
 # Contributing to AReaL
 
 Thank you for your interest in contributing to AReaL! We welcome contributions from
-everyone, whether you're fixing bugs, improving documentation, adding new features, or
+everyone, whether you're fixing bugs, improving documentations, adding new features, or
 helping with code reviews. This guide will help you get started.
+
+Please review our [Code of Conduct](CODE_OF_CONDUCT.md) before participating and our
+[Governance](GOVERNANCE.md) document to understand how the project is managed.
 
 ## Table of Contents
 
 - [Quick Start](#quick-start)
-- [Ways to Contribute](#ways-to-contribute)
 - [Tips for Using AI-Assisted Coding](#tips-for-using-ai-assisted-coding)
 - [CI/CD](#cicd)
 
@@ -24,16 +26,16 @@ helping with code reviews. This guide will help you get started.
 1. **Install Development Dependencies:**
 
    Check our
-   [installation guide](https://inclusionai.github.io/AReaL/tutorial/installation.html)
+   [installation guide](https://inclusionai.github.io/AReaL/en/tutorial/installation.html)
    for detailed setup instructions.
 
-1. **Set Up Code Formatting:**
+1. **Set Up Pre-commit Hooks:**
 
    ```bash
-   pip install pre-commit
-   pre-commit install
-   # Subsequent commits will automatically format your files:
-   git commit -a -m 'my change'
+   # Install hooks (includes formatting, linting, and commit message checks)
+   pre-commit install --install-hooks
+   # Subsequent commits will automatically check your files and commit messages:
+   git commit -a -m 'feat(engine): my change'
    ```
 
 1. **Find an Issue:**
@@ -56,7 +58,7 @@ helping with code reviews. This guide will help you get started.
    ```bash
    # --sw: step-wise debugging
    # --lf: run the last failed test first
-   pytest -sv --sw --lf areal/tests/
+   pytest -sv --sw --lf tests/
    ```
 
    Our test suite includes:
@@ -71,64 +73,22 @@ helping with code reviews. This guide will help you get started.
    - Running other unit tests for individual components
 
    Some unit tests require multiple GPUs. The entry point scripts are located under
-   `areal/tests/torchrun`. In the corresponding test files (e.g.,
+   `tests/torchrun`. In the corresponding test files (e.g.,
    `test_data_redistribution.py`), we use subprocesses to launch distributed experiments
    with `torchrun` and wait for results.
 
-   If you have modified documentation, build it locally and preview it before opening a
-   PR:
+   If you have modified documentation, prepare doc in English and Chinese (use
+   [/translate-doc-zh](../en/reference/ai_assisted_dev.md#commands) if needed), then
+   build the docs and preview locally:
 
    ```bash
-   # Build docs locally (jupyter-book is included in dev dependencies):
-   jb build docs
+   ./docs/build_all.sh
    ```
 
 1. **Submit a Pull Request**
 
-We suggest applying our provided claude command `/create-pr` whenever possible.
-
-## Ways to Contribute
-
-### 🐛 Bug Reports
-
-Found a bug? Please create a
-[bug report](https://github.com/inclusionAI/AReaL/issues/new?template=bug.md) with:
-
-- A clear description of the issue
-- Steps to reproduce
-- Expected vs. actual behavior
-- Environment details (commit ID, hardware, software)
-- Full logs when possible
-
-### ✨ Feature Requests
-
-Have an idea? Submit a
-[feature request](https://github.com/inclusionAI/AReaL/issues/new?template=feature.md)
-with:
-
-- Background and use case
-- Proposed solution or implementation approach
-- Expected benefits to the community
-
-### 📚 Documentation
-
-Documentation improvements are always welcome:
-
-- Fix typos or clarify existing docs
-- Add examples or tutorials
-- Improve API documentation
-- Write blog posts or guides
-
-### 💻 Code Contributions
-
-We accept various types of code contributions:
-
-- Bug fixes
-- New features
-- Performance improvements
-- Algorithm implementations
-- Test coverage improvements
-- Code refactoring
+We suggest applying our provided agent harness command `/create-pr` whenever possible.
+Use that in `claude`, `opencode`, or any other coding agent CLI.
 
 **IMPORTANT**: For new features and code refactoring, please submit a corresponding
 issue or open a draft PR to discuss with the core developers before making any code
@@ -138,27 +98,21 @@ waste your effort.
 ## Tips for Using AI-Assisted Coding
 
 See the full
-[AI-Assisted Development Guide](https://inclusionai.github.io/AReaL/reference/ai_assisted_dev.html)
+[AI-Assisted Development Guide](https://inclusionai.github.io/AReaL/en/reference/ai_assisted_dev.html)
 for detailed documentation.
 
 ## CI/CD
 
-### Format Check
+### Pre-commit Checks
 
-The format check runs automatically whenever a PR is opened. Your PR will pass the
-format check as long as you have properly run the formatting tools using `pre-commit`.
+Pre-commit checks run automatically on every PR. CI executes
+`pre-commit run --all-files` to verify formatting (Ruff, clang-format, mdformat) and
+linting. Commit messages are also validated against
+[Conventional Commits](https://www.conventionalcommits.org/) format (e.g., `feat: ...`,
+`fix: ...`, `docs: ...`, `gov: ...`).
 
-**Important Note on Formatting Tools:**
-
-We are gradually transitioning our Python formatting tool from `black` to `ruff`.
-Currently, the CI format check still uses `black` for Python file formatting, while
-`pre-commit` uses `ruff`. Please note that `ruff check` will fail on files in `areal/`
-and `examples/` because these directories have not been fully re-formatted yet.
-
-`black` and `ruff` have known conflicts when handling long assertions. To pass the CI
-format check, you should manually convert long assertions to `if`-`raise` statements.
-See [this issue](https://github.com/inclusionAI/AReaL/issues/503) for detailed
-information.
+As long as you have `pre-commit install --install-hooks` set up locally, your code will
+be checked before each commit and your commit messages will be validated automatically.
 
 ### Tests
 
@@ -171,8 +125,8 @@ suite runs on ephemeral GCP compute engines with 2 A100 GPUs (40GB memory).
 **Writing Tests for New Features:**
 
 If you have implemented a new feature, we highly recommend writing tests and adding them
-to our pytest workflow. Place your test files under `areal/tests/test_*.py` and mark
-them with our pre-defined pytest markers:
+to our pytest workflow. Place your test files under `tests/test_*.py` and mark them with
+our pre-defined pytest markers:
 
 - `slow`: Tests that take more than 30 seconds to run. These will not run in the CI/CD
   workflow unless also marked with `ci`.
@@ -210,8 +164,6 @@ def test_some_multi_gpu_functionality():
 ```
 
 ### Image Building
-
-> **NOTE:** The image building CI workflow is experimental and subject to change.
 
 The image building workflow can be triggered manually from any branch by users with
 write permissions to the repository.

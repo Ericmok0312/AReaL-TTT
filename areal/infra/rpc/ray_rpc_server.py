@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import traceback
 from concurrent.futures import Future
@@ -5,8 +7,8 @@ from typing import Any
 
 import ray
 
+from areal.api import InferenceEngine, TrainEngine
 from areal.api.cli_args import BaseExperimentConfig
-from areal.api.engine_api import InferenceEngine, TrainEngine
 from areal.infra.rpc.rtensor import RTensor
 from areal.utils import logging, name_resolve, seeding
 from areal.utils.data import (
@@ -42,6 +44,30 @@ class RayRPCServer:
         from areal.infra.platforms import current_platform
 
         return current_platform.current_device()
+
+    def _get_device_type(self) -> str:
+        from areal.infra.platforms import current_platform
+
+        return current_platform.device_type
+
+    def _should_broadcast_payload(
+        self,
+        engine: TrainEngine | InferenceEngine,
+        rpc_meta: dict[str, Any] | None,
+    ) -> bool:
+        default_broadcast = isinstance(engine, TrainEngine) and engine.initialized
+        if rpc_meta is None:
+            return default_broadcast
+        if not isinstance(rpc_meta, dict):
+            raise ValueError(
+                f"Invalid rpc_meta: expected dict or None, got {type(rpc_meta)}"
+            )
+        broadcast = rpc_meta.get("broadcast", default_broadcast)
+        if not isinstance(broadcast, bool):
+            raise ValueError(
+                f"Invalid rpc_meta.broadcast: expected bool, got {type(broadcast)}"
+            )
+        return broadcast
 
     def ping(self) -> str:
         return "ok"
@@ -99,7 +125,14 @@ class RayRPCServer:
             )
             raise
 
-    def call(self, method: str, *args, engine_name: str | None = None, **kwargs) -> Any:
+    def call(
+        self,
+        method: str,
+        *args,
+        engine_name: str | None = None,
+        rpc_meta: dict[str, Any] | None = None,
+        **kwargs,
+    ) -> Any:
         self.logger.debug(
             f"Calling {method} on engine '{engine_name}' with arguments {args=} {kwargs=}"
         )
@@ -117,25 +150,16 @@ class RayRPCServer:
 
         raw_args = list(args)
         raw_kwargs = kwargs.copy()
-        # fetch remote tensors if any
+        # Fetch remote tensors
         args = RTensor.localize(raw_args)
         kwargs = RTensor.localize(raw_kwargs)
 
-        # Broadcast args when engine is a TrainEngine and has been initialized
         try:
-            if isinstance(engine, TrainEngine) and engine.initialized:
+            should_broadcast = self._should_broadcast_payload(
+                engine=engine, rpc_meta=rpc_meta
+            )
+            if should_broadcast:
                 device = self._get_device()
-
-                raw_args = broadcast_tensor_container(
-                    tensor_container_to(raw_args, self._get_device()),
-                    src_rank=engine.current_data_parallel_head(),
-                    group=engine.context_and_model_parallel_group,
-                )
-                raw_kwargs = broadcast_tensor_container(
-                    tensor_container_to(raw_kwargs, self._get_device()),
-                    src_rank=engine.current_data_parallel_head(),
-                    group=engine.context_and_model_parallel_group,
-                )
                 args = tensor_container_to(args, device)
                 args = broadcast_tensor_container(
                     args,
@@ -157,15 +181,21 @@ class RayRPCServer:
 
         try:
             fn = getattr(engine, method)
+            # Re-establish current device in RPC execution context before
+            # invoking engine methods that may issue object collectives.
+            if (
+                isinstance(engine, TrainEngine)
+                and engine.initialized
+                and self._get_device_type() != "cpu"
+            ):
+                from areal.infra.platforms import current_platform
+
+                current_platform.set_device(current_platform.current_device())
             result = fn(*args, **kwargs)
             if isinstance(result, Future):
                 result = result.result()
             # Convert all tensors to RTensors and store the tensor locally
-            layout = RTensor.extract_layout(
-                result, layouts=dict(args=raw_args, kwargs=raw_kwargs), node_addr=""
-            )
-            if layout is not None:
-                result = RTensor.remotize(result, layout, node_addr="")
+            result = RTensor.remotize(result, node_addr="")
             # put back to cpu to mimic RPCServer encode/decode
             result = tensor_container_to(result, "cpu")
             self.logger.debug(f"Successfully completed RayRPCServer call {result}")

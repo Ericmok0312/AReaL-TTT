@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import asyncio
@@ -5,7 +7,6 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
-import torch
 from pydantic import BaseModel
 
 from areal.experimental.openai.cache import InteractionCache
@@ -26,12 +27,14 @@ class StartSessionRequest(BaseModel):
     """Request to start a new RL session."""
 
     task_id: str
+    api_key: str | None = None  # Reuse a previously-issued key (refresh)
 
 
 class StartSessionResponse(BaseModel):
     """Response from start_session endpoint."""
 
     session_id: str
+    api_key: str
 
 
 class SetRewardRequest(BaseModel):
@@ -68,8 +71,7 @@ class SessionData:
 
         self._completed = False
         self._completions = InteractionCache()
-        self._completed_event = asyncio.Event()
-
+        self._completed_event = threading.Event()
         self._start_time = time.time()
         self._last_access_time = time.time()
         self._end_time = None
@@ -91,18 +93,23 @@ class SessionData:
         self._completed_event.set()
 
     @property
+    def is_completed(self) -> bool:
+        """Whether this session has been completed via ``finish()``."""
+        return self._completed
+
+    @property
     def completions(self):
         return self._completions
 
     async def wait_for_finish(self, timeout: float | None = None) -> bool:
-        """Asynchronously wait for session to finish. Returns True if finished, False if timeout."""
-        if timeout:
-            try:
-                await asyncio.wait_for(self._completed_event.wait(), timeout)
-                return True
-            except TimeoutError:
+        loop = asyncio.get_running_loop()
+        deadline = time.monotonic() + timeout if timeout else None
+        while not self._completed_event.is_set():
+            remaining = (deadline - time.monotonic()) if deadline else 1.0
+            if deadline and remaining <= 0:
                 return False
-        await self._completed_event.wait()
+            poll = min(remaining, 1.0)  # Poll every 1s so cancellation works
+            await loop.run_in_executor(None, self._completed_event.wait, poll)
         return True
 
     def export_interactions(
@@ -122,16 +129,25 @@ class SessionData:
 def serialize_interactions(
     interactions: dict[str, InteractionWithTokenLogpReward],
 ) -> dict[str, Any]:
-    """Serialize interactions for HTTP transport."""
+    """Serialize interactions into a json-compatible format for HTTP transport."""
+    from areal.infra.rpc.serialization import serialize_value
+
     result = {}
     for key, interaction in interactions.items():
-        tensor_dict = interaction.to_tensor_dict()
-        result[key] = {
-            "tensor_dict": {k: v.tolist() for k, v in tensor_dict.items()},
-            "reward": interaction.reward,
-            "interaction_id": interaction.interaction_id,
-        }
-    return result
+        if interaction.has_tensor_data:
+            result[key] = {
+                "tensor_dict": interaction.to_tensor_dict(),
+                "reward": interaction.reward,
+                "interaction_id": interaction.interaction_id,
+            }
+        else:
+            result[key] = {
+                "messages": interaction.messages,
+                "output_message_list": interaction.output_message_list,
+                "reward": interaction.reward,
+                "interaction_id": interaction.interaction_id,
+            }
+    return serialize_value(result)
 
 
 def deserialize_interactions(
@@ -139,14 +155,19 @@ def deserialize_interactions(
 ) -> dict[str, InteractionWithTokenLogpReward]:
     """Deserialize interactions from HTTP response."""
     from areal.experimental.openai.types import InteractionWithTokenLogpReward
+    from areal.infra.rpc.serialization import deserialize_value
 
+    data = deserialize_value(data)
     result = {}
     for key, item in data.items():
-        tensor_dict = {k: torch.tensor(v) for k, v in item["tensor_dict"].items()}
-        # Create a minimal InteractionWithTokenLogpReward with cached tensor dict
         interaction = InteractionWithTokenLogpReward()
-        interaction._cache = tensor_dict
+        if "tensor_dict" in item:
+            interaction._cache = item["tensor_dict"]
+        else:
+            interaction.messages = item["messages"]
+            interaction.output_message_list = item["output_message_list"]
         interaction.reward = item["reward"]
+        interaction.interaction_id = item["interaction_id"]
         result[key] = interaction
     return result
 
@@ -161,3 +182,24 @@ RL_SET_REWARD_PATHNAME = "rl/set_reward"
 CHAT_COMPLETIONS_PATHNAME = "chat/completions"
 RESPONSES_PATHNAME = "responses"
 ANTHROPIC_MESSAGES_PATHNAME = "v1/messages"
+GRANT_CAPACITY_PATHNAME = "grant_capacity"
+EXPORT_TRAJECTORIES_PATHNAME = "export_trajectories"
+INTERNAL_WAIT_FOR_SESSION_PATHNAME = "internal/wait_for_session"
+
+# Shared default for admin API key — used by cli_args.py and workflow.py
+# to avoid independent duplication.
+DEFAULT_ADMIN_API_KEY = "areal-admin-key"
+
+
+class WaitForSessionRequest(BaseModel):
+    """Request from _OnlineAgent to register a worker and wait for a session."""
+
+    worker_addr: str
+
+
+class WaitForSessionResponse(BaseModel):
+    """Response with completed session credentials."""
+
+    session_api_key: str
+    session_id: str
+    worker_addr: str

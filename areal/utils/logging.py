@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import logging.config
 import os
 import threading
@@ -59,10 +61,12 @@ LOGGER_COLORS_EXACT = {
     "SyncRPCServer": "white",
     "RayRPCServer": "white",
     "RPCSerialization": "white",
+    "HttpRTensor": "white",
     # Inference wrappers - white
     "SGLangWrapper": "white",
     "VLLMWrapper": "white",
     "RemoteInfEngine": "white",
+    "vLLMEngine": "white",
     # Dataset - green
     "Dataset": "light_green",
     "CLEVR70KDataset": "light_green",
@@ -76,12 +80,27 @@ LOGGER_COLORS_EXACT = {
     "Geometry3KReward": "purple",
     "RewardUtils": "purple",
     "RewardAPI": "purple",
+    # Tree attention - cyan
+    "TreeAttentionWrapper": "light_cyan",
+    "TreeAttentionFSDP": "light_cyan",
+    "TreeAttentionMegatron": "light_cyan",
+    "TreeAttentionCore": "light_cyan",
+    "TreeAttentionConstants": "light_cyan",
+    "TreeAttentionViz": "light_cyan",
+    # Checkpoint - blue (infrastructure)
+    "Saver": "blue",
+    "AsyncCheckpoint": "blue",
+    "ArchonCheckpoint": "blue",
     # Platforms - cyan
     "Platform": "light_cyan",
     "PlatformInit": "light_cyan",
     "CUDAPlatform": "light_cyan",
     "NPUPlatform": "light_cyan",
     "UnknownPlatform": "light_cyan",
+    # Sandbox backends
+    "DaytonaClientManager": "blue",
+    "DaytonaRunner": "light_cyan",
+    "DaytonaPythonTool": "light_purple",
     # OpenAI - purple
     "OpenAIClient": "light_purple",
     "OpenAICache": "light_purple",
@@ -89,6 +108,20 @@ LOGGER_COLORS_EXACT = {
     "ToolCallParser": "light_purple",
     "TokenLogpReward": "light_purple",
     "ProxyUtils": "light_purple",
+    # Agent Service - purple
+    "AgentGateway": "light_purple",
+    "AgentBridge": "light_purple",
+    "AgentRouter": "light_purple",
+    "AgentWorker": "light_purple",
+    "AgentDataProxy": "light_purple",
+    "AgentController": "light_purple",
+    # Inference service - white (orchestration)
+    "RolloutControllerV2": "white",
+    "InferenceDataProxy": "white",
+    "InferenceInfBridge": "white",
+    "InferenceRouter": "white",
+    "InferenceGateway": "white",
+    "RPCGuard": "white",
 }
 
 # Prefix patterns checked in order (first match wins)
@@ -387,7 +420,7 @@ _LATEST_LOG_STEP = 0
 
 
 def log_swanlab_wandb_tensorboard(data, step=None, summary_writer=None):
-    # Logs data to SwanLab、 wandb、 TensorBoard.
+    # Logs data to SwanLab, wandb, TensorBoard, and Trackio.
 
     global _LATEST_LOG_STEP
     if step is None:
@@ -407,6 +440,14 @@ def log_swanlab_wandb_tensorboard(data, step=None, summary_writer=None):
     import wandb
 
     wandb.log(data, step=step)
+
+    # trackio
+    try:
+        import trackio
+
+        trackio.log(data, step=step)
+    except (ModuleNotFoundError, ImportError):
+        pass
 
     # tensorboard
     if summary_writer is not None:

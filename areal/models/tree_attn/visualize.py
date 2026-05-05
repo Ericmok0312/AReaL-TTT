@@ -1,8 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import torch
 
 from areal.utils import logging
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("TreeAttentionViz")
 
 
 # Helper function for visualizing attention masks

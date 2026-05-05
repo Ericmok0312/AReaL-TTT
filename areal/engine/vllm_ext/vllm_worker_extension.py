@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import traceback
 
 import torch
@@ -8,9 +10,9 @@ from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.model_loader import get_model_loader
 
+from areal.engine.core.distributed import init_custom_process_group
 from areal.infra.platforms import current_platform
 from areal.utils.constants import DIST_GROUP_DEFAULT_TIMEOUT
-from areal.utils.distributed import init_custom_process_group
 
 logger = init_logger("vllm_worker_extension")
 
@@ -24,7 +26,7 @@ class VLLMWorkerExtension:
         current_platform.synchronize()
         torch.distributed.barrier()
 
-    def update_weights(self, model_path):
+    def areal_update_weights(self, model_path):
         logger.info(f"start update weights, {model_path}", flush=True)
         try:
             # load weight
@@ -42,7 +44,7 @@ class VLLMWorkerExtension:
             logger.error(error_msg)
             return False, error_msg
 
-    def update_weights_lora(
+    def areal_update_weights_lora(
         self,
         lora_model_path: str,
         lora_name: str,
@@ -72,7 +74,7 @@ class VLLMWorkerExtension:
             logger.error(error_msg)
             return False, error_msg
 
-    def set_weight_meta(
+    def areal_set_weight_meta(
         self,
         names: list[str],
         dtypes: list[str],
@@ -86,7 +88,7 @@ class VLLMWorkerExtension:
         self.areal_weight_meta_group_name = group_name
         return True, "Success"
 
-    def set_weight_meta_lora(
+    def areal_set_weight_meta_lora(
         self,
         names: list[str],
         dtypes: list[str],
@@ -116,7 +118,7 @@ class VLLMWorkerExtension:
         self.areal_lora_base_model_name = base_model_name
         return True, "Success"
 
-    def update_weight_xccl(self):
+    def areal_update_weight_xccl(self):
         logger.info("start update weights by nccl or hccl", flush=True)
         names = self.areal_weight_meta_names
         dtypes = self.areal_weight_meta_dtypes
@@ -149,7 +151,7 @@ class VLLMWorkerExtension:
             logger.error(error_msg)
             return False, error_msg
 
-    def update_weight_lora_xccl(self):
+    def areal_update_weight_lora_xccl(self):
         # NOTE: This code relies on vLLM private APIs: _adapter_manager, _registered_adapters,
         # and _add_adapter/activate_adapter, which may change/ breakdown due to newer vllm versions.
 
@@ -180,7 +182,7 @@ class VLLMWorkerExtension:
                     f"LoRA adapter {lora_int_id} not found. Available: {adapter_ids}"
                 )
 
-            # Get the LoRA model
+            # Get the currently registered LoRA model (used for diagnostics).
             lora_model = (
                 self.model_runner.lora_manager._adapter_manager._registered_adapters[
                     lora_int_id
@@ -207,15 +209,36 @@ class VLLMWorkerExtension:
                     async_op=False,
                 )
 
-                received_weights[name] = tensor
+                received_weights[name] = tensor.cpu()
 
             logger.info(f"Received {len(received_weights)} LoRA parameters via XCCL")
-
-            self.model_runner.lora_manager.remove_adapter(lora_int_id)
 
             normalized_weights = {
                 k.replace("default.", ""): v for k, v in received_weights.items()
             }
+
+            lora_partial_shard_key = (self.areal_lora_name, lora_int_id)
+
+            group_shards = self._lora_partial_shards.setdefault(
+                lora_partial_shard_key, {}
+            )
+            group_shards[self.areal_weight_meta_group_name] = normalized_weights
+            buffered_count = len(group_shards)
+
+            # Assumes that every registered weight update group contributes to the update cycle
+            if buffered_count < len(self.weight_update_groups):
+                logger.info(
+                    "Buffered LoRA shard for "
+                    f"{self.areal_lora_name}: group={self.areal_weight_meta_group_name}, "
+                    f"buffered={buffered_count}/{len(self.weight_update_groups)} PP stages."
+                )
+                self.sync()
+                return True, "Success"
+
+            merged_weights: dict[str, torch.Tensor] = {}
+            for shard in group_shards.values():
+                merged_weights.update(shard)
+            self._lora_partial_shards.pop(lora_partial_shard_key, None)
 
             peft_config = {
                 "r": self.areal_lora_rank,
@@ -234,9 +257,9 @@ class VLLMWorkerExtension:
 
             new_lora_model = LoRAModel.from_lora_tensors(
                 lora_model_id=self.areal_lora_int_id,
-                tensors=normalized_weights,
+                tensors=merged_weights,
                 peft_helper=peft_helper,
-                device=self.model_runner.device,
+                device="cpu",
                 dtype=self.model_runner.lora_manager.lora_config.lora_dtype,
                 model_vocab_size=model_vocab_size,
                 weights_mapper=getattr(
@@ -244,13 +267,21 @@ class VLLMWorkerExtension:
                 ),
             )
 
+            self.model_runner.lora_manager.remove_adapter(lora_int_id)
+
             self.model_runner.lora_manager._adapter_manager._add_adapter(new_lora_model)
             self.model_runner.lora_manager._adapter_manager.activate_adapter(
                 new_lora_model.id
             )
             logger.info(
-                f"Found LoRA model with {len(new_lora_model.loras)} LoRA modules"
+                f"Updated New LoRA model with {len(new_lora_model.loras)} LoRA modules "
+                f"from {len(merged_weights)} tensors across {len(self.weight_update_groups)} groups"
             )
+            if len(new_lora_model.loras) != len(lora_model.loras):
+                logger.warning(
+                    f"Number of modules in the new LoRA model ({len(new_lora_model.loras)}) "
+                    f"does not match the old LoRA model ({len(lora_model.loras)})."
+                )
 
             self.sync()
             return True, "Success"
@@ -260,7 +291,7 @@ class VLLMWorkerExtension:
             logger.error(error_msg)
             return False, error_msg
 
-    def init_update_weight_group(
+    def areal_init_update_weight_group(
         self,
         master_address: str,
         master_port: str,
@@ -271,6 +302,18 @@ class VLLMWorkerExtension:
     ):
         if not hasattr(self, "weight_update_groups"):
             self.weight_update_groups: dict[str, dist.ProcessGroup] = {}
+
+        # This is required for buffering weights during lora weight update, as vLLM
+        # expects the partial PP shards to be buffered until all groups have sent their shards.
+        _is_vllm_lora_enabled = (
+            getattr(self.model_runner, "lora_manager", None) is not None
+        )
+        if _is_vllm_lora_enabled and not hasattr(self, "_lora_partial_shards"):
+            # (lora_name, lora_int_id) -> group_name -> normalized weight dict
+            self._lora_partial_shards: dict[
+                tuple[str, int], dict[str, dict[str, torch.Tensor]]
+            ] = {}
+
         try:
             group = init_custom_process_group(
                 backend=backend,

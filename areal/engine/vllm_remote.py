@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import subprocess
 import sys
@@ -8,31 +10,39 @@ from typing import Any
 
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from areal.api.cli_args import InferenceEngineConfig, PerfTracerConfig, vLLMConfig
-from areal.api.engine_api import InferenceEngine
-from areal.api.io_struct import (
-    HttpGenerationResult,
-    HttpRequest,
+from areal.api import (
+    InferenceEngine,
     LocalInfServerInfo,
+    ModelAllocation,
     ModelRequest,
     ModelResponse,
     ParamSpec,
+    Scheduler,
     WeightUpdateMeta,
-    WeightUpdateRequests,
+    WorkflowLike,
 )
-from areal.api.scheduler_api import Scheduler
-from areal.api.workflow_api import WorkflowLike
+from areal.api.cli_args import InferenceEngineConfig, PerfTracerConfig, vLLMConfig
+from areal.api.io_struct import (
+    HttpGenerationResult,
+    HttpRequest,
+    WeightUpdateRequests,
+    detect_image_mime,
+    get_versioned_lora_name,
+)
 from areal.infra import RemoteInfEngine, RolloutController, WorkflowExecutor
 from areal.infra.platforms import current_platform
-from areal.utils import perf_tracer, stats_tracker
-from areal.utils.launcher import TRITON_CACHE_PATH
+from areal.infra.utils.launcher import TRITON_CACHE_PATH
+from areal.utils import logging, perf_tracer, stats_tracker
+from areal.utils.network import format_host_for_url
+
+logger = logging.getLogger("vLLMEngine")
 
 
 class VLLMBackend:
     """vLLM-specific backend implementation for remote inference."""
 
     def build_generation_request(
-        self, req: ModelRequest, with_lora: bool
+        self, req: ModelRequest, with_lora: bool, version: int
     ) -> HttpRequest:
         """Build vLLM generation request."""
         gconfig = req.gconfig
@@ -53,8 +63,13 @@ class VLLMBackend:
             "stream": False,
         }
 
-        if with_lora and len(gconfig.lora_name) > 0:
-            payload["model"] = gconfig.lora_name
+        if with_lora:
+            lora_name = gconfig.lora_name
+            if not lora_name:
+                raise ValueError(
+                    "LoRA name (gconfig.lora_name) is required when use_lora is enabled."
+                )
+            payload["model"] = get_versioned_lora_name(lora_name, version)
 
         if req.vision_msg_vllm:
             images = iter(req.image_data)
@@ -69,8 +84,9 @@ class VLLMBackend:
                                 raise ValueError(
                                     "Not enough images in req.image_data to match image_url entries."
                                 )
+                            mime = detect_image_mime(base64_img)
                             content["image_url"] = {
-                                "url": f"data:image/jpeg;base64,{base64_img}"
+                                "url": f"data:{mime};base64,{base64_img}"
                             }
             payload["messages"] = parsed_input.copy()
             payload["logprobs"] = True
@@ -111,20 +127,17 @@ class VLLMBackend:
         )
 
     def build_disk_weight_update_requests(
-        self, meta: WeightUpdateMeta, lora_initialized: bool
+        self, meta: WeightUpdateMeta
     ) -> WeightUpdateRequests:
         """Build vLLM disk weight update requests."""
         if meta.use_lora:
-            if not lora_initialized:
-                raise ValueError(
-                    "LoRA update requested, but LoRA is not enabled/initialized in the vLLM engine."
-                )
-            endpoint = "/areal_update_weights_lora"
+            if meta.version is None:
+                raise ValueError("Version is required for LoRA update.")
+            lora_name = get_versioned_lora_name(meta.lora_name, meta.version)
+            endpoint = "/v1/load_lora_adapter"
             payload = {
-                "lora_model_path": str(meta.path),
-                "lora_name": str(meta.lora_name),
-                "lora_int_id": meta.lora_int_id,
-                "base_model_name": str(meta.base_model_name),
+                "lora_path": str(meta.path),
+                "lora_name": lora_name,
             }
         else:
             endpoint = "/areal_update_weights"
@@ -135,7 +148,9 @@ class VLLMBackend:
         )
 
     def build_distributed_weight_update_requests(
-        self, meta: WeightUpdateMeta, param_specs: list[ParamSpec]
+        self,
+        meta: WeightUpdateMeta,
+        param_specs: list[ParamSpec],
     ) -> WeightUpdateRequests:
         """Build vLLM distributed weight update requests."""
         # vLLM uses two-step process: set metadata, then update
@@ -148,8 +163,11 @@ class VLLMBackend:
         }
 
         if meta.use_lora:
+            if meta.version is None:
+                raise ValueError("Version is required for LoRA update.")
+            lora_name = get_versioned_lora_name(meta.lora_name, meta.version)
             lora_payload = {
-                "lora_name": meta.lora_name,
+                "lora_name": lora_name,
                 "lora_int_id": meta.lora_int_id,
                 "lora_target_modules": meta.peft_config["target_modules"],
                 "lora_rank": meta.peft_config["r"],
@@ -173,7 +191,7 @@ class VLLMBackend:
                 ),
                 HttpRequest(
                     endpoint=update_endpoint,
-                    payload={},
+                    payload={} if not meta.use_lora else payload,
                 ),
             ]
         )
@@ -182,15 +200,14 @@ class VLLMBackend:
         self, addr: str, server_idx: int, meta: WeightUpdateMeta
     ) -> HttpRequest:
         """Build vLLM init weights group request."""
-        assert meta.alloc_mode is not None
-        rank_offset = (
-            1 + server_idx * meta.alloc_mode.gen.tp_size * meta.alloc_mode.gen.pp_size
-        )
+        assert meta.gen_allocation is not None
+        gen_parallel = meta.gen_allocation.parallel
+        rank_offset = 1 + server_idx * gen_parallel.tp_size * gen_parallel.pp_size
         payload = {
-            "master_address": meta.nccl_master_address,
+            "master_address": format_host_for_url(meta.nccl_master_address),
             "master_port": str(meta.nccl_master_port),
             "rank_offset": rank_offset,
-            "world_size": meta.alloc_mode.gen.world_size + 1,
+            "world_size": gen_parallel.world_size + 1,
             "backend": current_platform.communication_backend,
             "group_name": meta.nccl_group_name,
         }
@@ -246,7 +263,9 @@ class VLLMBackend:
         vllm_cache_path = _env.get("VLLM_CACHE_ROOT")
         if vllm_cache_path:
             _env["VLLM_CACHE_ROOT"] = os.path.join(vllm_cache_path, str(uuid.uuid4()))
+        _env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
 
+        logger.info(f"Launching vLLM server with command: {' '.join(cmd)}")
         return subprocess.Popen(
             cmd,
             env=_env,
@@ -272,8 +291,45 @@ class RemotevLLMEngine(InferenceEngine):
         self.config = config
         # Pure composition - create internal engine with vLLM backend
         self._engine = RemoteInfEngine(config, VLLMBackend())
-        # lora already initialized when use_lora=true during init, by design, for vLLM
-        self._engine.lora_initialized = config.use_lora
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        tokenizer_path: str | None = None,
+        dp_size: int = 1,
+        max_concurrent_rollouts: int | None = None,
+        **kwargs,
+    ) -> "RemoteInfEngine":
+        """Create a RemoteInfEngine without kwargs instead of InferenceEngineConfig.
+
+        Parameters
+        ----------
+        tokenizer_path: str | None = None
+            Path to the tokenizer
+        dp_size : int
+            Data parallelism size
+        max_concurrent_rollouts : int | None
+            Maximum concurrent rollouts
+        **kwargs : dict
+            Additional config parameters passed to InferenceEngineConfig
+
+        Returns
+        -------
+        RemoteInfEngine
+        """
+
+        backend_str = f"vllm:d{dp_size}"
+
+        config = InferenceEngineConfig(
+            backend=backend_str,
+            max_concurrent_rollouts=max_concurrent_rollouts,
+            tokenizer_path=tokenizer_path,
+            **kwargs,
+        )
+
+        engine = cls(config)
+
+        return engine
 
     def initialize(
         self,
@@ -282,6 +338,10 @@ class RemotevLLMEngine(InferenceEngine):
         train_data_parallel_size: int | None = None,
     ):
         """Initialize the engine by discovering and connecting to servers."""
+        if train_data_parallel_size is None:
+            train_data_parallel_size = ModelAllocation.from_str(
+                self.config.backend, name="rollout"
+            ).parallel.data_parallel_size
         return self._engine.initialize(engine_id, addr, train_data_parallel_size)
 
     def destroy(self):
@@ -304,6 +364,9 @@ class RemotevLLMEngine(InferenceEngine):
     def get_version(self) -> int:
         """Get the current weight version."""
         return self._engine.get_version()
+
+    def set_proxy_gateway_addr(self, addr: str) -> None:
+        self._engine.set_proxy_gateway_addr(addr)
 
     async def agenerate(self, req: ModelRequest) -> ModelResponse:
         """Asynchronously generate a response for the given request."""
@@ -435,8 +498,23 @@ class RemotevLLMEngine(InferenceEngine):
     ) -> RolloutController:
         return RolloutController(cls, config=config, scheduler=scheduler)
 
-    def clear_batches(self, *args):
-        """Placeholder method of single-controller API."""
+    def clear_batches(self, shard_ids: list[str]) -> None:
+        """Drain this worker's client-side RTensor fetch buffer.
+
+        Called via RPC by ``TrainController.clear_batches`` at step end so
+        cross-node consumer DP heads release cached tensors. See #1209.
+        Upstream ``TrainController.clear_batches`` guards against empty
+        input, so ``shard_ids`` is always a non-empty ``list[str]``.
+        """
+        from areal.infra.rpc.rtensor import clear_fetch_buffer
+
+        clear_fetch_buffer(shard_ids)
+
+    def fetch_buffer_stats(self) -> dict[str, int]:
+        """Expose local fetch-buffer stats for post-step drain verification."""
+        from areal.infra.rpc.rtensor import fetch_buffer_stats
+
+        return fetch_buffer_stats()
 
     def save_perf_tracer(self, step: int | None = None, force: bool = False) -> None:
         perf_tracer.save(step=step, force=force)

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import json
@@ -15,6 +17,8 @@ from areal.utils import logging
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
+
+    from areal.models.tree_attn.module_archon import TreeAttentionMeta
 
 logger = logging.getLogger("ArchonModelBase")
 
@@ -102,6 +106,15 @@ class BaseStateDictAdapter(ABC):
             )
         return HuggingFaceStorageReader(path)
 
+    def _maybe_composite_hf_key(self, hf_key: str) -> str:
+        """Return the checkpoint key to use for HF save/load operations.
+
+        Most Archon adapters use the HuggingFace key as-is. Adapters that need to
+        remap text weights into a composite namespace, such as Qwen3.5 multimodal
+        checkpoints, can override this hook.
+        """
+        return hf_key
+
     @abstractmethod
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]: ...
 
@@ -124,6 +137,7 @@ class BaseArchonModel(nn.Module, ABC):
         positions: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        tree_attn_meta: TreeAttentionMeta | None = None,
     ) -> torch.Tensor: ...
 
     @abstractmethod

@@ -1,7 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import re
 
-from areal.reward import get_math_verify_worker
 from areal.utils import logging
+
+from . import get_math_verify_worker
 
 logger = logging.getLogger("Geometry3KReward")
 

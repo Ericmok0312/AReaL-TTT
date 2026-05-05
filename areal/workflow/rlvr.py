@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -6,13 +8,17 @@ import torch
 from transformers import PreTrainedTokenizerFast
 
 from areal import workflow_context
+from areal.api import (
+    AsyncRewardWrapper,
+    InferenceEngine,
+    ModelRequest,
+    ModelResponse,
+    RolloutWorkflow,
+)
 from areal.api.cli_args import GenerationHyperparameters
-from areal.api.engine_api import InferenceEngine
-from areal.api.io_struct import ModelRequest, ModelResponse
-from areal.api.reward_api import AsyncRewardWrapper
-from areal.api.workflow_api import RolloutWorkflow
 from areal.utils import logging, stats_tracker
 from areal.utils.dynamic_import import import_from_string
+from areal.utils.hf_utils import apply_chat_template
 from areal.utils.perf_tracer import (
     atrace_session_phase,
     session_context,
@@ -27,13 +33,13 @@ def default_get_input_ids_fn(
     tokenizer: PreTrainedTokenizerFast,
     enable_thinking: bool,
 ) -> list[int]:
-    input_ids = tokenizer.apply_chat_template(
+    return apply_chat_template(
+        tokenizer,
         data,
         tokenize=True,
         add_generation_prompt=True,
         enable_thinking=enable_thinking,
     )
-    return list(input_ids)
 
 
 def default_data_extract_prompt_fn(data: dict[str, Any]) -> Any:

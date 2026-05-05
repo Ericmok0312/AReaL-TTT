@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # Adapted from torchtitan: torchtitan/distributed/activation_checkpoint.py
 
 import functools
@@ -17,7 +19,6 @@ from torch.utils.checkpoint import (
     create_selective_checkpoint_contexts,
 )
 
-from areal.experimental.models.archon import varlen_attention as _  # noqa: F401
 from areal.utils import logging
 
 

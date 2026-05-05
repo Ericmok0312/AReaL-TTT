@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import gc
 
 import torch
@@ -25,3 +27,4 @@ class NPUPlatform(Platform):
     def clear_memory(self) -> None:
         self.synchronize()
         gc.collect()
+        torch.npu.empty_cache()

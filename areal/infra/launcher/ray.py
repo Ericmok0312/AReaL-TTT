@@ -1,8 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import importlib.util
 import pathlib
 import re
 import sys
 import time
+import warnings
 from collections.abc import Callable
 from functools import partial
 
@@ -13,9 +16,10 @@ from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 import areal.utils.logging as logging
-from areal.api.alloc_mode import AllocationMode, AllocationType
+from areal.api.alloc_mode import AllocationType, _AllocationMode
 from areal.api.cli_args import (
     ClusterSpecConfig,
+    InferenceEngineConfig,
     RecoverConfig,
     SGLangConfig,
     parse_cli_args,
@@ -23,9 +27,8 @@ from areal.api.cli_args import (
     vLLMConfig,
 )
 from areal.infra.platforms import current_platform, is_npu_available
-from areal.utils import name_resolve, names
-from areal.utils.exp_metadata import save_experiment_metadata
-from areal.utils.launcher import (
+from areal.infra.utils.exp_metadata import save_experiment_metadata
+from areal.infra.utils.launcher import (
     BASE_ENVIRONS,
     JobException,
     JobState,
@@ -34,8 +37,9 @@ from areal.utils.launcher import (
     validate_config_for_distributed_launcher,
     wait_llm_server_addrs,
 )
+from areal.infra.utils.ray import get_placement_group_master_ip_and_port
+from areal.utils import name_resolve, names
 from areal.utils.offload import get_tms_env_vars
-from areal.utils.ray import get_placement_group_master_ip_and_port
 from areal.utils.recover import check_if_recover
 
 logger = logging.getLogger("RayLauncher")
@@ -345,6 +349,16 @@ def ray_main(config, run_id: int = 0):
     config.recover = to_structured_cfg(config.recover, RecoverConfig)
     config.cluster = to_structured_cfg(config.cluster, ClusterSpecConfig)
     is_recover_run = check_if_recover(config.recover, run_id)
+    warnings.warn(
+        "SPMD launchers use the deprecated _AllocationMode parser which will be removed. "
+        "Bare dimension strings (e.g., 'd4t2') are NO LONGER ACCEPTED. "
+        "All allocation strings must include an explicit backend prefix "
+        "(e.g., 'fsdp:d4', 'sglang:d4t2'). "
+        "Migrate to single-controller mode (scheduler.type=local) with per-engine 'backend' "
+        "fields (e.g., actor.backend='fsdp:d4'). See docs/en/reference/alloc_mode.md.",
+        FutureWarning,
+        stacklevel=2,
+    )
     validate_config_for_distributed_launcher(config)
 
     name_resolve.reconfigure(config.cluster.name_resolve)
@@ -371,11 +385,12 @@ def ray_main(config, run_id: int = 0):
         launcher = RAY_LAUNCHER
 
     allocation_mode = config.allocation_mode
-    allocation_mode = AllocationMode.from_str(allocation_mode)
+    allocation_mode = _AllocationMode.from_str(allocation_mode)
 
     actor_spec = get_scheduling_spec(config.actor)
 
     if allocation_mode.gen_backend in ("sglang", "vllm"):
+        config.rollout = to_structured_cfg(config.rollout, InferenceEngineConfig)
         rollout_spec = get_scheduling_spec(config.rollout)
 
     if not is_recover_run:

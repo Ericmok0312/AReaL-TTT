@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -9,7 +11,7 @@ import torch.distributed as dist
 
 from areal.infra.platforms import current_platform
 from areal.utils import logging
-from areal.utils.datapack import flat2d
+from areal.utils.seqpack import flat2d
 
 logger = logging.getLogger("StatsTracker")
 
