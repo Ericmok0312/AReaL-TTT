@@ -27,7 +27,7 @@ import torch.distributed as dist
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal import PPOTrainer
-from areal.api.alloc_mode import AllocationMode, ParallelStrategy
+from areal.api.alloc_mode import _AllocationMode as AllocationMode, ParallelStrategy
 from areal.api.cli_args import (
     PPOActorConfig,
     PPOConfig,
@@ -41,7 +41,7 @@ from areal.utils import logging, seeding, stats_tracker
 from areal.utils.evaluator import Evaluator
 from areal.utils.saver import Saver
 from areal.utils.recover import RecoverHandler
-from areal.utils.data import KLEstimator
+# Native AReaL KDRL uses teacher_logp in ppo_update; no manual KL estimator needed.
 
 from areal.experimental.ttt_discover.config import (
     SamplerConfig,
@@ -258,11 +258,8 @@ class TTTDDistillTrainer(PPOTrainer):
         # Store workflow kwargs for later use
         self._workflow_kwargs = {}
         
-        # KL estimator for distill steps
-        self.kl_estimator = KLEstimator(
-            kl_estimator=config.kl_estimator_type,
-            apply_clamp=True,
-        )
+        # Native AReaL KDRL: teacher_logp is computed on-the-fly and consumed
+        # by actor.ppo_update(). No manual KL estimator or reward shaping needed.
 
     def _load_hf_checkpoint(self, engine, path: str, model_name: str = ""):
         """Load HF checkpoint, handling PEFT LoRA adapter key conversion.
@@ -535,95 +532,49 @@ class TTTDDistillTrainer(PPOTrainer):
 
 
 
-    def _compute_kl_reward(self, rollout_batch: dict[str, Any]) -> torch.Tensor:
-        """Compute KL divergence reward for a rollout batch.
-        
-        Returns sequence-level negative KL scaled by kl_reward_scale.
+    def _attach_teacher_logp(self, rollout_batch: dict[str, Any]) -> dict[str, Any]:
+        """Compute teacher logprobs and attach KDRL metadata to batch.
+
+        Uses native AReaL KDRL logic: teacher_logp is consumed by
+        actor.ppo_update() to compute the distillation loss automatically.
         """
+        if self.teacher is None:
+            return rollout_batch
+
         device = self.actor.device
-        
-        # Compute teacher logprobs for the rollout sequences
         with torch.no_grad():
-            teacher_logp = self.teacher.compute_logp(rollout_batch)
-        
-        # Get student logprobs (use prox_logp if available, otherwise logprobs)
-        if "prox_logp" in rollout_batch and rollout_batch["prox_logp"] is not None:
-            student_logp = rollout_batch["prox_logp"]
+            # PPOActor.compute_logp expects list[dict]; wrap singleton batch
+            teacher_logps = self.teacher.compute_logp([rollout_batch])
+        rollout_batch["teacher_logp"] = teacher_logps[0]
+
+        # Pull weights from config (native AReaL KDRL fields)
+        if self.config.teacher is not None:
+            rollout_batch["rl_loss_weight"] = self.config.teacher.rl_loss_weight
+            rollout_batch["distill_loss_weight"] = self.config.teacher.distill_loss_weight
         else:
-            student_logp = rollout_batch["logprobs"]
-        
-        # Ensure same shape and device
-        if teacher_logp is None:
-            logger.warning("[Distill] Teacher logp is None, using zero reward")
-            return torch.zeros(rollout_batch["rewards"].shape[0], device=device)
-        
-        teacher_logp = teacher_logp.to(device)
-        student_logp = student_logp.to(device)
-        
-        # Compute per-token KL using estimator
-        # kl_estimator returns log_ratio = log p_student - log p_teacher
-        # This is a sampled estimate of KL(student || teacher)
-        kl_per_token = self.kl_estimator(student_logp, teacher_logp)  # [bs, seqlen]
-        
-        # Apply loss mask to sum only over valid tokens
-        loss_mask = rollout_batch["loss_mask"].float().to(device)
-        loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
-        kl_per_token = kl_per_token * loss_mask
-        
-        # Sequence-level KL (sum over valid tokens)
-        seq_kl = kl_per_token.sum(dim=1)  # [bs]
-        
-        # Reward = negative KL (we want to minimize KL)
-        reward = -seq_kl * self.config.kl_reward_scale
-        
-        return reward
-    
-    def _compute_distill_advantages(self, rollout_batch: dict[str, Any]) -> dict[str, Any]:
-        """Simple advantage computation for distillation.
-        
-        Bypasses TTTDActor's entropic objective and computes plain advantages:
-            A = reward - mean(reward)
-        
-        This is much simpler than TTT-Discover's w_beta - 1 entropic weighting.
-        """
-        device = rollout_batch["input_ids"].device
-        bs, max_seqlen = rollout_batch["input_ids"].shape
-        
-        # Sequence-level rewards (already -KL)
-        reward_score = rollout_batch["rewards"].squeeze(-1)  # [bs]
-        rollout_batch["rewards"] = reward_score
-        
-        # Optional mean baseline across all ranks
-        if dist.is_initialized() and self.actor.data_parallel_world_size > 1:
-            local_sum = reward_score.sum()
-            local_count = torch.tensor(bs, dtype=torch.float32, device=device)
-            dist.all_reduce(local_sum, op=dist.ReduceOp.SUM)
-            dist.all_reduce(local_count, op=dist.ReduceOp.SUM)
-            mean_reward = local_sum / local_count
-        else:
-            mean_reward = reward_score.mean()
-        
-        # Simple advantage: reward - mean(reward)
-        advantages_seq = reward_score - mean_reward  # [bs]
-        
-        # Broadcast to token level
-        advantages = advantages_seq.unsqueeze(-1).expand(-1, max_seqlen)  # [bs, seq_len]
-        
-        # Apply loss mask
-        loss_mask = rollout_batch["loss_mask"].float()
-        loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
-        advantages = advantages * loss_mask
-        
-        # Store in batch
-        rollout_batch["advantages"] = advantages
-        rollout_batch["returns"] = advantages
-        rollout_batch["loss_mask"] = loss_mask
-        
-        # ppo_update expects kl_rewards and tot_rewards for logging
-        rollout_batch["kl_rewards"] = torch.zeros_like(advantages)
-        rollout_batch["tot_rewards"] = reward_score.unsqueeze(-1).expand(-1, max_seqlen) * loss_mask
-        
+            # Backward compatibility: pure distillation defaults
+            rollout_batch["rl_loss_weight"] = 0.0
+            rollout_batch["distill_loss_weight"] = getattr(
+                self.config, "kl_reward_scale", 1.0
+            )
         return rollout_batch
+    
+    def _normalize_rollout_batch(self, rollout_batch) -> dict[str, Any]:
+        """Ensure rollout_batch is a single dict for TTTDActor methods.
+
+        prepare_batch may return list[dict] depending on the backend path;
+        concat if necessary so that TTTDActor.compute_advantages (dict input)
+        and the KDRL path below work uniformly.
+        """
+        if isinstance(rollout_batch, dict):
+            return rollout_batch
+        if isinstance(rollout_batch, list):
+            if len(rollout_batch) == 1:
+                return rollout_batch[0]
+            from areal.utils.data import concat_batch
+            batched, _meta = concat_batch(rollout_batch)
+            return batched
+        raise TypeError(f"Unexpected rollout_batch type: {type(rollout_batch)}")
     
     def train(
         self,
@@ -705,11 +656,8 @@ class TTTDDistillTrainer(PPOTrainer):
                 )
             rollout_time = time.perf_counter() - rollout_start
             
-            # Compute KL-based reward
-            kl_reward = self._compute_kl_reward(rollout_batch)
-            
-            # Replace batch rewards with KL reward
-            rollout_batch["rewards"] = kl_reward.unsqueeze(-1)  # [bs, 1]
+            # Normalize batch to dict for TTTDActor methods
+            rollout_batch = self._normalize_rollout_batch(rollout_batch)
             
             # Compute global reward statistics
             local_rollouts = rollout_batch["rewards"].shape[0]
@@ -738,7 +686,7 @@ class TTTDDistillTrainer(PPOTrainer):
             
             logger.info(
                 f"[Distill][Step {global_step}] Rollouts: {local_rollouts} (global: {global_rollouts}), "
-                f"KL reward: max={step_max_reward:.4f}, mean={step_mean_reward:.4f}, min={step_min_reward:.4f}"
+                f"Reward: max={step_max_reward:.4f}, mean={step_mean_reward:.4f}, min={step_min_reward:.4f}"
             )
             
             # Training computations
@@ -749,13 +697,19 @@ class TTTDDistillTrainer(PPOTrainer):
                 steps_per_epoch=config.distill_steps,
             )
             
-            # Compute prox_logp if needed
+            # Compute prox_logp if needed (wrap dict in list for PPOActor.compute_logp)
             if config.should_compute_prox_logp():
-                rollout_batch["prox_logp"] = self.actor.compute_logp(rollout_batch)
+                prox_logps = self.actor.compute_logp([rollout_batch])
+                rollout_batch["prox_logp"] = prox_logps[0]
             
-            # Compute simple advantages (bypass TTT-Discover entropic objective)
-            self._compute_distill_advantages(rollout_batch)
-            self.actor.ppo_update(rollout_batch)
+            # Compute advantages using TTTDActor (native AReaL logic)
+            rollout_batch = self.actor.compute_advantages(rollout_batch)
+            
+            # Attach teacher logp for KDRL (native AReaL logic)
+            rollout_batch = self._attach_teacher_logp(rollout_batch)
+            
+            # PPO update: automatically handles KD loss when teacher_logp is present
+            self.actor.ppo_update([rollout_batch])
             self.actor.step_lr_scheduler()
             
             # Export training stats
@@ -950,7 +904,7 @@ def main(args):
     env = create_env_from_config(config)
     
     # Calculate local batch size
-    from areal.api.alloc_mode import AllocationMode
+    from areal.api.alloc_mode import _AllocationMode as AllocationMode
     alloc_mode = AllocationMode.from_str(config.allocation_mode)
     train_world_size = alloc_mode.train.world_size
     local_batch_size = config.sampler.batch_size // train_world_size

@@ -17,7 +17,7 @@ import torch.distributed as dist
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal import PPOTrainer
-from areal.api.alloc_mode import AllocationMode
+from areal.api.alloc_mode import _AllocationMode as AllocationMode
 from areal.api.cli_args import load_expr_config
 from areal.api.io_struct import FinetuneSpec, WeightUpdateMeta
 from areal.infra import current_platform
@@ -498,7 +498,7 @@ def main(args):
     
     env = create_env_from_config(config)
     
-    from areal.api.alloc_mode import AllocationMode
+    from areal.api.alloc_mode import _AllocationMode as AllocationMode
     alloc_mode = AllocationMode.from_str(config.allocation_mode)
     train_world_size = alloc_mode.train.world_size
     local_batch_size = config.sampler.batch_size // train_world_size

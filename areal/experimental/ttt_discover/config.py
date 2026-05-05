@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Any
 from areal.api.cli_args import (
     PPOActorConfig,
+    TeacherConfig,
     ClusterSpecConfig,
     StatsLoggerConfig,
     SaverConfig,
@@ -440,6 +441,12 @@ class TTTDDistillConfig(TTTDPPOActorConfig):
     kl_ctl: float = field(
         default=0.0,
         metadata={"help": "KL penalty coefficient (should be 0 for distillation)"}
+    )
+    teacher: TeacherConfig | None = field(
+        default=None,
+        metadata={"help": "Teacher configuration for native AReaL KDRL. "
+                         "If set, uses rl_loss_weight and distill_loss_weight for joint KD+RL. "
+                         "rl_loss_weight=0 means pure distillation (reverse KL)."}
     )
     run_eval_step: bool = field(
         default=True,

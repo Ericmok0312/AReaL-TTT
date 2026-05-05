@@ -25,7 +25,7 @@ import torch.distributed as dist
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal import PPOTrainer
-from areal.api.alloc_mode import AllocationMode
+from areal.api.alloc_mode import _AllocationMode as AllocationMode
 from areal.api.cli_args import (
     PPOActorConfig,
     PPOConfig,
@@ -1353,7 +1353,7 @@ def main(args):
     # Calculate local batch size (per-rank)
     # NOTE: batch_size here is LOCAL batch_size (per-rank), not global
     # Parse allocation mode to get train world size
-    from areal.api.alloc_mode import AllocationMode
+    from areal.api.alloc_mode import _AllocationMode as AllocationMode
     alloc_mode = AllocationMode.from_str(config.allocation_mode)
     train_world_size = alloc_mode.train.world_size
     local_batch_size = config.sampler.batch_size // train_world_size

@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 
 from areal import current_platform
-from areal.api.alloc_mode import AllocationMode
+from areal.api.alloc_mode import _AllocationMode as AllocationMode
 from areal.api.cli_args import load_expr_config
 from areal.api.io_struct import FinetuneSpec, StepInfo, WeightUpdateMeta
 from areal.engine.vllm_remote import RemotevLLMEngine
