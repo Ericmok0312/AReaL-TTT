@@ -232,26 +232,33 @@ class TTTDEvalTrainer(PPOTrainer):
     def _load_hf_checkpoint(self, engine, path: str, model_name: str = ""):
         """Load HF checkpoint, handling PEFT LoRA adapter key conversion."""
         from areal.api.io_struct import SaveLoadMeta
+        from areal.engine.fsdp_utils import fsdp2_load_full_state_dict
+        from areal.utils.save_load import get_state_dict_from_repo_id_or_path
         from safetensors.torch import load_file
         from torch.distributed.checkpoint.state_dict import (
             StateDictOptions,
             set_model_state_dict,
         )
-        
+
         adapter_path = os.path.join(path, "adapter_model.safetensors")
         is_lora_adapter = os.path.isfile(adapter_path)
-        
+
         if not is_lora_adapter:
-            meta = SaveLoadMeta(
-                path=path,
-                weight_format="hf",
-                with_optim=False,
-                tokenizer=None,
-                processor=None,
+            # Standard HF checkpoint (full model)
+            # For PEFT-wrapped models, add base_model.model. prefix to base keys
+            full_state = get_state_dict_from_repo_id_or_path(path)
+            if getattr(engine.model, "peft_config", None) is not None:
+                full_state = {
+                    f"base_model.model.{k}": v for k, v in full_state.items()
+                }
+            fsdp2_load_full_state_dict(
+                engine.model,
+                full_state,
+                engine.cpu_offload,
+                tie_word_embeddings=engine.model_config.tie_word_embeddings,
             )
-            engine.load(meta)
             return
-        
+
         logger.info(f"[Load-{model_name}] Loading LoRA adapter from {path}")
         if dist.get_rank() == 0:
             lora_state = load_file(adapter_path)
@@ -263,7 +270,7 @@ class TTTDEvalTrainer(PPOTrainer):
                 fixed_state[k] = v
         else:
             fixed_state = {}
-        
+
         options = StateDictOptions(
             full_state_dict=True,
             cpu_offload=False,
