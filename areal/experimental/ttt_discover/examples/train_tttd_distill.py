@@ -201,11 +201,11 @@ class TTTDDistillTrainer(PPOTrainer):
         self.valid_dataloader = None
         self.valid_dataset = None
         
-        # Initialize inference engines
-        self.rollout = self._init_rollout(config.rollout, is_eval=False)
-        
         # Initialize models
         self._initialize_engines()
+        
+        # Save initial LoRA weights for vLLM pre-loading (native AReaL path)
+        initial_lora_path = self._save_initial_lora_weights()
         
         # =====================================================================
         # Save evaluation checkpoints for base, teacher, and student
@@ -250,6 +250,9 @@ class TTTDDistillTrainer(PPOTrainer):
         
         # Connect sampler to actor (for API compatibility, though we won't sync)
         self.actor.connect_sampler(self.sampler)
+        
+        # Initialize inference engines with LoRA path for vLLM pre-loading
+        self.rollout = self._init_rollout(config.rollout, is_eval=False, lora_path=initial_lora_path)
         
         # Setup weight update meta
         self._setup_weight_update_meta()
