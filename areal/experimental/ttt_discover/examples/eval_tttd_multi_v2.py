@@ -2,10 +2,9 @@
 """
 TTT-Discover Multi-Model Evaluation (v2).
 
-Evaluates multiple models in a SINGLE vLLM process by pre-loading all LoRA
-adapters at vLLM startup time, then switching between them via ``set_version()``
-(HTTP ``model`` field). This completely avoids ``update_weights()``, which
-causes hangs with vLLM 0.17.0 V1 engine.
+Evaluates multiple models sequentially by loading each LoRA adapter into the
+actor and pushing it to vLLM via ``update_weights()`` (same path as training).
+This mirrors ``eval_tttd_single_v2.py`` but loops over multiple checkpoints.
 
 Usage (via launcher, same as training):
     python -m areal.infra.launcher.local \
@@ -72,10 +71,9 @@ class TTTDMultiEvalTrainer(PPOTrainer):
     Mirrors ``TTTDDistillTrainer`` initialization but:
     - No training loop
     - No teacher actor
-    - Skips ``connect_engine`` / ``update_weights`` entirely
-    - Pre-loads all target LoRAs into vLLM at startup via ``lora_modules``
-    - Switches model at inference time using ``set_version()`` only
+    - Loads each LoRA adapter on demand and pushes via ``update_weights()``
     """
+
 
     def __init__(self, config: TTTDDistillConfig):
         self.config = config
@@ -155,15 +153,21 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         self.valid_dataloader = None
         self.valid_dataset = None
 
-        # ------------------------------------------------------------------
-        # Pre-configure vLLM lora_modules so vLLM loads ALL adapters at startup.
-        # Format: JSON object strings, one per adapter.
-        # The "name" must match get_versioned_lora_name(config.gconfig.lora_name, version).
-        # ------------------------------------------------------------------
-        self._setup_vllm_lora_modules(config)
-
-        # Initialize inference engines (vLLM will now load all LoRAs at startup)
+        # Do NOT pre-load LoRAs via lora_modules; we load on demand via update_weights.
+        config.vllm.lora_modules = None
         self.rollout = self._init_rollout(config.rollout, is_eval=False)
+
+        # Determine which models to evaluate
+        eval_models = getattr(config, 'eval_models', None)
+        if eval_models is None:
+            eval_models = {
+                "teacher": getattr(config, 'teacher_lora_path', config.teacher_path),
+                "student": getattr(config, 'student_lora_path', None),
+            }
+        eval_models = {k: v for k, v in eval_models.items() if v}
+        if not eval_models:
+            raise ValueError("No evaluation models found. Set teacher_path / student_lora_path or eval_models.")
+        self._eval_models = eval_models
 
         # Initialize models
         self._initialize_engines()
@@ -171,9 +175,7 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         # Connect sampler to actor for distributed synchronization
         self.actor.connect_sampler(self.sampler)
 
-        # Setup weight update meta and connect to inference engine.
-        # connect_engine() is REQUIRED because prepare_batch() checks it.
-        # We still skip update_weights() after this.
+        # Setup weight update meta and connect to inference engine
         self._setup_weight_update_meta()
 
         # Setup stats logger only
@@ -245,40 +247,72 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         )
         self.stats_logger = StatsLogger(config, ft_spec)
 
-    def _setup_vllm_lora_modules(self, config: TTTDDistillConfig):
-        """Configure vLLM ``lora_modules`` so it pre-loads all evaluation adapters.
+    def _load_peft_lora_adapter(self, engine, path: str):
+        """Load a PEFT LoRA adapter checkpoint into the FSDP-wrapped actor.
 
-        Reads ``eval_models`` from config (or defaults to teacher + student) and
-        builds a YAML-compatible list of JSON object strings.
+        AReaL does not expose a dedicated ``load_adapter`` API for LoRA-only
+        checkpoints, so we do it manually with the correct key mapping:
+
+        1. PEFT ``save_pretrained`` strips the ``base_model.model.`` prefix.
+        2. PEFT ``save_pretrained`` strips the ``.default`` adapter suffix.
+        3. FSDP2 ``set_model_state_dict`` expects the full param names as they
+           appear in the model, i.e. ``base_model.model....lora_A.default.weight``.
         """
-        # Determine which models to evaluate
-        eval_models = getattr(config, 'eval_models', None)
-        if eval_models is None:
-            eval_models = {
-                "teacher": getattr(config, 'teacher_lora_path', config.teacher_path),
-                "student": getattr(config, 'student_lora_path', None),
-            }
-        # Filter out missing paths
-        eval_models = {k: v for k, v in eval_models.items() if v}
-        if not eval_models:
-            raise ValueError("No evaluation models found. Set teacher_path / student_lora_path or eval_models.")
+        from safetensors.torch import load_file
+        from torch.distributed.checkpoint.state_dict import (
+            StateDictOptions,
+            set_model_state_dict,
+        )
 
-        self._eval_models = eval_models
-        lora_name = config.gconfig.lora_name
-        base_model = config.actor.path
+        adapter_path = os.path.join(path, "adapter_model.safetensors")
+        if not os.path.isfile(adapter_path):
+            raise ValueError(
+                f"LoRA adapter not found at {adapter_path}. "
+                f"Expected a PEFT checkpoint with adapter_model.safetensors."
+            )
 
-        lora_modules = []
-        for idx, (label, path) in enumerate(eval_models.items()):
-            resolved = os.path.expanduser(path)
-            if not os.path.isdir(resolved):
-                raise ValueError(f"Eval model path for '{label}' does not exist: {resolved}")
-            # Name must match get_versioned_lora_name(lora_name, version)
-            adapter_name = f"{lora_name}-v{idx}"
-            # vLLM CLI expects "name=path" string format, not JSON.
-            lora_modules.append(f"{adapter_name}={resolved}")
-            logger.info(f"[MultiEval] Will pre-load LoRA '{adapter_name}' -> {resolved}")
+        logger.info(f"[LoadAdapter] Loading LoRA adapter from {path}")
 
-        config.vllm.lora_modules = lora_modules
+        if dist.get_rank() == 0:
+            raw_state = load_file(adapter_path)
+            fixed_state = {}
+            for k, v in raw_state.items():
+                # (1) Restore base_model.model. prefix if PEFT stripped it
+                if not k.startswith("base_model.model."):
+                    k = f"base_model.model.{k}"
+                # (2) Restore .default adapter suffix (PEFT default adapter name)
+                if ".lora_A.weight" in k:
+                    k = k.replace(".lora_A.weight", ".lora_A.default.weight")
+                elif ".lora_B.weight" in k:
+                    k = k.replace(".lora_B.weight", ".lora_B.default.weight")
+                fixed_state[k] = v
+        else:
+            fixed_state = {}
+
+        options = StateDictOptions(
+            full_state_dict=True,
+            cpu_offload=False,
+            broadcast_from_rank0=True,
+            strict=False,  # LoRA is a subset; keep False to be safe
+        )
+        set_model_state_dict(engine.model, fixed_state, options=options)
+
+        # Verify loading succeeded
+        if dist.get_rank() == 0:
+            expected_keys = set(fixed_state.keys())
+            model_keys = set(name for name, _ in engine.model.named_parameters())
+            matched = expected_keys & model_keys
+            unmatched = expected_keys - model_keys
+            logger.info(
+                f"[LoadAdapter] Matched {len(matched)}/{len(expected_keys)} keys "
+                f"into actor model"
+            )
+            if unmatched:
+                logger.warning(
+                    f"[LoadAdapter] {len(unmatched)} keys could not be matched: "
+                    f"{list(unmatched)[:10]}"
+                )
+        logger.info("[LoadAdapter] LoRA adapter loaded into actor successfully")
 
     def _clear_workflow_cache(self):
         """Clear workflow executor cache so a new workflow can be used."""
@@ -314,8 +348,23 @@ class TTTDMultiEvalTrainer(PPOTrainer):
 
     def _run_single_model_eval(self, label: str, version: int, workflow_class, initial_states, group_size):
         """Evaluate a single model on initial states with verification."""
-        logger.info(f"[MultiEval-{label}] Setting version={version} and starting rollout")
-        self.rollout.set_version(version)
+        lora_path = self._eval_models[label]
+        logger.info(f"[MultiEval-{label}] Loading LoRA from {lora_path}")
+
+        # Load LoRA adapter into actor
+        self._load_peft_lora_adapter(self.actor, lora_path)
+
+        # Push to vLLM via update_weights (same as training)
+        logger.info(f"[MultiEval-{label}] Pushing LoRA weights to vLLM via update_weights()...")
+        self.rollout.pause()
+        self.actor.update_weights(self.weight_update_meta)
+        self.actor.set_version(1)
+        self.rollout.set_version(1)
+        if dist.is_initialized():
+            dist.barrier(group=self.actor.cpu_group)
+        current_platform.synchronize()
+        self.rollout.resume()
+        logger.info(f"[MultiEval-{label}] Weights pushed and rollout resumed.")
 
         # Create temp dataloader with initial states only
         temp_sampler = _InitialStateSampler(initial_states)

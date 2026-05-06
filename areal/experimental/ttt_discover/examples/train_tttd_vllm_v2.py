@@ -98,6 +98,24 @@ def _format_sampler_summary(sampler, title: str = "Sampler State") -> str:
     return "\n".join(lines)
 
 
+def _normalize_rollout_batch(rollout_batch):
+    """Ensure rollout_batch is a single dict for downstream processing.
+
+    AReaL upstream commit fc2c8a85 standardized prepare_batch to return
+    list[dict[str, Any]] across all backends. This helper mirrors
+    FSDPEngine._normalize_batch_input.
+    """
+    if isinstance(rollout_batch, dict):
+        return rollout_batch
+    if isinstance(rollout_batch, list):
+        if len(rollout_batch) == 1:
+            return rollout_batch[0]
+        from areal.utils.data import concat_batch
+        batched, _meta = concat_batch(rollout_batch)
+        return batched
+    raise TypeError(f"Unexpected rollout_batch type: {type(rollout_batch)}")
+
+
 def main(args):
     config, _ = load_expr_config(args, TTTDPPOConfig)
     config: TTTDPPOConfig
@@ -481,7 +499,10 @@ def main(args):
                 group_size=group_size,
                 should_accept_fn=lambda sample: True,
             )
-        
+
+        # Normalize batch (prepare_batch may return list[dict] on some backends)
+        batch = _normalize_rollout_batch(batch)
+
         # ============================================================
         # Sampler Synchronization (Unified Interface)
         # ============================================================
