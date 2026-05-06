@@ -153,8 +153,10 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         self.valid_dataloader = None
         self.valid_dataset = None
 
-        # Do NOT pre-load LoRAs via lora_modules; we load on demand via update_weights.
-        config.vllm.lora_modules = None
+        # Keep the YAML's lora_modules config so vLLM initializes its LoRA manager
+        # at startup.  The initial adapter (e.g. the base / pre-distill LoRA) is only
+        # a placeholder; we overwrite it with the checkpoint we actually want to eval
+        # via update_weights() below.
         self.rollout = self._init_rollout(config.rollout, is_eval=False)
 
         # Determine which models to evaluate
