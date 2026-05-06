@@ -2,7 +2,7 @@
 """
 Sequential multi-model evaluation launcher for TTT-Discover.
 
-Reads model paths from the YAML config, runs ``eval_tttd_single.py`` for each
+Reads model paths from the YAML config, runs ``eval_tttd_single_v2.py`` for each
 model in order, and finally aggregates all per-model JSONs into a single
 ``eval_comparison.json`` under the config's output folder.
 
@@ -13,7 +13,7 @@ Usage
     python run_eval_sequence.py \
         -c conf/fsdp_lora_vllm_ac1_qwen3_8b_distill.yaml \
         --models teacher,student \
-        [any extra args forwarded to eval_tttd_single.py]
+        [any extra args forwarded to eval_tttd_single_v2.py]
 
 Supported model labels (mapped from YAML keys):
   * ``teacher``   → ``teacher_path`` (or ``teacher_lora_path``)
@@ -31,7 +31,7 @@ from pathlib import Path
 from omegaconf import OmegaConf
 
 # Path to the single-model eval script (relative to this file)
-EVAL_SINGLE_PY = Path(__file__).with_name("eval_tttd_single.py")
+EVAL_SINGLE_PY = Path(__file__).with_name("eval_tttd_single_v2.py")
 
 
 def resolve_yaml(yaml_path: str) -> tuple[OmegaConf, str]:
@@ -65,9 +65,12 @@ def get_model_path(conf: OmegaConf, label: str) -> str | None:
 
 
 def run_single_eval(lora_path: str, config_path: str, extra_argv: list[str]) -> None:
-    """Invoke ``eval_tttd_single.py`` as a subprocess."""
+    """Invoke ``eval_tttd_single.py`` through AReaL's local launcher."""
+    # We must go through the launcher so that torch.distributed env vars
+    # (RANK, WORLD_SIZE, etc.) and AREAL_SPMD_MODE are set properly.
     cmd = [
         sys.executable,
+        "-m", "areal.infra.launcher.local",
         str(EVAL_SINGLE_PY),
         "--lora-path", lora_path,
         "--config", config_path,
