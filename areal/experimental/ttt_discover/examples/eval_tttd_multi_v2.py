@@ -274,9 +274,8 @@ class TTTDMultiEvalTrainer(PPOTrainer):
                 raise ValueError(f"Eval model path for '{label}' does not exist: {resolved}")
             # Name must match get_versioned_lora_name(lora_name, version)
             adapter_name = f"{lora_name}-v{idx}"
-            lora_modules.append(
-                json.dumps({"name": adapter_name, "path": resolved, "base_model_name": base_model})
-            )
+            # vLLM CLI expects "name=path" string format, not JSON.
+            lora_modules.append(f"{adapter_name}={resolved}")
             logger.info(f"[MultiEval] Will pre-load LoRA '{adapter_name}' -> {resolved}")
 
         config.vllm.lora_modules = lora_modules
@@ -343,6 +342,9 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         eval_rollout_time = time.perf_counter() - eval_start
 
         # Gather results
+        if not isinstance(eval_batch, dict):
+            logger.error(f"[MultiEval-{label}] eval_batch is not a dict (type={type(eval_batch).__name__}). Value: {eval_batch}")
+            raise TypeError(f"eval_batch must be dict, got {type(eval_batch).__name__}")
         if "rewards" not in eval_batch:
             logger.error(f"[MultiEval-{label}] eval_batch missing 'rewards' key. Keys: {list(eval_batch.keys())}")
             raise KeyError("eval_batch missing 'rewards' key")
