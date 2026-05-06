@@ -170,12 +170,10 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         # Connect sampler to actor for distributed synchronization
         self.actor.connect_sampler(self.sampler)
 
-        # ------------------------------------------------------------------
-        # Skip weight update meta / connect_engine entirely.
-        # We do NOT call self.actor.connect_engine(self.rollout, ...)
-        # because we never use update_weights().
-        # ------------------------------------------------------------------
-        logger.info("[MultiEval] Skipping connect_engine / weight_update_meta (no update_weights)")
+        # Setup weight update meta and connect to inference engine.
+        # connect_engine() is REQUIRED because prepare_batch() checks it.
+        # We still skip update_weights() after this.
+        self._setup_weight_update_meta()
 
         # Setup stats logger only
         self._setup_stats_logger()
