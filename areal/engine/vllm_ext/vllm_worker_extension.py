@@ -156,7 +156,8 @@ class VLLMWorkerExtension:
         # and _add_adapter/activate_adapter, which may change/ breakdown due to newer vllm versions.
 
         logger.info(
-            f"start update lora weights by xccl, lora_name={self.areal_lora_name}, lora_int_id={self.areal_lora_int_id}",
+            f"[DEBUG] ENTER areal_update_weight_lora_xccl, lora_name={self.areal_lora_name}, "
+            f"lora_int_id={self.areal_lora_int_id}, group_name={self.areal_weight_meta_group_name}",
             flush=True,
         )
         names = self.areal_lora_weight_meta_names

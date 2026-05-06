@@ -1408,14 +1408,20 @@ class FSDPEngine(TrainEngine):
 
         if self.config.use_lora:
             # For LoRA, only iterate over trainable LoRA parameters
-            param_iterator = (
+            param_iterator = [
                 (name, param)
                 for name, param in self._get_model_name_parameters(meta)
                 if param.requires_grad
+            ]
+            self.logger.info(
+                f"[DEBUG update_weights] use_lora=True, found {len(param_iterator)} trainable params"
             )
         else:
             # For full model, iterate over all parameters
-            param_iterator = self._get_model_name_parameters(meta)
+            param_iterator = list(self._get_model_name_parameters(meta))
+            self.logger.info(
+                f"[DEBUG update_weights] use_lora=False, found {len(param_iterator)} params"
+            )
 
         try:
             for name, param in param_iterator:
