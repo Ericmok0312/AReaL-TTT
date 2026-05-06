@@ -29,6 +29,7 @@ from areal import PPOTrainer
 from areal.api.alloc_mode import _AllocationMode as AllocationMode, ModelAllocation
 from areal.api.cli_args import load_expr_config
 from areal.api.io_struct import FinetuneSpec
+from areal.api.engine_api import WeightUpdateMeta
 from areal.infra import current_platform
 from areal.utils.environ import is_single_controller
 from areal.utils import logging, seeding, stats_tracker
@@ -195,6 +196,44 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             train_batch_size=self.config.sampler.batch_size,
         )
         self.actor.initialize(addr=None, ft_spec=ft_spec, alloc_mode=self.allocation_mode, role="actor")
+
+    def _setup_weight_update_meta(self):
+        """Setup weight update meta and connect to inference engine."""
+        config = self.config
+        if config.actor.weight_update_mode == "disk":
+            disk_kwargs = {
+                "experiment_name": config.experiment_name,
+                "trial_name": config.trial_name,
+                "file_root": config.cluster.fileroot,
+                "name": "default",
+                "clear_checkpoint_after_load": True,
+            }
+            if config.actor.use_lora:
+                disk_kwargs.update({
+                    "use_lora": config.actor.use_lora,
+                    "lora_name": config.gconfig.lora_name,
+                    "lora_int_id": 1,
+                    "base_model_name": config.actor.path,
+                })
+            self.weight_update_meta = WeightUpdateMeta.from_disk(**disk_kwargs)
+        elif config.actor.weight_update_mode == "xccl":
+            if self.allocation_mode.train_backend == "megatron":
+                self.weight_update_meta = WeightUpdateMeta.from_megatron_xccl(self.allocation_mode)
+            else:
+                xccl_kwargs = {"gen_allocation": self.rollout_alloc}
+                if config.actor.use_lora:
+                    xccl_kwargs.update({
+                        "use_lora": config.actor.use_lora,
+                        "lora_name": config.gconfig.lora_name,
+                        "lora_int_id": 1,
+                        "base_model_name": config.actor.path,
+                    })
+                self.weight_update_meta = WeightUpdateMeta.from_fsdp_xccl(**xccl_kwargs)
+        else:
+            raise ValueError(f"Invalid weight update mode: {config.actor.weight_update_mode}")
+
+        self.actor.connect_engine(self.rollout, self.weight_update_meta)
+        logger.info(f"[Rank {dist.get_rank()}] connect_engine done")
 
     def _setup_stats_logger(self):
         """Setup stats logger only (no saver/recover/evaluator for eval)."""
