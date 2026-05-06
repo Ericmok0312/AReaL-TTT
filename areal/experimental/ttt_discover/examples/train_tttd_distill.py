@@ -582,17 +582,37 @@ class TTTDDistillTrainer(PPOTrainer):
                 )
             
             # Update weights and save
+            logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] Before rollout.pause")
             self.rollout.pause()
+            logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] After rollout.pause")
+            
+            logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] Before actor.update_weights")
             self.actor.update_weights(self.weight_update_meta)
+            logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] After actor.update_weights")
+            
             self.actor.set_version(global_step + 1)
             self.rollout.set_version(global_step + 1)
+            logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] After set_version")
             
+            logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] Before _save_hf")
             self._save_hf(epoch=global_step, epoch_step=global_step, global_step=global_step)
-            self._save_recover_checkpoint(epoch=global_step, epoch_step=global_step, global_step=global_step)
+            logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] After _save_hf")
             
+            logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] Before _save_recover_checkpoint")
+            self._save_recover_checkpoint(epoch=global_step, epoch_step=global_step, global_step=global_step)
+            logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] After _save_recover_checkpoint")
+            
+            logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] Before dist.barrier")
             dist.barrier(group=self.actor.cpu_group)
+            logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] After dist.barrier")
+            
+            logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] Before current_platform.synchronize")
             current_platform.synchronize()
+            logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] After current_platform.synchronize")
+            
+            logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] Before rollout.resume")
             self.rollout.resume()
+            logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] After rollout.resume")
             
             step_total = time.perf_counter() - step_start_time
             logger.info(
