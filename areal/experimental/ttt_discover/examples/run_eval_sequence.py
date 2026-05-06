@@ -64,12 +64,13 @@ def get_model_path(conf: OmegaConf, label: str) -> str | None:
     return str(path) if path else None
 
 
-def run_single_eval(lora_path: str, extra_argv: list[str]) -> None:
+def run_single_eval(lora_path: str, config_path: str, extra_argv: list[str]) -> None:
     """Invoke ``eval_tttd_single.py`` as a subprocess."""
     cmd = [
         sys.executable,
         str(EVAL_SINGLE_PY),
         "--lora-path", lora_path,
+        "--config", config_path,
         *extra_argv,
     ]
     print("=" * 70)
@@ -194,7 +195,7 @@ def main() -> None:
     # Run evaluation for each model sequentially
     for lbl, path in model_paths.items():
         print(f"\n[run_eval_sequence] >>> Evaluating '{lbl}' from {path}")
-        run_single_eval(path, extra_argv)
+        run_single_eval(path, known.config, extra_argv)
         print(f"[run_eval_sequence] <<< Finished '{lbl}'")
 
     # Aggregate results
