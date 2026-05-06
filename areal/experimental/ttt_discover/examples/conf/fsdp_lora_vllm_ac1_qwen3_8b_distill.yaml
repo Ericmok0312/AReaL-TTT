@@ -36,7 +36,7 @@ teacher:
 teacher_sampler_checkpoint: ./outputs_ac1_async_v2/tttd-async-qwen3-8b-ac1/trial0/sampler
 
 run_eval_step: true
-total_rollouts_per_step: 8
+total_rollouts_per_step: 512
 
 actor:
   experiment_name: ${experiment_name}
