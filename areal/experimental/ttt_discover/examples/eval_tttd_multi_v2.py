@@ -359,7 +359,8 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         # Push to vLLM via update_weights (same as training)
         logger.info(f"[MultiEval-{label}] Pushing LoRA weights to vLLM via update_weights()...")
         self.rollout.pause()
-        self.actor.update_weights(self.weight_update_meta)
+        versioned_meta = self.weight_update_meta.with_version(1)
+        self.actor.update_weights(versioned_meta)
         self.actor.set_version(1)
         self.rollout.set_version(1)
         if dist.is_initialized():

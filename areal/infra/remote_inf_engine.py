@@ -1415,13 +1415,6 @@ def _update_weights_from_distributed(
             meta, param_specs
         )
 
-        import logging as _logging
-        _logger = _logging.getLogger("remote_inf_engine.debug")
-        _logger.info(
-            f"[DEBUG _update_weights_from_distributed] {len(weight_reqs.requests)} requests, "
-            f"addresses={addresses}"
-        )
-
         # Execute all requests sequentially (they may have dependencies)
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=request_timeout),
@@ -1429,9 +1422,6 @@ def _update_weights_from_distributed(
             connector=get_default_connector(),
         ) as session:
             for http_req in weight_reqs.requests:
-                _logger.info(
-                    f"[DEBUG] Sending {http_req.method} {http_req.endpoint} to {len(addresses)} servers"
-                )
                 jobs = [
                     arequest_with_retry(
                         session=session,
@@ -1445,6 +1435,5 @@ def _update_weights_from_distributed(
                     for addr in addresses
                 ]
                 await asyncio.gather(*jobs)
-                _logger.info(f"[DEBUG] Finished {http_req.endpoint}")
 
     return uvloop.run(_fn())

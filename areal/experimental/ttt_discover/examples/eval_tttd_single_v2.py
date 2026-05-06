@@ -184,7 +184,8 @@ class TTTDSingleEvalTrainer(PPOTrainer):
         # ------------------------------------------------------------------
         logger.info("[SingleEval] Pushing LoRA weights to vLLM via update_weights()...")
         self.rollout.pause()
-        self.actor.update_weights(self.weight_update_meta)
+        versioned_meta = self.weight_update_meta.with_version(1)
+        self.actor.update_weights(versioned_meta)
         self.actor.set_version(1)
         self.rollout.set_version(1)
         dist.barrier(group=self.actor.cpu_group)
