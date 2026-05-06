@@ -25,7 +25,7 @@ teacher:
     granularity: 1
   optimizer: null
   scheduling_spec: ${actor.scheduling_spec}
-  use_lora: ${actor.use_lora}
+  use_lora: false
   peft_type: ${actor.peft_type}
   lora_rank: ${actor.lora_rank}
   lora_alpha: ${actor.lora_alpha}

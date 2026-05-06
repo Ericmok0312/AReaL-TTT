@@ -450,7 +450,7 @@ class TTTDDistillTrainer(PPOTrainer):
         
         logger.info(
             f"[Distill] Starting distillation: "
-            f"distill_steps={config.distill_steps}, "
+            f"max_steps={config.max_steps}, "
             f"total_rollouts_per_step={total_rollouts}, "
             f"kl_scale={config.kl_reward_scale}"
         )
@@ -528,7 +528,7 @@ class TTTDDistillTrainer(PPOTrainer):
                 global_step=global_step,
                 epoch=global_step,
                 epoch_step=global_step,
-                steps_per_epoch=config.distill_steps,
+                steps_per_epoch=config.max_steps,
             )
             
             # Compute teacher logp (native AReaL KDRL path)
