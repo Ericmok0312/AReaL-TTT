@@ -3,18 +3,41 @@ trial_name: trial0
 is_tttd_config: true
 seed: 1
 enable_offload: false
-max_steps: 1
-total_train_epochs: 1
+max_steps: 10
+total_train_epochs: 10
 enable_thinking: true
 reset_puct_stats_on_resume: false
-teacher_path: ./outputs_ac1_async_v2/checkpoints/eric/tttd-async-qwen3-8b-ac1/trial0/default/epoch49epochstep49globalstep49
+
+# Native AReaL KDRL teacher config
+teacher:
+  backend: fsdp:d4p1t1
+  rl_loss_weight: 0.0
+  distill_loss_weight: 0.005
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ./outputs_ac1_async_v2/checkpoints/eric/tttd-async-qwen3-8b-ac1/trial0/default/epoch49epochstep49globalstep49
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${actor.dtype}
+  mb_spec:
+    max_tokens_per_mb: 32768
+    n_mbs: 1
+    granularity: 1
+  optimizer: null
+  scheduling_spec: ${actor.scheduling_spec}
+  use_lora: ${actor.use_lora}
+  peft_type: ${actor.peft_type}
+  lora_rank: ${actor.lora_rank}
+  lora_alpha: ${actor.lora_alpha}
+  target_modules:
+  - all-linear
+
+# Teacher PUCTSampler checkpoint (used for sampling only, no updates during distillation)
 teacher_sampler_checkpoint: ./outputs_ac1_async_v2/tttd-async-qwen3-8b-ac1/trial0/sampler
-teacher_weight_format: hf
-distill_steps: 1
+
 run_eval_step: true
-kl_reward_scale: 1.0
-kl_estimator_type: k1
-total_rollouts_per_step: 1
+total_rollouts_per_step: 512
+
 actor:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
@@ -37,7 +60,7 @@ actor:
   gradient_checkpointing: true
   optimizer:
     type: adam
-    lr: 4e-5
+    lr: 1e-5
     weight_decay: 0.01
     beta1: 0.9
     beta2: 0.95
@@ -58,13 +81,9 @@ actor:
     action: mask
     metric: ratio
     upper: 5.0
-  reward_norm:
-    mean_level: group
-    std_level: group
-    group_size: ${gconfig.n_samples}
-  adv_norm:
-    mean_level: batch
-    std_level: batch
+  # Disable reward/adv norm because dummy reward is all zeros in pure KD mode
+  reward_norm: null
+  adv_norm: null
   max_new_tokens: ${gconfig.max_new_tokens}
   use_lora: true
   peft_type: lora
@@ -78,7 +97,9 @@ actor:
   adv_estimator_target_kl: 0.693
   adv_estimator_beta_max: 1000000.0
   adv_estimator_beta_iters: 60
+
 tokenizer_path: ${actor.path}
+
 cluster:
   n_nodes: 1
   n_gpus_per_node: 8
@@ -86,9 +107,12 @@ cluster:
   name_resolve:
     type: nfs
     nfs_record_root: /tmp/areal/name_resolve
+
 allocation_mode: vllm[rollout]:d4p1t1+fsdp[actor]:d4p1t1
+
 scheduler:
   type: null
+
 rollout:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
@@ -104,8 +128,9 @@ rollout:
   dump_to_file: true
   use_lora: ${actor.use_lora}
   backend: vllm:d4p1t1
+
 gconfig:
-  n_samples: 1
+  n_samples: 64
   min_new_tokens: 0
   max_new_tokens: 32768
   max_tokens: 32768
@@ -113,7 +138,9 @@ gconfig:
   temperature: 1.0
   top_p: 0.95
   lora_name: tttd_lora_adapter
+
 max_prompt_thinking_tokens: 26000
+
 ref:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
@@ -131,6 +158,7 @@ ref:
     target: actor
   scheduling_spec: ${actor.scheduling_spec}
   backend: fsdp:d4p1t1
+
 vllm:
   model: ${actor.path}
   seed: ${seed}
@@ -143,6 +171,7 @@ vllm:
   max_lora_rank: 32
   lora_modules: '{"name": "${gconfig.lora_name}", "path": "./lora_init_ac1_distill",
     "base_model_name": "${actor.path}"}'
+
 sampler:
   type: puct
   batch_size: 8
@@ -161,12 +190,15 @@ sampler:
   num_cpus: 2
   gpu_type: H100
   n: 100
+
 train_dataset:
   batch_size: ${sampler.batch_size}
   max_length: 32768
+
 valid_dataset:
   batch_size: 8
   max_length: 32768
+
 saver:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
@@ -174,6 +206,7 @@ saver:
   freq_epochs: 1
   freq_steps: 1
   freq_secs: null
+
 recover:
   mode: 'on'
   experiment_name: ${experiment_name}
@@ -182,6 +215,7 @@ recover:
   freq_epochs: 1
   freq_steps: 1
   freq_secs: 3600
+
 evaluator:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
@@ -189,6 +223,7 @@ evaluator:
   freq_epochs: 1
   freq_steps: null
   freq_secs: null
+
 stats_logger:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
@@ -197,6 +232,7 @@ stats_logger:
     mode: disabled
     project: tttd-distill-qwen3-8b-ac1
     entity: null
+
 perf_tracer:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
@@ -205,5 +241,5 @@ perf_tracer:
   session_tracer:
     enabled: false
 
-teacher_lora_path: ${teacher_path}
+teacher_lora_path: ${teacher.path}
 student_lora_path: ./outputs_ac1_distill/eval_checkpoints/student

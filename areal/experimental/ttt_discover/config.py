@@ -269,37 +269,21 @@ class TTTDDistillConfig(TTTDPPOConfig):
     """
     Extended config for TTT-Discover distillation and evaluation.
 
+    Uses native AReaL KDRL (teacher config block) for on-policy distillation.
+    PUCTSampler is loaded from teacher checkpoint for controlled sampling only
+    (no updates during distillation).
+
     Used by both training (train_tttd_distill.py) and evaluation
     (eval_tttd_distill.py) scripts.
     """
 
-    # Teacher model settings
-    teacher_path: str = field(
-        default="",
-        metadata={"help": "Path to teacher model checkpoint (HF format or DCP)"},
-    )
+    # Teacher PUCTSampler checkpoint (loaded for sampling, not updated during distillation)
     teacher_sampler_checkpoint: str = field(
         default="",
         metadata={"help": "Path to teacher PUCTSampler checkpoint directory"},
     )
-    teacher_weight_format: str = field(
-        default="hf",
-        metadata={"help": "Teacher checkpoint format: 'hf' or 'dcp'", "choices": ["hf", "dcp"]},
-    )
 
-    # Distillation settings
-    distill_steps: int = field(
-        default=3,
-        metadata={"help": "Number of distillation steps (no verification)"},
-    )
-    kl_reward_scale: float = field(
-        default=1.0,
-        metadata={"help": "Scale factor for KL-based reward (legacy, kept for compatibility)"},
-    )
-    kl_estimator_type: str = field(
-        default="k1",
-        metadata={"help": "KL estimator: k1, k2, or k3", "choices": ["k1", "k2", "k3"]},
-    )
+    # Validation / logging
     total_rollouts_per_step: int = field(
         default=512,
         metadata={"help": "Total number of rollouts per step across all ranks"},
@@ -310,7 +294,7 @@ class TTTDDistillConfig(TTTDPPOConfig):
     )
     teacher_lora_path: str = field(
         default="",
-        metadata={"help": "Path to teacher LoRA adapter for eval (defaults to teacher_path if empty)"},
+        metadata={"help": "Path to teacher LoRA adapter for eval (defaults to teacher.path if empty)"},
     )
     student_lora_path: str = field(
         default="",

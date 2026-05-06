@@ -180,9 +180,12 @@ class TTTDDistillTrainer(PPOTrainer):
         self.ref = None  # No ref model needed (kl_ctl=0)
         
         # =====================================================================
-        # Create and initialize teacher model
+        # Create teacher model (native AReaL path)
         # =====================================================================
-        self.teacher = self._create_teacher_actor(config)
+        self.teacher = None
+        if config.teacher is not None:
+            teacher_alloc = ModelAllocation.from_str(config.teacher.backend, name="teacher")
+            self.teacher = self._create_train_engine(config.teacher, teacher_alloc)
         
         # =====================================================================
         # Create dataloaders using teacher sampler
@@ -260,157 +263,11 @@ class TTTDDistillTrainer(PPOTrainer):
         # Store workflow kwargs for later use
         self._workflow_kwargs = {}
         
-        # Native AReaL KDRL: teacher_logp is computed on-the-fly and consumed
-        # by actor.ppo_update(). No manual KL estimator or reward shaping needed.
-
-    def _load_hf_checkpoint(self, engine, path: str, model_name: str = ""):
-        """Load HF checkpoint, handling PEFT LoRA adapter key conversion.
-        
-        PEFT save_pretrained() strips '.default' suffix from adapter keys,
-        but FSDP-wrapped PEFT models expect it. We fix the keys here.
-        """
-        from areal.api.io_struct import SaveLoadMeta
-        from safetensors.torch import load_file
-        from torch.distributed.checkpoint.state_dict import (
-            StateDictOptions,
-            set_model_state_dict,
-        )
-        
-        adapter_path = os.path.join(path, "adapter_model.safetensors")
-        is_lora_adapter = os.path.isfile(adapter_path)
-        
-        if not is_lora_adapter:
-            # Standard HF checkpoint (full model)
-            meta = SaveLoadMeta(
-                path=path,
-                weight_format="hf",
-                with_optim=False,
-                tokenizer=None,
-                processor=None,
-            )
-            engine.load(meta)
-            return
-        
-        # LoRA adapter: manually load and fix keys
-        logger.info(f"[Load-{model_name}] Loading LoRA adapter from {path}")
-        if dist.get_rank() == 0:
-            lora_state = load_file(adapter_path)
-            fixed_state = {}
-            for k, v in lora_state.items():
-                if "lora_A" in k or "lora_B" in k:
-                    k = k.replace(".lora_A.weight", ".lora_A.default.weight")
-                    k = k.replace(".lora_B.weight", ".lora_B.default.weight")
-                fixed_state[k] = v
-        else:
-            fixed_state = {}
-        
-        options = StateDictOptions(
-            full_state_dict=True,
-            cpu_offload=False,
-            broadcast_from_rank0=True,
-            strict=False,
-        )
-        set_model_state_dict(engine.model, fixed_state, options=options)
-        logger.info(f"[Load-{model_name}] Loaded LoRA adapter from {path}")
-    
     def _create_tttd_actor(self, actor_config: TTTDPPOActorConfig):
         """Create student TTTDActor."""
         actor = TTTDActor(config=actor_config)
         actor.create_process_group(parallel_strategy=self.allocation_mode.train)
         return actor
-    
-    def _create_teacher_actor(self, config: TTTDDistillConfig):
-        """Create and initialize frozen teacher TTTDActor from checkpoint.
-        
-        Supports:
-        - HF LoRA adapter (PEFT format with adapter_config.json)
-        - HF full model (standard transformers format)
-        - DCP checkpoint (AReaL distributed checkpoint)
-        """
-        if not config.teacher_path:
-            raise ValueError("teacher_path must be provided for distillation")
-        
-        teacher_config = copy.deepcopy(config)
-        
-        # Detect checkpoint format
-        adapter_config_path = os.path.join(config.teacher_path, "adapter_config.json")
-        is_lora_adapter = os.path.isfile(adapter_config_path)
-        
-        if is_lora_adapter:
-            # ================================================================
-            # Teacher is a LoRA adapter (from TTT-Discover training)
-            # ================================================================
-            logger.info(f"[Teacher] Detected LoRA adapter at {config.teacher_path}")
-            
-            # Read base model from adapter config
-            with open(adapter_config_path, "r") as f:
-                adapter_cfg = json.load(f)
-            base_model = adapter_cfg.get("base_model_name_or_path", config.actor.path)
-            
-            # If base_model is a HF Hub ID (not a local path), use student's base model
-            # or the teacher checkpoint dir itself (which has config.json/tokenizer)
-            if not base_model or not os.path.isdir(base_model):
-                # Prefer teacher checkpoint dir if it has config.json
-                if os.path.isfile(os.path.join(config.teacher_path, "config.json")):
-                    base_model = config.teacher_path
-                    logger.info(f"[Teacher] Using teacher checkpoint dir as base model: {base_model}")
-                else:
-                    base_model = config.actor.path
-                    logger.info(f"[Teacher] Using student's base model as fallback: {base_model}")
-            
-            teacher_config.actor.path = base_model
-            teacher_config.actor.use_lora = True
-            # Inherit LoRA params from student config (assumes same architecture)
-            
-            logger.info(
-                f"[Teacher] Will initialize LoRA teacher: base={base_model}, "
-                f"rank={teacher_config.actor.lora_rank}, alpha={teacher_config.actor.lora_alpha}"
-            )
-        else:
-            # ================================================================
-            # Teacher is a full model (HF or DCP)
-            # ================================================================
-            teacher_config.actor.path = config.teacher_path
-            teacher_config.actor.use_lora = False
-            logger.info(f"[Teacher] Detected full model checkpoint at {config.teacher_path}")
-        
-        # Create teacher actor
-        # NOTE: TTTDActor expects a TTTDPPOActorConfig (actor-level config),
-        # not the top-level TTTDDistillConfig.
-        teacher = TTTDActor(config=teacher_config.actor)
-        teacher.create_process_group(parallel_strategy=self.allocation_mode.train)
-        
-        ft_spec = FinetuneSpec(
-            total_train_epochs=1,
-            dataset_size=1,
-            train_batch_size=1,
-        )
-        teacher.initialize(addr=None, ft_spec=ft_spec, alloc_mode=self.allocation_mode, role="ref")
-        
-        # Load weights
-        if is_lora_adapter:
-            self._load_hf_checkpoint(teacher, config.teacher_path, "Teacher")
-        elif config.teacher_weight_format == "dcp":
-            from areal.api.io_struct import SaveLoadMeta
-            meta = SaveLoadMeta(
-                path=config.teacher_path,
-                weight_format="dcp",
-                with_optim=False,
-                tokenizer=None,
-                processor=None,
-                base_model_path=None,
-            )
-            teacher.load(meta)
-            logger.info(f"[Teacher] Loaded DCP weights from {config.teacher_path}")
-        else:
-            logger.info(f"[Teacher] Using HF weights loaded during initialize() from {teacher_config.actor.path}")
-        
-        # Freeze teacher parameters
-        for param in teacher.model.parameters():
-            param.requires_grad = False
-        
-        logger.info("[Teacher] Teacher model created and frozen")
-        return teacher
     
     def _create_tttd_dataloader(
         self,
@@ -431,7 +288,7 @@ class TTTDDistillTrainer(PPOTrainer):
     
     def _initialize_engines(self):
         """Initialize training engines."""
-        max_steps = self.config.distill_steps
+        max_steps = self.config.max_steps
         ft_spec = FinetuneSpec(
             total_train_epochs=max_steps,
             dataset_size=max_steps * self.config.sampler.batch_size,
@@ -445,6 +302,8 @@ class TTTDDistillTrainer(PPOTrainer):
         }
         
         self.actor.initialize(**engine_init_kwargs, role="actor")
+        if self.teacher is not None:
+            self.teacher.initialize(**engine_init_kwargs, role="teacher")
     
     def _setup_weight_update_meta(self):
         """Setup weight update meta and connect to inference engine."""
@@ -490,7 +349,7 @@ class TTTDDistillTrainer(PPOTrainer):
         """Setup evaluator, saver, recover handler, and stats logger."""
         config = self.config
         
-        max_steps = config.distill_steps
+        max_steps = config.max_steps
         ft_spec = FinetuneSpec(
             total_train_epochs=max_steps,
             dataset_size=max_steps * config.sampler.batch_size,
@@ -533,35 +392,6 @@ class TTTDDistillTrainer(PPOTrainer):
         if hasattr(self.rollout, 'data_generator'):
             delattr(self.rollout, 'data_generator')
             logger.info("[Distill] Cleared rollout controller data_generator")
-
-
-
-    def _attach_teacher_logp(self, rollout_batch: dict[str, Any]) -> dict[str, Any]:
-        """Compute teacher logprobs and attach KDRL metadata to batch.
-
-        Uses native AReaL KDRL logic: teacher_logp is consumed by
-        actor.ppo_update() to compute the distillation loss automatically.
-        """
-        if self.teacher is None:
-            return rollout_batch
-
-        device = self.actor.device
-        with torch.no_grad():
-            # PPOActor.compute_logp expects list[dict]; wrap singleton batch
-            teacher_logps = self.teacher.compute_logp([rollout_batch])
-        rollout_batch["teacher_logp"] = teacher_logps[0]
-
-        # Pull weights from config (native AReaL KDRL fields)
-        if self.config.teacher is not None:
-            rollout_batch["rl_loss_weight"] = self.config.teacher.rl_loss_weight
-            rollout_batch["distill_loss_weight"] = self.config.teacher.distill_loss_weight
-        else:
-            # Backward compatibility: pure distillation defaults
-            rollout_batch["rl_loss_weight"] = 0.0
-            rollout_batch["distill_loss_weight"] = getattr(
-                self.config, "kl_reward_scale", 1.0
-            )
-        return rollout_batch
     
     def _normalize_rollout_batch(self, rollout_batch) -> dict[str, Any]:
         """Ensure rollout_batch is a single dict for TTTDActor methods.
@@ -628,7 +458,7 @@ class TTTDDistillTrainer(PPOTrainer):
         # =====================================================================
         # Phase 1: Distillation steps (no verification)
         # =====================================================================
-        for step_idx in range(config.distill_steps):
+        for step_idx in range(config.max_steps):
             global_step = step_idx
             logger.info(f"[Distill][Step {global_step}] Starting distill step")
             
@@ -701,6 +531,14 @@ class TTTDDistillTrainer(PPOTrainer):
                 steps_per_epoch=config.distill_steps,
             )
             
+            # Compute teacher logp (native AReaL KDRL path)
+            if self.teacher is not None:
+                with torch.no_grad():
+                    teacher_logps = self.teacher.compute_logp([rollout_batch])
+                rollout_batch["teacher_logp"] = teacher_logps[0]
+                rollout_batch["rl_loss_weight"] = self.config.teacher.rl_loss_weight
+                rollout_batch["distill_loss_weight"] = self.config.teacher.distill_loss_weight
+            
             # Compute prox_logp if needed (wrap dict in list for PPOActor.compute_logp)
             if config.actor.should_compute_prox_logp():
                 prox_logps = self.actor.compute_logp([rollout_batch])
@@ -708,9 +546,6 @@ class TTTDDistillTrainer(PPOTrainer):
             
             # Compute advantages using TTTDActor (native AReaL logic)
             rollout_batch = self.actor.compute_advantages(rollout_batch)
-            
-            # Attach teacher logp for KDRL (native AReaL logic)
-            rollout_batch = self._attach_teacher_logp(rollout_batch)
             
             # PPO update: automatically handles KD loss when teacher_logp is present
             self.actor.ppo_update([rollout_batch])
@@ -855,11 +690,17 @@ def main(args):
     
     config, _ = load_expr_config(args, TTTDDistillConfig)
     
-    # Validate teacher paths
-    if not config.teacher_path:
-        raise ValueError("teacher_path must be provided. Add +teacher_path=<path> to your command.")
+    # Validate teacher config
+    if config.teacher is None:
+        raise ValueError(
+            "teacher config block must be provided for distillation. "
+            "Add teacher: {...} to your YAML."
+        )
     if not config.teacher_sampler_checkpoint:
-        raise ValueError("teacher_sampler_checkpoint must be provided. Add +teacher_sampler_checkpoint=<path> to your command.")
+        raise ValueError(
+            "teacher_sampler_checkpoint must be provided. "
+            "Add +teacher_sampler_checkpoint=<path> to your command."
+        )
     
     # Ensure stop tokens are set
     if config.tokenizer_path:
