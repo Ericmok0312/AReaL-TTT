@@ -296,6 +296,22 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             delattr(self.rollout, 'data_generator')
             logger.info("[MultiEval] Cleared rollout controller data_generator")
 
+    def _normalize_eval_batch(self, eval_batch) -> dict[str, Any]:
+        """Ensure eval_batch is a single dict for downstream processing.
+
+        prepare_batch may return list[dict] depending on the backend path;
+        concat if necessary so that evaluation metrics work uniformly.
+        """
+        if isinstance(eval_batch, dict):
+            return eval_batch
+        if isinstance(eval_batch, list):
+            if len(eval_batch) == 1:
+                return eval_batch[0]
+            from areal.utils.data import concat_batch
+            batched, _meta = concat_batch(eval_batch)
+            return batched
+        raise TypeError(f"Unexpected eval_batch type: {type(eval_batch)}")
+
     def _run_single_model_eval(self, label: str, version: int, workflow_class, initial_states, group_size):
         """Evaluate a single model on initial states with verification."""
         logger.info(f"[MultiEval-{label}] Setting version={version} and starting rollout")
@@ -340,6 +356,9 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             logger.error(traceback.format_exc())
             raise
         eval_rollout_time = time.perf_counter() - eval_start
+
+        # Normalize batch (prepare_batch may return list[dict] on some backends)
+        eval_batch = self._normalize_eval_batch(eval_batch)
 
         # Gather results
         if not isinstance(eval_batch, dict):
