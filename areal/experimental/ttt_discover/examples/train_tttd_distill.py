@@ -452,7 +452,7 @@ class TTTDDistillTrainer(PPOTrainer):
             f"[Distill] Starting distillation: "
             f"max_steps={config.max_steps}, "
             f"total_rollouts_per_step={total_rollouts}, "
-            f"kl_scale={config.kl_reward_scale}"
+            f"distill_loss_weight={config.teacher.distill_loss_weight if config.teacher else 'N/A'}"
         )
         
         # =====================================================================
