@@ -373,7 +373,9 @@ class TTTDDistillTrainer(PPOTrainer):
             logger.info(f"[Teacher] Detected full model checkpoint at {config.teacher_path}")
         
         # Create teacher actor
-        teacher = TTTDActor(config=teacher_config)
+        # NOTE: TTTDActor expects a TTTDPPOActorConfig (actor-level config),
+        # not the top-level TTTDDistillConfig.
+        teacher = TTTDActor(config=teacher_config.actor)
         teacher.create_process_group(parallel_strategy=self.allocation_mode.train)
         
         ft_spec = FinetuneSpec(
