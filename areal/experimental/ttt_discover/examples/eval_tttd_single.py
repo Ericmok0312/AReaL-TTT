@@ -84,7 +84,11 @@ class TTTDSingleEvalTrainer(PPOTrainer):
         # Initialize scheduler
         self.scheduler = None
         if is_single_controller():
-            self.scheduler = self._init_scheduler()
+            sched_type = getattr(config.scheduler, 'type', None)
+            if sched_type is not None and sched_type != 'null':
+                self.scheduler = self._init_scheduler()
+            else:
+                logger.info("[SingleEval] scheduler.type is null, skipping scheduler init")
 
         # Set seed
         seeding.set_random_seed(config.seed, key=f"eval{rank}")
