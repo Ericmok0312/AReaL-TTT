@@ -250,7 +250,8 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         # NOTE: Uses composite key to handle same parent sampled in multiple steps
         self._staleness_tracker: dict[tuple[str, int], dict] = {}
         self._current_version: int = 0  # Current training step, set externally
-        
+        self._current_step: int = 0  # For staleness tracking in get_pending_updates
+
         # Scheme 1 (Sync-like) batch tracking
         # Enables waiting for all parents in a batch to complete before PUCT update
         self._current_batch_step: int = 0
