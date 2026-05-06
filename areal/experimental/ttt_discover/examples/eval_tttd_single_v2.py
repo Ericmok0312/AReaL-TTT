@@ -154,7 +154,10 @@ class TTTDSingleEvalTrainer(PPOTrainer):
         self.valid_dataloader = None
         self.valid_dataset = None
 
-        # Initialize inference engines (same as training, no lora_path pre-loading)
+        # Initialize inference engines (same as training, no lora_path pre-loading).
+        # Force lora_modules to None to avoid vLLM startup errors if the YAML
+        # contains a mis-formatted JSON string. We rely entirely on update_weights().
+        config.vllm.lora_modules = None
         self.rollout = self._init_rollout(config.rollout, is_eval=False)
 
         # Initialize models
