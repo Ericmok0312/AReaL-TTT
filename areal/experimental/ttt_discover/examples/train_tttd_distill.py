@@ -204,9 +204,6 @@ class TTTDDistillTrainer(PPOTrainer):
         # Initialize models
         self._initialize_engines()
         
-        # Save initial LoRA weights for vLLM pre-loading (native AReaL path)
-        initial_lora_path = self._save_initial_lora_weights()
-        
         # =====================================================================
         # Save evaluation checkpoints for base, teacher, and student
         # These are used in the final eval phase to compare three models
@@ -251,8 +248,8 @@ class TTTDDistillTrainer(PPOTrainer):
         # Connect sampler to actor (for API compatibility, though we won't sync)
         self.actor.connect_sampler(self.sampler)
         
-        # Initialize inference engines with LoRA path for vLLM pre-loading
-        self.rollout = self._init_rollout(config.rollout, is_eval=False, lora_path=initial_lora_path)
+        # Initialize inference engines
+        self.rollout = self._init_rollout(config.rollout, is_eval=False)
         
         # Setup weight update meta
         self._setup_weight_update_meta()
@@ -714,7 +711,7 @@ def main(args):
         if tokenizer.eos_token_id not in config.gconfig.stop_token_ids:
             config.gconfig.stop_token_ids.append(tokenizer.eos_token_id)
     
-    # Verify LoRA adapter exists
+    # Verify LoRA adapter exists (required for SPMD mode vLLM pre-loading)
     if config.actor.use_lora and not config.skip_lora_check:
         lora_output_path = "./lora_init"
         if hasattr(config, 'vllm'):

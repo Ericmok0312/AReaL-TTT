@@ -169,6 +169,8 @@ vllm:
   enforce_eager: false
   enable_lora: ${actor.use_lora}
   max_lora_rank: 32
+  lora_modules: '{"name": "${gconfig.lora_name}-v0", "path": "./lora_init_ac1_distill",
+    "base_model_name": "${actor.path}"}'
 
 sampler:
   type: puct
