@@ -114,6 +114,8 @@ class TTTDDistillTrainer(PPOTrainer):
         
         # Parse allocation mode
         self.allocation_mode = AllocationMode.from_str(config.allocation_mode)
+        self.actor_alloc = ModelAllocation.from_str(config.actor.backend, name="actor")
+        self.rollout_alloc = ModelAllocation.from_str(config.rollout.backend, name="rollout")
         self._amend_xccl_weight_update_envvar()
         
         # =====================================================================
