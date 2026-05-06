@@ -27,7 +27,7 @@ import torch.distributed as dist
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal import PPOTrainer
-from areal.api.alloc_mode import _AllocationMode as AllocationMode, ParallelStrategy
+from areal.api.alloc_mode import _AllocationMode as AllocationMode, ModelAllocation, ParallelStrategy
 from areal.api.cli_args import (
     PPOActorConfig,
     PPOConfig,
