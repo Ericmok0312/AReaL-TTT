@@ -587,11 +587,14 @@ class TTTDDistillTrainer(PPOTrainer):
             logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] After rollout.pause")
             
             logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] Before actor.update_weights")
-            self.actor.update_weights(self.weight_update_meta)
+            new_version = global_step + 1
+            versioned_meta = self.weight_update_meta.with_version(new_version)
+            logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] Using versioned_meta version={versioned_meta.version}")
+            self.actor.update_weights(versioned_meta)
             logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] After actor.update_weights")
             
-            self.actor.set_version(global_step + 1)
-            self.rollout.set_version(global_step + 1)
+            self.actor.set_version(new_version)
+            self.rollout.set_version(new_version)
             logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] After set_version")
             
             logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] Before _save_hf")
