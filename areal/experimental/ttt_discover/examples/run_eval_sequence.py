@@ -65,21 +65,25 @@ def get_model_path(conf: OmegaConf, label: str) -> str | None:
 
 
 def run_single_eval(lora_path: str, config_path: str, extra_argv: list[str]) -> None:
-    """Invoke ``eval_tttd_single.py`` through AReaL's local launcher."""
+    """Invoke ``eval_tttd_single_v2.py`` through AReaL's local launcher."""
     # We must go through the launcher so that torch.distributed env vars
     # (RANK, WORLD_SIZE, etc.) and AREAL_SPMD_MODE are set properly.
+    # NOTE: --lora-path is passed via env var because launcher's parse_cli_args
+    # treats unknown --flags as Hydra overrides and crashes.
     cmd = [
         sys.executable,
         "-m", "areal.infra.launcher.local",
         str(EVAL_SINGLE_PY),
-        "--lora-path", lora_path,
         "--config", config_path,
         *extra_argv,
     ]
+    env = os.environ.copy()
+    env["EVAL_LORA_PATH"] = lora_path
     print("=" * 70)
     print("[run_eval_sequence] Running:\n  ", " ".join(cmd))
+    print(f"[run_eval_sequence] EVAL_LORA_PATH={lora_path}")
     print("=" * 70)
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, env=env)
 
 
 def aggregate_results(output_dir: str, model_paths: dict[str, str]) -> dict:

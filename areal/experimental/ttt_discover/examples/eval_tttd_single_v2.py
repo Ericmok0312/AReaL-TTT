@@ -495,36 +495,20 @@ class TTTDSingleEvalTrainer(PPOTrainer):
         perf_tracer.save(force=True)
 
 
-def _extract_lora_path(args: list[str]) -> tuple[str | None, list[str]]:
-    """Extract --lora-path from args and return (lora_path, remaining_args)."""
-    lora_path = None
-    remaining = []
-    i = 0
-    while i < len(args):
-        if args[i] in ("--lora-path", "--lora_path") and i + 1 < len(args):
-            lora_path = args[i + 1]
-            i += 2
-        else:
-            remaining.append(args[i])
-            i += 1
-    return lora_path, remaining
-
-
 def main(args):
     """Main evaluation function."""
-    lora_path, remaining_args = _extract_lora_path(args)
+    lora_path = os.environ.get("EVAL_LORA_PATH")
     if lora_path is None:
         raise ValueError(
-            "Must provide --lora-path <path>.\n"
-            "Example: python -m areal.infra.launcher.local "
-            "eval_tttd_single_v2.py --lora-path ./outputs/teacher "
-            "--config conf/fsdp_lora_vllm_ac1_qwen3_8b_distill.yaml"
+            "Environment variable EVAL_LORA_PATH must be set.\n"
+            "Example: EVAL_LORA_PATH=./outputs/teacher python -m areal.infra.launcher.local "
+            "eval_tttd_single_v2.py --config conf/fsdp_lora_vllm_ac1_qwen3_8b_distill.yaml"
         )
 
     if not os.path.isdir(lora_path):
-        raise ValueError(f"--lora-path does not exist or is not a directory: {lora_path}")
+        raise ValueError(f"EVAL_LORA_PATH does not exist or is not a directory: {lora_path}")
 
-    config, _ = load_expr_config(remaining_args, TTTDDistillConfig)
+    config, _ = load_expr_config(args, TTTDDistillConfig)
 
     if not config.teacher_sampler_checkpoint:
         raise ValueError(
