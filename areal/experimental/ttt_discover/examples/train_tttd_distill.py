@@ -586,13 +586,17 @@ class TTTDDistillTrainer(PPOTrainer):
                 except Exception as e:
                     logger.warning(f"[Distill][Step {global_step}] Failed to compute dynamic metrics: {e}")
 
-            # All-reduce dynamic metrics across DP ranks for global averages
+            # All-reduce dynamic metrics across DP ranks (weighted by token count)
             if dist.is_initialized() and dynamic_metrics:
-                dp_world_size = self.actor.data_parallel_world_size
+                count = dynamic_metrics.pop("distill/_count", 0)
+                count_t = torch.tensor([float(count)], dtype=torch.float32, device=self.actor.device)
+                dist.all_reduce(count_t, op=dist.ReduceOp.SUM)
+                total_count = int(count_t.item())
+
                 for key in list(dynamic_metrics.keys()):
                     val = torch.tensor([dynamic_metrics[key]], dtype=torch.float32, device=self.actor.device)
                     dist.all_reduce(val, op=dist.ReduceOp.SUM)
-                    dynamic_metrics[key] = (val / dp_world_size).item()
+                    dynamic_metrics[key] = (val / total_count).item() if total_count > 0 else 0.0
 
             # Record dynamic metrics to history logger (saved as JSON)
             if hasattr(self, 'dynamic_metrics_logger') and self.dynamic_metrics_logger is not None:
@@ -772,10 +776,15 @@ class TTTDDistillTrainer(PPOTrainer):
         - overlap_token_advantage: M_adv = E_t[ 1/|∩| Σ_{v∈∩} A_t(v) ]
         - entropy_gap: ΔH_t = |H(q_t) - H(p_t)|
 
-        To control memory, we chunk the batch and only keep top-k indices/logprobs
-        instead of the full vocab distribution.
+        Memory-safe implementation:
+        1. Forward one sequence at a time (batch dim chunk_size=1).
+        2. Within each sequence, chunk active tokens along seq dim to avoid
+           materializing [seq_len, vocab] log_probs all at once.
         """
-        chunk_size = getattr(self.config, "metric_chunk_size", 4)
+        # Batch dim: process one sequence at a time to keep peak activation small.
+        # Seq dim: further chunk active tokens so we never do log_softmax on
+        #          more than ~seq_chunk_size x vocab at once.
+        seq_chunk_size = getattr(self.config, "metric_seq_chunk_size", 512)
 
         input_ids = rollout_batch["input_ids"]
         attention_mask = rollout_batch["attention_mask"]
@@ -788,39 +797,50 @@ class TTTDDistillTrainer(PPOTrainer):
             topk_logps = []
             entropies = []
 
-            for i in range(0, n, chunk_size):
-                end = min(i + chunk_size, n)
-                ids = input_ids[i:end].to(device)
-                mask = attention_mask[i:end].to(device)
-                lmask = loss_mask[i:end].to(device)
+            for i in range(n):
+                ids = input_ids[i : i + 1].to(device)
+                mask = attention_mask[i : i + 1].to(device)
+                lmask = loss_mask[i : i + 1].to(device)
 
                 with torch.no_grad():
                     out = engine.model(input_ids=ids, attention_mask=mask)
-                    logits = out.logits  # [chunk, seqlen, vocab]
+                    logits = out.logits.squeeze(0)  # [seqlen, vocab]
 
-                log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
-                entropy = -(log_probs.exp() * log_probs).sum(-1)  # [chunk, seqlen]
+                active = lmask.squeeze(0) > 0
+                if not active.any():
+                    del out, logits
+                    continue
 
-                active = lmask > 0
-                if active.any():
-                    entropies.append(entropy[active].cpu())
-                    active_log_probs = log_probs[active]  # [n_active, vocab]
-                    tk_logp, tk_idx = torch.topk(active_log_probs, k, dim=-1)
+                active_logits = logits[active]  # [n_active, vocab]
+                n_active = active_logits.shape[0]
+
+                # Chunk along sequence dim to cap peak memory.
+                for j in range(0, n_active, seq_chunk_size):
+                    chunk_logits = active_logits[j : j + seq_chunk_size]  # [<=seq_chunk, vocab]
+                    log_probs = torch.nn.functional.log_softmax(
+                        chunk_logits.float(), dim=-1
+                    )
+                    entropy = -(log_probs.exp() * log_probs).sum(-1)
+                    entropies.append(entropy.cpu())
+
+                    tk_logp, tk_idx = torch.topk(log_probs, k, dim=-1)
                     topk_logps.append(tk_logp.cpu())
                     topk_indices.append(tk_idx.cpu())
+
+                    del chunk_logits, log_probs, entropy, tk_logp, tk_idx
+
+                del out, logits, active_logits, active
 
             if not entropies:
                 return None, None, None
             return torch.cat(topk_indices), torch.cat(topk_logps), torch.cat(entropies)
 
         s_idx, s_logp, s_ent = _get_topk_and_entropy(self.actor, self.actor.device)
+        torch.cuda.empty_cache()
         t_idx, t_logp, t_ent = _get_topk_and_entropy(self.teacher, self.teacher.device)
 
         if s_idx is None or t_idx is None:
             return {}
-
-        # Entropy metrics (GPU/CPU tensor ops)
-        entropy_gap = (t_ent - s_ent).abs().mean().item()
 
         # Overlap metrics (CPU numpy for simplicity and speed with small k)
         s_idx_np = s_idx.numpy()
@@ -858,11 +878,12 @@ class TTTDDistillTrainer(PPOTrainer):
             adv_values[i] = A.sum() / len(inter)
 
         return {
-            "distill/overlap_ratio": float(overlap_ratios.mean()),
-            "distill/overlap_token_advantage": float(adv_values.mean()),
-            "distill/entropy_gap": entropy_gap,
-            "distill/student_entropy": s_ent.mean().item(),
-            "distill/teacher_entropy": t_ent.mean().item(),
+            "distill/overlap_ratio": float(overlap_ratios.sum()),
+            "distill/overlap_token_advantage": float(adv_values.sum()),
+            "distill/entropy_gap": float((t_ent - s_ent).abs().sum()),
+            "distill/student_entropy": float(s_ent.sum()),
+            "distill/teacher_entropy": float(t_ent.sum()),
+            "distill/_count": int(n_active),
         }
 
     def close(self):
