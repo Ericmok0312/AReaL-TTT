@@ -582,7 +582,7 @@ class TTTDDistillTrainer(PPOTrainer):
             dynamic_metrics = {}
             if self.teacher is not None:
                 try:
-                    dynamic_metrics = self._compute_dynamic_metrics(rollout_batch, k=50)
+                    dynamic_metrics = self._compute_dynamic_metrics(rollout_batch, k=16)
                 except Exception as e:
                     logger.warning(f"[Distill][Step {global_step}] Failed to compute dynamic metrics: {e}")
 
@@ -764,7 +764,7 @@ class TTTDDistillTrainer(PPOTrainer):
         )
         recover_info.dump(recover_info_path)
 
-    def _compute_dynamic_metrics(self, rollout_batch: dict[str, Any], k: int = 50) -> dict[str, float]:
+    def _compute_dynamic_metrics(self, rollout_batch: dict[str, Any], k: int = 16) -> dict[str, float]:
         """Compute dynamic metrics from the TTT-Discover paper.
 
         Metrics:

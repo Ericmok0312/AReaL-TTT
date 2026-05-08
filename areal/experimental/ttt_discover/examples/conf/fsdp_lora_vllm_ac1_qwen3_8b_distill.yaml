@@ -36,7 +36,7 @@ teacher:
 teacher_sampler_checkpoint: ./outputs_ac1_async_v2/tttd-async-qwen3-8b-ac1/trial0/sampler
 
 run_eval_step: true
-total_rollouts_per_step: 8
+total_rollouts_per_step: 512
 
 actor:
   experiment_name: ${experiment_name}
@@ -130,7 +130,7 @@ rollout:
   backend: vllm:d4p1t1
 
 gconfig:
-  n_samples: 1
+  n_samples: 64
   min_new_tokens: 0
   max_new_tokens: 32768
   max_tokens: 32768
