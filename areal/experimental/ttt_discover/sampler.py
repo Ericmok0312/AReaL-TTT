@@ -7,6 +7,7 @@ import threading
 import time
 
 import numpy as np
+import random
 
 from areal.experimental.ttt_discover.state import (
     InequalitiesState,
@@ -441,6 +442,7 @@ class PUCTSampler(StateSampler):
         self._T: int = 0 # Total number of expansions across all states
         self._last_scale: float = 1.0
         self._last_puct_stats: list[tuple[int, float, float, float, float]] = [] # n, Q, P, bonus, score
+        self.sampling_strategy: str = kwargs.get('sampling_strategy', 'puct')
         
         # Versioned sampling support for lazy PUCT
         # version -> snapshot of PUCT state at that version
@@ -600,6 +602,9 @@ class PUCTSampler(StateSampler):
             self._sample_counter += 1
             self._last_sampled_step = current_sample_step
         
+        if self.sampling_strategy == "parent_pool":
+            return self._sample_parent_pool(num_states)
+        
         initial_ids = {s.id for s in self._initial_states}
         candidates = list(self._states)
 
@@ -656,6 +661,31 @@ class PUCTSampler(StateSampler):
                 self._refresh_random_construction(s)
 
         return picked
+
+    def _sample_parent_pool(self, num_states: int) -> list[State]:
+        """Sample randomly from all states that have been visited/expanded as parents."""
+        with self._lock:
+            # Filter states that have been expanded (n > 0)
+            parent_pool = [s for s in self._states if self._n.get(s.id, 0) > 0]
+            
+            if not parent_pool:
+                # Fallback: create fresh initial states if no parents exist
+                picked = [create_initial_state(self.env_type, self.initial_exp_type, self.budget_s)
+                          for _ in range(num_states)]
+                self._last_sampled_states = picked
+                self._last_sampled_indices = []
+                self._last_puct_stats = [(0, 0.0, 0.0, 0.0, 0.0) for _ in picked]
+                return picked
+            
+            # Pure random sampling with replacement
+            picked = random.choices(parent_pool, k=num_states)
+            
+            state_id_to_idx = {s.id: i for i, s in enumerate(self._states)}
+            self._last_sampled_states = picked
+            self._last_sampled_indices = [state_id_to_idx.get(s.id, -1) for s in picked]
+            self._last_puct_stats = [(0, 0.0, 0.0, 0.0, 0.0) for _ in picked]
+            
+            return picked
 
     def save_version_snapshot(self, version: int):
         """
@@ -1240,6 +1270,7 @@ def create_sampler_from_config(
     top_k = getattr(config, 'top_k', 1000)
     temperature = getattr(config, 'temperature', 1.0)
     save_freq = getattr(config, 'save_freq', 100)
+    sampling_strategy = getattr(config, 'sampling_strategy', 'puct')
     
     # Auto-detect latest sampler checkpoint step
     resume_step = _find_latest_sampler_step(log_path, sampler_type)
@@ -1268,6 +1299,7 @@ def create_sampler_from_config(
         top_k=top_k,
         temperature=temperature,
         max_version_history=max_version_history,
+        sampling_strategy=sampling_strategy,
     )
 
 

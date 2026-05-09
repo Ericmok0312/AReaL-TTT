@@ -164,10 +164,13 @@ class TTTDDistillTrainer(PPOTrainer):
                     f"Using fresh sampler state."
                 )
 
+        # Distillation: use parent_pool sampling by default (random from all teacher-explored parents)
+        self.sampler.sampling_strategy = getattr(config.sampler, 'sampling_strategy', 'parent_pool')
         logger.info(
             f"[TeacherSampler] Loaded {len(self.sampler._states)} states, "
             f"T={self.sampler._T}, n_entries={len(self.sampler._n)}, "
-            f"m_entries={len(self.sampler._m)}"
+            f"m_entries={len(self.sampler._m)}, "
+            f"sampling_strategy={self.sampler.sampling_strategy}"
         )
 
         # =====================================================================
@@ -563,28 +566,40 @@ class TTTDDistillTrainer(PPOTrainer):
                 steps_per_epoch=config.max_steps,
             )
 
-            # Compute teacher logp (native AReaL KDRL path)
+            # =====================================================================
+            # Compute dynamic metrics AND per-token logps in one forward pass
+            # (avoids redundant teacher.compute_logp + actor.compute_logp)
+            # =====================================================================
+            dynamic_metrics = {}
+            teacher_logp = None
+            student_logp = None
             if self.teacher is not None:
-                with torch.no_grad():
-                    teacher_logps = self.teacher.compute_logp([rollout_batch])
-                rollout_batch["teacher_logp"] = teacher_logps[0]
+                try:
+                    dynamic_metrics, teacher_logp, student_logp = (
+                        self._compute_dynamic_metrics_and_logps(rollout_batch, k=16)
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[Distill][Step {global_step}] Failed to compute dynamic metrics: {e}"
+                    )
+
+            # Use extracted logps; fall back to compute_logp if extraction failed
+            if self.teacher is not None:
+                if teacher_logp is not None:
+                    rollout_batch["teacher_logp"] = teacher_logp
+                else:
+                    with torch.no_grad():
+                        teacher_logps = self.teacher.compute_logp([rollout_batch])
+                    rollout_batch["teacher_logp"] = teacher_logps[0]
                 rollout_batch["rl_loss_weight"] = self.config.teacher.rl_loss_weight
                 rollout_batch["distill_loss_weight"] = self.config.teacher.distill_loss_weight
 
-            # Compute prox_logp if needed (wrap dict in list for PPOActor.compute_logp)
             if config.actor.should_compute_prox_logp():
-                prox_logps = self.actor.compute_logp([rollout_batch])
-                rollout_batch["prox_logp"] = prox_logps[0]
-
-            # =====================================================================
-            # Compute dynamic metrics (overlap ratio, overlap-token advantage, entropy gap)
-            # =====================================================================
-            dynamic_metrics = {}
-            if self.teacher is not None:
-                try:
-                    dynamic_metrics = self._compute_dynamic_metrics(rollout_batch, k=16)
-                except Exception as e:
-                    logger.warning(f"[Distill][Step {global_step}] Failed to compute dynamic metrics: {e}")
+                if student_logp is not None:
+                    rollout_batch["prox_logp"] = student_logp
+                else:
+                    prox_logps = self.actor.compute_logp([rollout_batch])
+                    rollout_batch["prox_logp"] = prox_logps[0]
 
             # All-reduce dynamic metrics across DP ranks (weighted by token count)
             if dist.is_initialized() and dynamic_metrics:
@@ -603,7 +618,7 @@ class TTTDDistillTrainer(PPOTrainer):
                 try:
                     self.dynamic_metrics_logger.record_step(
                         step=global_step,
-                        rewards=step_rewards.tolist(),
+                        rewards=[0.0],  # dummy: dynamic metrics logger should not store rewards
                         additional_metrics=dynamic_metrics,
                     )
                 except Exception as e:
@@ -768,22 +783,15 @@ class TTTDDistillTrainer(PPOTrainer):
         )
         recover_info.dump(recover_info_path)
 
-    def _compute_dynamic_metrics(self, rollout_batch: dict[str, Any], k: int = 16) -> dict[str, float]:
-        """Compute dynamic metrics from the TTT-Discover paper.
+    def _compute_dynamic_metrics_and_logps(
+        self, rollout_batch: dict[str, Any], k: int = 16
+    ) -> tuple[dict[str, float], torch.Tensor | None, torch.Tensor | None]:
+        """Compute dynamic metrics and extract per-token logps in one pass.
 
-        Metrics:
-        - overlap_ratio: M_overlap = E_t[ |S_t^(p) ∩ S_t^(q)| / k ]
-        - overlap_token_advantage: M_adv = E_t[ 1/|∩| Σ_{v∈∩} A_t(v) ]
-        - entropy_gap: ΔH_t = |H(q_t) - H(p_t)|
-
-        Memory-safe implementation:
-        1. Forward one sequence at a time (batch dim chunk_size=1).
-        2. Within each sequence, chunk active tokens along seq dim to avoid
-           materializing [seq_len, vocab] log_probs all at once.
+        Returns (metrics_dict, teacher_logp, student_logp).
+        teacher_logp and student_logp have shape [batch, seq_len] matching
+        compute_logp() output, so caller can skip redundant forward passes.
         """
-        # Batch dim: process one sequence at a time to keep peak activation small.
-        # Seq dim: further chunk active tokens so we never do log_softmax on
-        #          more than ~seq_chunk_size x vocab at once.
         seq_chunk_size = getattr(self.config, "metric_seq_chunk_size", 512)
 
         input_ids = rollout_batch["input_ids"]
@@ -791,11 +799,12 @@ class TTTDDistillTrainer(PPOTrainer):
         loss_mask = rollout_batch["loss_mask"]
         n, seqlen = input_ids.shape
 
-        def _get_topk_and_entropy(engine, device):
+        def _get_topk_entropy_and_logp(engine, device, input_ids_full):
             engine.model.eval()
             topk_indices = []
             topk_logps = []
             entropies = []
+            all_token_logps = []
 
             for i in range(n):
                 ids = input_ids[i : i + 1].to(device)
@@ -807,19 +816,30 @@ class TTTDDistillTrainer(PPOTrainer):
                     logits = out.logits.squeeze(0)  # [seqlen, vocab]
 
                 active = lmask.squeeze(0) > 0
+                seq_token_logps = torch.zeros(seqlen, dtype=torch.float32, device=device)
+
                 if not active.any():
                     del out, logits
+                    all_token_logps.append(seq_token_logps)
                     continue
 
                 active_logits = logits[active]  # [n_active, vocab]
                 n_active = active_logits.shape[0]
+                token_logps = []
 
-                # Chunk along sequence dim to cap peak memory.
                 for j in range(0, n_active, seq_chunk_size):
-                    chunk_logits = active_logits[j : j + seq_chunk_size]  # [<=seq_chunk, vocab]
+                    chunk_logits = active_logits[j : j + seq_chunk_size]
                     log_probs = torch.nn.functional.log_softmax(
                         chunk_logits.float(), dim=-1
                     )
+
+                    # Extract per-token logp for actual tokens (reuse for compute_logp)
+                    chunk_input_ids = input_ids_full[i][active][j : j + seq_chunk_size]
+                    chunk_token_logp = log_probs.gather(
+                        dim=-1, index=chunk_input_ids.unsqueeze(-1)
+                    ).squeeze(-1)
+                    token_logps.append(chunk_token_logp)
+
                     entropy = -(log_probs.exp() * log_probs).sum(-1)
                     entropies.append(entropy.cpu())
 
@@ -829,20 +849,33 @@ class TTTDDistillTrainer(PPOTrainer):
 
                     del chunk_logits, log_probs, entropy, tk_logp, tk_idx
 
+                active_positions = torch.where(active)[0]
+                seq_token_logps[active_positions] = torch.cat(token_logps)
+                all_token_logps.append(seq_token_logps)
+
                 del out, logits, active_logits, active
 
             if not entropies:
-                return None, None, None
-            return torch.cat(topk_indices), torch.cat(topk_logps), torch.cat(entropies)
+                return None, None, None, None
+            return (
+                torch.cat(topk_indices),
+                torch.cat(topk_logps),
+                torch.cat(entropies),
+                torch.stack(all_token_logps),  # [n, seqlen]
+            )
 
-        s_idx, s_logp, s_ent = _get_topk_and_entropy(self.actor, self.actor.device)
+        s_idx, s_logp, s_ent, s_token_logp = _get_topk_entropy_and_logp(
+            self.actor, self.actor.device, input_ids
+        )
         torch.cuda.empty_cache()
-        t_idx, t_logp, t_ent = _get_topk_and_entropy(self.teacher, self.teacher.device)
+        t_idx, t_logp, t_ent, t_token_logp = _get_topk_entropy_and_logp(
+            self.teacher, self.teacher.device, input_ids
+        )
 
-        if s_idx is None or t_idx is None:
-            return {}
+        if s_idx is None or t_idx is None or s_token_logp is None or t_token_logp is None:
+            return {}, None, None
 
-        # Overlap metrics (CPU numpy for simplicity and speed with small k)
+        # Overlap metrics (CPU numpy)
         s_idx_np = s_idx.numpy()
         t_idx_np = t_idx.numpy()
         s_logp_np = s_logp.numpy()
@@ -877,7 +910,7 @@ class TTTDDistillTrainer(PPOTrainer):
             A = p * (np.log(q + 1e-12) - np.log(p + 1e-12))
             adv_values[i] = A.sum() / len(inter)
 
-        return {
+        metrics = {
             "distill/overlap_ratio": float(overlap_ratios.sum()),
             "distill/overlap_token_advantage": float(adv_values.sum()),
             "distill/entropy_gap": float((t_ent - s_ent).abs().sum()),
@@ -885,6 +918,7 @@ class TTTDDistillTrainer(PPOTrainer):
             "distill/teacher_entropy": float(t_ent.sum()),
             "distill/_count": int(n_active),
         }
+        return metrics, t_token_logp, s_token_logp
 
     def close(self):
         """Cleanup resources."""

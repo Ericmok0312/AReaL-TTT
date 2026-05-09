@@ -56,6 +56,12 @@ class SamplerConfig:
         metadata={"help": "Directory to save sampler checkpoints"},
     )
 
+    # Sampling strategy
+    sampling_strategy: str = field(
+        default="puct",
+        metadata={"help": "Sampling strategy: 'puct' (UCB-based) or 'parent_pool' (random from visited parents)"},
+    )
+
     # Initial state
     initial_exp_type: str = field(
         default="best_available",
