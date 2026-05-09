@@ -483,7 +483,7 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             if dist.is_initialized():
                 dist.barrier()
             all_results[label] = self._run_single_model_eval(
-                label, idx + 1, workflow_class, group_size
+                label, idx , workflow_class, group_size
             )
 
         # Save comparison results
