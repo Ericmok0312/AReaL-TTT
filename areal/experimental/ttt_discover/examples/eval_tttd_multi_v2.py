@@ -4,13 +4,10 @@ TTT-Discover Multi-Model Evaluation (v2).
 
 Evaluates multiple models sequentially by loading each LoRA adapter into the
 actor and pushing it to vLLM via ``update_weights()`` (same path as training).
-This mirrors ``eval_tttd_single_v2.py`` but loops over multiple checkpoints.
 
-Usage (via launcher, same as training):
-    python -m areal.infra.launcher.local \
-        eval_tttd_multi_v2.py \
-        --config conf/fsdp_lora_vllm_ac1_qwen3_8b_distill.yaml \
-        [+eval.models=teacher,student]
+Usage (same as training):
+    python areal/experimental/ttt_discover/examples/eval_tttd_multi_v2.py \
+        --config areal/experimental/ttt_discover/examples/conf/fsdp_lora_vllm_ac1_qwen3_8b_distill.yaml
 """
 
 import sys
@@ -51,29 +48,14 @@ from areal.experimental.ttt_discover.reward import tttd_reward_fn
 logger = logging.getLogger("eval_tttd_multi_v2")
 
 
-class _InitialStateSampler:
-    """Simple state sampler that cycles through initial states only."""
-    def __init__(self, initial_states):
-        self._initial_states = initial_states
-        self._idx = 0
-
-    def sample_states(self, num_states: int):
-        result = []
-        for _ in range(num_states):
-            result.append(self._initial_states[self._idx % len(self._initial_states)])
-            self._idx += 1
-        return result
-
-
 class TTTDMultiEvalTrainer(PPOTrainer):
     """Multi-model evaluation trainer.
 
     Mirrors ``TTTDDistillTrainer`` initialization but:
-    - No training loop
-    - No teacher actor
+    - No training loop, no teacher actor, no saver/evaluator/recover
     - Loads each LoRA adapter on demand and pushes via ``update_weights()``
+    - Runs a single rollout step per model and aggregates rewards
     """
-
 
     def __init__(self, config: TTTDDistillConfig):
         self.config = config
@@ -100,7 +82,7 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         self.rollout_alloc = ModelAllocation.from_str(config.rollout.backend, name="rollout")
         self._amend_xccl_weight_update_envvar()
 
-        # Create sampler from teacher checkpoint
+        # Create sampler from teacher checkpoint (same as training)
         max_head_offpolicyness = getattr(config.rollout, 'max_head_offpolicyness', 2)
         max_version_history = max_head_offpolicyness + 1
         self.is_sync_mode = (max_head_offpolicyness == 0)
@@ -141,7 +123,7 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         self.actor = self._create_tttd_actor(config.actor)
         self.ref = None
 
-        # Create dataloader
+        # Create dataloader (same as training)
         self.train_dataloader = create_tttd_dataloader(
             state_sampler=self.sampler,
             rank=self.actor.data_parallel_rank,
@@ -153,10 +135,7 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         self.valid_dataloader = None
         self.valid_dataset = None
 
-        # Keep the YAML's lora_modules config so vLLM initializes its LoRA manager
-        # at startup.  The initial adapter (e.g. the base / pre-distill LoRA) is only
-        # a placeholder; we overwrite it with the checkpoint we actually want to eval
-        # via update_weights() below.
+        # Initialize rollout engine (same as training)
         self.rollout = self._init_rollout(config.rollout, is_eval=False)
 
         # Determine which models to evaluate
@@ -269,16 +248,7 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         logger.info(f"[LoadAdapter] Zeroed {n_zeroed} LoRA parameters")
 
     def _load_peft_lora_adapter(self, engine, path: str):
-        """Load a PEFT LoRA adapter checkpoint into the FSDP-wrapped actor.
-
-        AReaL does not expose a dedicated ``load_adapter`` API for LoRA-only
-        checkpoints, so we do it manually with the correct key mapping:
-
-        1. PEFT ``save_pretrained`` strips the ``base_model.model.`` prefix.
-        2. PEFT ``save_pretrained`` strips the ``.default`` adapter suffix.
-        3. FSDP2 ``set_model_state_dict`` expects the full param names as they
-           appear in the model, i.e. ``base_model.model....lora_A.default.weight``.
-        """
+        """Load a PEFT LoRA adapter checkpoint into the FSDP-wrapped actor."""
         from safetensors.torch import load_file
         from torch.distributed.checkpoint.state_dict import (
             StateDictOptions,
@@ -298,10 +268,8 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             raw_state = load_file(adapter_path)
             fixed_state = {}
             for k, v in raw_state.items():
-                # (1) Restore base_model.model. prefix if PEFT stripped it
                 if not k.startswith("base_model.model."):
                     k = f"base_model.model.{k}"
-                # (2) Restore .default adapter suffix (PEFT default adapter name)
                 if ".lora_A.weight" in k:
                     k = k.replace(".lora_A.weight", ".lora_A.default.weight")
                 elif ".lora_B.weight" in k:
@@ -314,11 +282,10 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             full_state_dict=True,
             cpu_offload=False,
             broadcast_from_rank0=True,
-            strict=False,  # LoRA is a subset; keep False to be safe
+            strict=False,
         )
         set_model_state_dict(engine.model, fixed_state, options=options)
 
-        # Verify loading succeeded
         if dist.get_rank() == 0:
             expected_keys = set(fixed_state.keys())
             model_keys = set(name for name, _ in engine.model.named_parameters())
@@ -336,27 +303,30 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         logger.info("[LoadAdapter] LoRA adapter loaded into actor successfully")
 
     def _clear_workflow_cache(self):
-        """Clear workflow executor cache so a new workflow can be used."""
-        workflow_executor = None
-        if hasattr(self.rollout, '_engine') and hasattr(self.rollout._engine, 'workflow_executor'):
-            workflow_executor = self.rollout._engine.workflow_executor
-        elif hasattr(self.rollout, 'workflow_executor'):
-            workflow_executor = self.rollout.workflow_executor
+        """Clear ALL workflow and data generator caches across every layer."""
+        targets = []
 
-        if workflow_executor is not None and hasattr(workflow_executor, 'data_generator'):
-            delattr(workflow_executor, 'data_generator')
-            logger.info("[MultiEval] Cleared workflow executor cache")
+        # rollout._engine (RolloutController)
+        if hasattr(self.rollout, '_engine'):
+            if hasattr(self.rollout._engine, 'data_generator'):
+                delattr(self.rollout._engine, 'data_generator')
+                targets.append("rollout._engine.data_generator")
+            if hasattr(self.rollout._engine, 'workflow_executor'):
+                we = self.rollout._engine.workflow_executor
+                if hasattr(we, 'data_generator'):
+                    delattr(we, 'data_generator')
+                    targets.append("workflow_executor.data_generator")
 
+        # rollout directly
         if hasattr(self.rollout, 'data_generator'):
             delattr(self.rollout, 'data_generator')
-            logger.info("[MultiEval] Cleared rollout controller data_generator")
+            targets.append("rollout.data_generator")
+
+        if targets:
+            logger.info(f"[MultiEval] Cleared caches: {', '.join(targets)}")
 
     def _normalize_eval_batch(self, eval_batch) -> dict[str, Any]:
-        """Ensure eval_batch is a single dict for downstream processing.
-
-        prepare_batch may return list[dict] depending on the backend path;
-        concat if necessary so that evaluation metrics work uniformly.
-        """
+        """Ensure eval_batch is a single dict for downstream processing."""
         if isinstance(eval_batch, dict):
             return eval_batch
         if isinstance(eval_batch, list):
@@ -367,8 +337,8 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             return batched
         raise TypeError(f"Unexpected eval_batch type: {type(eval_batch)}")
 
-    def _run_single_model_eval(self, label: str, version: int, workflow_class, initial_states, group_size):
-        """Evaluate a single model on initial states with verification."""
+    def _run_single_model_eval(self, label: str, version: int, workflow_class, group_size):
+        """Evaluate a single model with verification (single step, no training)."""
         lora_path = self._eval_models[label]
 
         if not lora_path:
@@ -379,50 +349,36 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             self._load_peft_lora_adapter(self.actor, lora_path)
 
         # Push to vLLM via update_weights (same as training)
-        logger.info(f"[MultiEval-{label}] Pushing LoRA weights to vLLM via update_weights()...")
+        logger.info(f"[MultiEval-{label}] Pushing weights to vLLM via update_weights()...")
         self.rollout.pause()
-        versioned_meta = self.weight_update_meta.with_version(1)
+        versioned_meta = self.weight_update_meta.with_version(version)
         self.actor.update_weights(versioned_meta)
-        self.actor.set_version(1)
-        self.rollout.set_version(1)
+        self.actor.set_version(version)
+        self.rollout.set_version(version)
         if dist.is_initialized():
             dist.barrier(group=self.actor.cpu_group)
         current_platform.synchronize()
         self.rollout.resume()
         logger.info(f"[MultiEval-{label}] Weights pushed and rollout resumed.")
 
-        # Create temp dataloader with initial states only
-        temp_sampler = _InitialStateSampler(initial_states)
-        eval_batch_size = min(len(initial_states), self.config.sampler.batch_size)
-        eval_batch_size = max(eval_batch_size, 1)
-
-        temp_dataloader = create_tttd_dataloader(
-            temp_sampler,
-            rank=self.actor.data_parallel_rank,
-            world_size=self.actor.data_parallel_world_size,
-            batch_size=eval_batch_size,
-            lazy_sampling=False,
-        )
-        logger.info(f"[MultiEval-{label}] Created temporary dataloader with batch size {eval_batch_size}")
-
-        # Create eval workflow with verification
+        # Create eval workflow with verification (same as training)
         eval_kwargs = self._workflow_kwargs.copy()
         eval_kwargs['reward_fn'] = tttd_reward_fn
         eval_workflow = workflow_class(**eval_kwargs)
 
         self._clear_workflow_cache()
 
-        # Run rollout
+        # Run rollout using the SAME dataloader and call signature as training
         eval_start = time.perf_counter()
         try:
             with stats_tracker.record_timing(f"eval_rollout_{label}"):
                 eval_batch = self.actor.prepare_batch(
-                    temp_dataloader,
+                    self.train_dataloader,
                     workflow=eval_workflow,
                     workflow_kwargs=None,
                     should_accept_fn=None,
                     group_size=group_size,
-                    dynamic_bs=False,
+                    dynamic_bs=self.config.dynamic_bs,
                 )
         except Exception as e:
             logger.error(f"[MultiEval-{label}] prepare_batch failed: {e}")
@@ -431,16 +387,17 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             raise
         eval_rollout_time = time.perf_counter() - eval_start
 
-        # Normalize batch (prepare_batch may return list[dict] on some backends)
+        # Normalize batch
         eval_batch = self._normalize_eval_batch(eval_batch)
 
         # Gather results
         if not isinstance(eval_batch, dict):
-            logger.error(f"[MultiEval-{label}] eval_batch is not a dict (type={type(eval_batch).__name__}). Value: {eval_batch}")
+            logger.error(f"[MultiEval-{label}] eval_batch is not a dict (type={type(eval_batch).__name__}).")
             raise TypeError(f"eval_batch must be dict, got {type(eval_batch).__name__}")
         if "rewards" not in eval_batch:
             logger.error(f"[MultiEval-{label}] eval_batch missing 'rewards' key. Keys: {list(eval_batch.keys())}")
             raise KeyError("eval_batch missing 'rewards' key")
+
         local_rollouts = eval_batch["rewards"].shape[0]
         eval_rewards = eval_batch["rewards"].cpu().numpy()
         eval_max_reward = float(eval_rewards.max())
@@ -503,9 +460,10 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         return result
 
     def run_eval(self, workflow_class, workflow_kwargs=None):
-        """Run evaluation on all pre-loaded models."""
+        """Run evaluation on all configured models."""
         config = self.config
 
+        # Setup workflow kwargs (same as training)
         if workflow_kwargs is not None:
             self._workflow_kwargs = workflow_kwargs.copy()
             self._workflow_kwargs['lazy_sampling'] = config.sampler.lazy_puct_sampling
@@ -517,15 +475,7 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         is_dp_head = self.actor.rank == 0
         group_size = config.gconfig.n_samples
 
-        # Get initial states
-        initial_states = self.sampler._initial_states
-        if not initial_states:
-            initial_states = [s for s in self.sampler._states if getattr(s, 'timestep', 0) == 0]
-        if not initial_states:
-            initial_states = self.sampler._states[:1]
-            logger.warning("[MultiEval] No initial states found, using first available state")
-
-        logger.info(f"[MultiEval] Using {len(initial_states)} initial states for evaluation")
+        logger.info(f"[MultiEval] Starting evaluation of {len(self._eval_models)} models: {list(self._eval_models.keys())}")
 
         # Evaluate each model sequentially
         all_results = {}
@@ -533,7 +483,7 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             if dist.is_initialized():
                 dist.barrier()
             all_results[label] = self._run_single_model_eval(
-                label, idx, workflow_class, initial_states, group_size
+                label, idx + 1, workflow_class, group_size
             )
 
         # Save comparison results
@@ -548,7 +498,7 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             logger.info(f"[MultiEval] Comparison results saved to {comparison_path}")
 
             logger.info("\n" + "="*70)
-            logger.info("EVALUATION COMPARISON (Initial States)")
+            logger.info("EVALUATION COMPARISON")
             logger.info("="*70)
             for label in self._eval_models:
                 r = all_results[label]
