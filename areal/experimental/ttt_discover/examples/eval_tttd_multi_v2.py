@@ -82,7 +82,7 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         self.rollout_alloc = ModelAllocation.from_str(config.rollout.backend, name="rollout")
         self._amend_xccl_weight_update_envvar()
 
-        # Create sampler from teacher checkpoint (same as training)
+        # Create sampler from initial state (no teacher checkpoint loading)
         max_head_offpolicyness = getattr(config.rollout, 'max_head_offpolicyness', 2)
         max_version_history = max_head_offpolicyness + 1
         self.is_sync_mode = (max_head_offpolicyness == 0)
@@ -90,28 +90,15 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             config.sampler.lazy_puct_sampling = False
 
         teacher_sampler_config = copy.deepcopy(config.sampler)
-        if config.teacher_sampler_checkpoint:
-            teacher_sampler_config.checkpoint_dir = config.teacher_sampler_checkpoint
+        import tempfile
+        teacher_sampler_config.checkpoint_dir = tempfile.mkdtemp(prefix="eval_fresh_sampler_")
 
         self.sampler = create_sampler_from_config(
             config=teacher_sampler_config,
             env_type=getattr(config.sampler, 'env_type', 'ac1'),
             max_version_history=max_version_history,
         )
-        if config.teacher_sampler_checkpoint:
-            latest_step = _find_latest_sampler_step(
-                config.teacher_sampler_checkpoint,
-                getattr(config.sampler, 'type', 'puct')
-            )
-            if latest_step is not None:
-                logger.info(f"[TeacherSampler] Loading latest checkpoint at step {latest_step}")
-                self.sampler._load(latest_step)
-                self.sampler._current_step = 0
-            else:
-                logger.warning(
-                    f"[TeacherSampler] No checkpoint found in {config.teacher_sampler_checkpoint}. "
-                    f"Using fresh sampler state."
-                )
+        
 
         logger.info(
             f"[TeacherSampler] Loaded {len(self.sampler._states)} states, "
@@ -124,7 +111,7 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         self.ref = None
 
         # Create dataloader (same as training)
-        self.train_dataloader = create_tttd_dataloader(
+        self.train_dataloader = create_tttd_datalooader(
             state_sampler=self.sampler,
             rank=self.actor.data_parallel_rank,
             world_size=self.actor.data_parallel_world_size,
@@ -404,6 +391,12 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         eval_mean_reward = float(eval_rewards.mean())
         local_rewards_list = eval_rewards.tolist()
 
+        # Pause rollout and sync GPU before PyTorch NCCL collectives to avoid
+        # NCCL/GIL deadlock with vLLM backend threads.
+        self.rollout.pause()
+        current_platform.synchronize()
+        torch.cuda.synchronize()
+
         if dist.is_initialized():
             local_max = torch.tensor([eval_max_reward], dtype=torch.float32, device=self.actor.device)
             local_sum = torch.tensor([eval_rewards.sum()], dtype=torch.float32, device=self.actor.device)
@@ -457,6 +450,7 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             f"children={len(eval_children)}, failed={len(eval_failed)}"
         )
 
+        self.rollout.resume()
         return result
 
     def run_eval(self, workflow_class, workflow_kwargs=None):
@@ -527,12 +521,6 @@ class TTTDMultiEvalTrainer(PPOTrainer):
 def main(args):
     """Main evaluation function."""
     config, _ = load_expr_config(args, TTTDDistillConfig)
-
-    if not config.teacher_sampler_checkpoint:
-        raise ValueError(
-            "teacher_sampler_checkpoint must be provided. "
-            "Add +teacher_sampler_checkpoint=<path> to your command."
-        )
 
     if config.tokenizer_path:
         from areal.utils.hf_utils import load_hf_tokenizer
