@@ -111,7 +111,7 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         self.ref = None
 
         # Create dataloader (same as training)
-        self.train_dataloader = create_tttd_datalooader(
+        self.train_dataloader = create_tttd_dataloader(
             state_sampler=self.sampler,
             rank=self.actor.data_parallel_rank,
             world_size=self.actor.data_parallel_world_size,
