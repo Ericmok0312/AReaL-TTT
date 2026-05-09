@@ -408,10 +408,18 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             eval_mean_reward = (local_sum / local_count).item() if local_count.item() > 0 else 0.0
             global_rollouts = int(local_count.item())
 
-            world_size = self.actor.data_parallel_world_size
-            all_rewards_gathered = [None] * world_size
-            dist.all_gather_object(all_rewards_gathered, local_rewards_list)
-            all_rewards_list = [r for rank_rewards in all_rewards_gathered for r in rank_rewards]
+            # Write per-rank rewards to disk instead of all_gather_object
+            # to avoid NCCL hang with large Python objects.
+            rank = self.actor.data_parallel_rank
+            local_rewards_path = os.path.join(
+                self.config.saver.fileroot,
+                f"eval_rewards_{label}_rank{rank}.json"
+            )
+            os.makedirs(self.config.saver.fileroot, exist_ok=True)
+            with open(local_rewards_path, 'w') as f:
+                json.dump(local_rewards_list, f)
+
+            all_rewards_list = local_rewards_list  # rank 0 merges from files later
         else:
             global_rollouts = local_rollouts
             all_rewards_list = local_rewards_list
@@ -479,6 +487,20 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             all_results[label] = self._run_single_model_eval(
                 label, idx , workflow_class, group_size
             )
+
+        # Merge per-rank reward files on rank 0
+        if is_dp_head and dist.is_initialized():
+            for label in self._eval_models:
+                merged_rewards = []
+                for rank in range(self.actor.data_parallel_world_size):
+                    rewards_path = os.path.join(
+                        config.saver.fileroot,
+                        f"eval_rewards_{label}_rank{rank}.json"
+                    )
+                    if os.path.exists(rewards_path):
+                        with open(rewards_path, 'r') as f:
+                            merged_rewards.extend(json.load(f))
+                all_results[label]["all_rewards"] = merged_rewards
 
         # Save comparison results
         if is_dp_head:
