@@ -162,11 +162,20 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         # Determine which models to evaluate
         eval_models = getattr(config, 'eval_models', None)
         if eval_models is None:
+            eval_ckpt_dir = os.path.join(config.saver.fileroot, "eval_checkpoints")
+            teacher_path = getattr(config, 'teacher_lora_path', None)
+            if teacher_path is None:
+                teacher_path = config.teacher_path
+            student_path = getattr(config, 'student_lora_path', None)
+            if student_path is None and os.path.isdir(os.path.join(eval_ckpt_dir, "student")):
+                student_path = os.path.join(eval_ckpt_dir, "student")
             eval_models = {
-                "teacher": getattr(config, 'teacher_lora_path', config.teacher_path),
-                "student": getattr(config, 'student_lora_path', None),
+                "baseline": None,  # Pure base model (no LoRA adapter)
+                "teacher": teacher_path,
+                "student": student_path,
             }
-        eval_models = {k: v for k, v in eval_models.items() if v}
+        # Keep baseline even when its path is None/empty; filter out other null paths
+        eval_models = {k: v for k, v in eval_models.items() if v is not None or k == "baseline"}
         if not eval_models:
             raise ValueError("No evaluation models found. Set teacher_path / student_lora_path or eval_models.")
         self._eval_models = eval_models
@@ -248,6 +257,16 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             train_batch_size=config.sampler.batch_size,
         )
         self.stats_logger = StatsLogger(config, ft_spec)
+
+    def _zero_lora_weights(self, engine):
+        """Zero out all LoRA parameters so the model behaves like the pure base model."""
+        logger.info("[LoadAdapter] Zeroing out LoRA weights for base model evaluation")
+        n_zeroed = 0
+        for name, param in engine.model.named_parameters():
+            if "lora_A" in name or "lora_B" in name:
+                param.data.zero_()
+                n_zeroed += 1
+        logger.info(f"[LoadAdapter] Zeroed {n_zeroed} LoRA parameters")
 
     def _load_peft_lora_adapter(self, engine, path: str):
         """Load a PEFT LoRA adapter checkpoint into the FSDP-wrapped actor.
@@ -351,10 +370,13 @@ class TTTDMultiEvalTrainer(PPOTrainer):
     def _run_single_model_eval(self, label: str, version: int, workflow_class, initial_states, group_size):
         """Evaluate a single model on initial states with verification."""
         lora_path = self._eval_models[label]
-        logger.info(f"[MultiEval-{label}] Loading LoRA from {lora_path}")
 
-        # Load LoRA adapter into actor
-        self._load_peft_lora_adapter(self.actor, lora_path)
+        if not lora_path:
+            logger.info(f"[MultiEval-{label}] Evaluating pure base model (no LoRA adapter)")
+            self._zero_lora_weights(self.actor)
+        else:
+            logger.info(f"[MultiEval-{label}] Loading LoRA from {lora_path}")
+            self._load_peft_lora_adapter(self.actor, lora_path)
 
         # Push to vLLM via update_weights (same as training)
         logger.info(f"[MultiEval-{label}] Pushing LoRA weights to vLLM via update_weights()...")
