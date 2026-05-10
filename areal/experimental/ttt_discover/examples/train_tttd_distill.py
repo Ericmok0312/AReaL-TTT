@@ -459,6 +459,15 @@ class TTTDDistillTrainer(PPOTrainer):
         """
         config = self.config
 
+        # Determine starting step from recovery info
+        start_step = (
+            self.recover_info.last_step_info.next().global_step
+            if getattr(self, 'recover_info', None) is not None
+            else 0
+        )
+        if start_step > 0:
+            logger.info(f"[Distill] Resuming from step {start_step} (recovered)")
+
         # Update workflow kwargs with sampler and DP info
         if workflow_kwargs is not None:
             self._workflow_kwargs = workflow_kwargs.copy()
@@ -485,7 +494,7 @@ class TTTDDistillTrainer(PPOTrainer):
 
         logger.info(
             f"[Distill] Starting distillation: "
-            f"max_steps={config.max_steps}, "
+            f"max_steps={config.max_steps}, start_step={start_step}, "
             f"total_rollouts_per_step={total_rollouts}, "
             f"distill_loss_weight={config.teacher.distill_loss_weight if config.teacher else 'N/A'}"
         )
@@ -493,8 +502,7 @@ class TTTDDistillTrainer(PPOTrainer):
         # =====================================================================
         # Phase 1: Distillation steps (no verification)
         # =====================================================================
-        for step_idx in range(config.max_steps):
-            global_step = step_idx
+        for global_step in range(start_step, config.max_steps):
             logger.info(f"[Distill][Step {global_step}] Starting distill step")
 
             step_start_time = time.perf_counter()
@@ -692,6 +700,13 @@ class TTTDDistillTrainer(PPOTrainer):
             logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] Before _save_recover_checkpoint")
             self._save_recover_checkpoint(epoch=global_step, epoch_step=global_step, global_step=global_step)
             logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] After _save_recover_checkpoint")
+
+            # Save dynamic metrics checkpoint after each step (for crash recovery)
+            if hasattr(self, 'dynamic_metrics_logger') and self.dynamic_metrics_logger is not None:
+                try:
+                    self.dynamic_metrics_logger.save_checkpoint()
+                except Exception as e:
+                    logger.warning(f"[Distill][Step {global_step}] Failed to save dynamic metrics checkpoint: {e}")
 
             logger.info(f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] Before dist.barrier")
             dist.barrier(group=self.actor.cpu_group)
