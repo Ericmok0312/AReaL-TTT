@@ -980,7 +980,10 @@ class TTTDDistillTrainer(PPOTrainer):
                 lmask = loss_mask[i : i + 1].to(device)
 
                 with torch.no_grad():
-                    out = engine.model(input_ids=ids, attention_mask=mask)
+                    # CRITICAL: use_cache=False avoids allocating KV cache,
+                    # which saves hundreds of MB per forward and prevents
+                    # cumulative memory fragmentation across steps.
+                    out = engine.model(input_ids=ids, attention_mask=mask, use_cache=False)
                     logits = out.logits.squeeze(0)  # [seqlen, vocab]
 
                 active = lmask.squeeze(0) > 0
@@ -1022,6 +1025,11 @@ class TTTDDistillTrainer(PPOTrainer):
                 all_token_logps.append(seq_token_logps)
 
                 del out, logits, active_logits, active
+
+                # Periodically clear CUDA cache to prevent memory fragmentation
+                # from accumulating across samples within the same step.
+                if i % 8 == 7:
+                    torch.cuda.empty_cache()
 
             if not entropies:
                 return None, None, None, None
