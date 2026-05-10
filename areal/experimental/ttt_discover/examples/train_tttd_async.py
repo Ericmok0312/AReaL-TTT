@@ -11,7 +11,8 @@ with the TTT-Discover workflow. Key features:
 - Distributed sampler synchronization across DP ranks
 
 Usage:
-    python train_tttd_async.py --config conf/fsdp_lora_vllm_ac1_qwen3_8b_async.yaml
+    python -m areal.infra.launcher.local \
+        areal/experimental/ttt_discover/examples/conf/fsdp_lora_vllm_ac1_qwen3_8b_async.yaml
 """
 
 import sys

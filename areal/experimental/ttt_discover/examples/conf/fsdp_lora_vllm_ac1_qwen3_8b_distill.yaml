@@ -130,7 +130,7 @@ rollout:
   backend: vllm:d4p1t1
 
 gconfig:
-  n_samples: 32
+  n_samples: 16
   min_new_tokens: 0
   max_new_tokens: 32768
   max_tokens: 32768
@@ -174,7 +174,7 @@ vllm:
 
 sampler:
   type: puct
-  batch_size: 16
+  batch_size: 32
   c_puct: 1.0
   gamma: 0.95
   max_children: 100

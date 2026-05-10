@@ -11,7 +11,8 @@ This script distills a teacher model's policy into a student model with LoRA:
 6. Run N distill steps and save student checkpoint
 
 Usage:
-    python train_tttd_distill.py --config conf/distill_lora_vllm_cp_qwen3_8b.yaml
+    python -m areal.infra.launcher.local \
+        areal/experimental/ttt_discover/examples/conf/fsdp_lora_vllm_ac1_qwen3_8b_distill.yaml
 """
 
 import copy
