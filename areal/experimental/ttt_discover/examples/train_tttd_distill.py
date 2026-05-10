@@ -736,6 +736,7 @@ class TTTDDistillTrainer(PPOTrainer):
             student_logp = None
             if self.teacher is not None:
                 try:
+                    torch.cuda.empty_cache()
                     dynamic_metrics, teacher_logp, student_logp = (
                         self._compute_dynamic_metrics_and_logps(rollout_batch, k=16)
                     )
@@ -749,6 +750,7 @@ class TTTDDistillTrainer(PPOTrainer):
                 if teacher_logp is not None:
                     rollout_batch["teacher_logp"] = teacher_logp
                 else:
+                    torch.cuda.empty_cache()
                     with torch.no_grad():
                         teacher_logps = self.teacher.compute_logp([rollout_batch])
                     rollout_batch["teacher_logp"] = teacher_logps[0]
@@ -759,6 +761,7 @@ class TTTDDistillTrainer(PPOTrainer):
                 if student_logp is not None:
                     rollout_batch["prox_logp"] = student_logp
                 else:
+                    torch.cuda.empty_cache()
                     prox_logps = self.actor.compute_logp([rollout_batch])
                     rollout_batch["prox_logp"] = prox_logps[0]
 
