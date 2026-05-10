@@ -727,11 +727,6 @@ class TTTDDistillTrainer(PPOTrainer):
                 steps_per_epoch=config.max_steps,
             )
 
-            # =====================================================================
-            # TEMP: skip dynamic metrics to diagnose OOM
-            # =====================================================================
-            dynamic_metrics = {}
-
             # Compute teacher logp (native AReaL KDRL path)
             if self.teacher is not None:
                 torch.cuda.empty_cache()
@@ -746,6 +741,26 @@ class TTTDDistillTrainer(PPOTrainer):
                 torch.cuda.empty_cache()
                 prox_logps = self.actor.compute_logp([rollout_batch])
                 rollout_batch["prox_logp"] = prox_logps[0]
+
+            # Compute advantages using TTTDActor (native AReaL logic)
+            rollout_batch = self.actor.compute_advantages(rollout_batch)
+
+            # PPO update: automatically handles KD loss when teacher_logp is present
+            self.actor.ppo_update([rollout_batch])
+            self.actor.step_lr_scheduler()
+
+            # =====================================================================
+            # Compute dynamic metrics AFTER ppo_update so OOM here doesn't block training
+            # =====================================================================
+            dynamic_metrics = {}
+            if self.teacher is not None:
+                try:
+                    torch.cuda.empty_cache()
+                    dynamic_metrics = self._compute_dynamic_metrics(rollout_batch, k=16)
+                except Exception as e:
+                    logger.warning(
+                        f"[Distill][Step {global_step}] Failed to compute dynamic metrics: {e}"
+                    )
 
             # All-reduce dynamic metrics across DP ranks (weighted by token count)
             if dist.is_initialized() and dynamic_metrics:
@@ -769,13 +784,6 @@ class TTTDDistillTrainer(PPOTrainer):
                     )
                 except Exception as e:
                     logger.warning(f"[Distill][Step {global_step}] Failed to record dynamic metrics to logger: {e}")
-
-            # Compute advantages using TTTDActor (native AReaL logic)
-            rollout_batch = self.actor.compute_advantages(rollout_batch)
-
-            # PPO update: automatically handles KD loss when teacher_logp is present
-            self.actor.ppo_update([rollout_batch])
-            self.actor.step_lr_scheduler()
 
             # Export training stats
             stats = self.actor.export_stats()
@@ -935,6 +943,19 @@ class TTTDDistillTrainer(PPOTrainer):
             self.config.recover.fileroot,
         )
         recover_info.dump(recover_info_path)
+
+    def _compute_dynamic_metrics(
+        self, rollout_batch: dict[str, Any], k: int = 16
+    ) -> dict[str, float]:
+        """Compute dynamic metrics (overlap ratio, advantage, entropy gap).
+
+        Lightweight wrapper around _compute_dynamic_metrics_and_logps that
+        discards the per-token logp tensors and returns only the scalar metrics.
+        """
+        metrics, _t_logp, _s_logp = self._compute_dynamic_metrics_and_logps(
+            rollout_batch, k=k
+        )
+        return metrics
 
     def _compute_dynamic_metrics_and_logps(
         self, rollout_batch: dict[str, Any], k: int = 16
