@@ -728,42 +728,24 @@ class TTTDDistillTrainer(PPOTrainer):
             )
 
             # =====================================================================
-            # Compute dynamic metrics AND per-token logps in one forward pass
-            # (avoids redundant teacher.compute_logp + actor.compute_logp)
+            # TEMP: skip dynamic metrics to diagnose OOM
             # =====================================================================
             dynamic_metrics = {}
-            teacher_logp = None
-            student_logp = None
-            if self.teacher is not None:
-                try:
-                    torch.cuda.empty_cache()
-                    dynamic_metrics, teacher_logp, student_logp = (
-                        self._compute_dynamic_metrics_and_logps(rollout_batch, k=16)
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"[Distill][Step {global_step}] Failed to compute dynamic metrics: {e}"
-                    )
 
-            # Use extracted logps; fall back to compute_logp if extraction failed
+            # Compute teacher logp (native AReaL KDRL path)
             if self.teacher is not None:
-                if teacher_logp is not None:
-                    rollout_batch["teacher_logp"] = teacher_logp
-                else:
-                    torch.cuda.empty_cache()
-                    with torch.no_grad():
-                        teacher_logps = self.teacher.compute_logp([rollout_batch])
-                    rollout_batch["teacher_logp"] = teacher_logps[0]
+                torch.cuda.empty_cache()
+                with torch.no_grad():
+                    teacher_logps = self.teacher.compute_logp([rollout_batch])
+                rollout_batch["teacher_logp"] = teacher_logps[0]
                 rollout_batch["rl_loss_weight"] = self.config.teacher.rl_loss_weight
                 rollout_batch["distill_loss_weight"] = self.config.teacher.distill_loss_weight
 
+            # Compute prox_logp if needed
             if config.actor.should_compute_prox_logp():
-                if student_logp is not None:
-                    rollout_batch["prox_logp"] = student_logp
-                else:
-                    torch.cuda.empty_cache()
-                    prox_logps = self.actor.compute_logp([rollout_batch])
-                    rollout_batch["prox_logp"] = prox_logps[0]
+                torch.cuda.empty_cache()
+                prox_logps = self.actor.compute_logp([rollout_batch])
+                rollout_batch["prox_logp"] = prox_logps[0]
 
             # All-reduce dynamic metrics across DP ranks (weighted by token count)
             if dist.is_initialized() and dynamic_metrics:
