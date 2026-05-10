@@ -987,7 +987,8 @@ class TTTDDistillTrainer(PPOTrainer):
                     logits = out.logits.squeeze(0)  # [seqlen, vocab]
 
                 active = lmask.squeeze(0) > 0
-                seq_token_logps = torch.zeros(seqlen, dtype=torch.float32, device=device)
+                # Build token logps on CPU to avoid holding GPU memory across sequences
+                seq_token_logps = torch.zeros(seqlen, dtype=torch.float32)
 
                 if not active.any():
                     del out, logits
@@ -1009,7 +1010,7 @@ class TTTDDistillTrainer(PPOTrainer):
                     chunk_token_logp = log_probs.gather(
                         dim=-1, index=chunk_input_ids.unsqueeze(-1)
                     ).squeeze(-1)
-                    token_logps.append(chunk_token_logp)
+                    token_logps.append(chunk_token_logp.cpu())
 
                     entropy = -(log_probs.exp() * log_probs).sum(-1)
                     entropies.append(entropy.cpu())
@@ -1020,7 +1021,7 @@ class TTTDDistillTrainer(PPOTrainer):
 
                     del chunk_logits, log_probs, entropy, tk_logp, tk_idx
 
-                active_positions = torch.where(active)[0]
+                active_positions = torch.where(active)[0].cpu()
                 seq_token_logps[active_positions] = torch.cat(token_logps)
                 all_token_logps.append(seq_token_logps)
 
@@ -1037,7 +1038,7 @@ class TTTDDistillTrainer(PPOTrainer):
                 torch.cat(topk_indices),
                 torch.cat(topk_logps),
                 torch.cat(entropies),
-                torch.stack(all_token_logps),  # [n, seqlen]
+                torch.stack(all_token_logps).to(device),  # [n, seqlen]
             )
 
         s_idx, s_logp, s_ent, s_token_logp = _get_topk_entropy_and_logp(
