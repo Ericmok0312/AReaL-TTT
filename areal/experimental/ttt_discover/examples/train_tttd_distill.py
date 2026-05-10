@@ -17,6 +17,7 @@ Usage:
 import copy
 import json
 import os
+import queue
 import sys
 import time
 from typing import Any
@@ -408,6 +409,158 @@ class TTTDDistillTrainer(PPOTrainer):
         )
 
         self._config_perf_tracer()
+
+        # Clear stale state after recovery (critical for correct staleness capacity)
+        self._clear_stale_state_after_recovery()
+
+    def _get_dispatcher(self):
+        """Get dispatcher from rollout (handles both RolloutController and RemotevLLMEngine)."""
+        if hasattr(self.rollout, 'dispatcher'):
+            return self.rollout.dispatcher
+        if hasattr(self.rollout, '_engine') and hasattr(self.rollout._engine, 'workflow_executor'):
+            return self.rollout._engine.workflow_executor._dispatcher
+        if hasattr(self.rollout, 'workflow_executor'):
+            return self.rollout.workflow_executor._dispatcher
+        return None
+
+    def _clear_stale_state_after_recovery(self):
+        """Clear stale state after recovery to fix staleness manager capacity calculation."""
+        is_dp_head = self.actor.rank == 0
+
+        if self.recover_info:
+            start_step = self.recover_info.last_step_info.next().global_step
+
+            if is_dp_head:
+                logger.info(f"[Resume] Cleaning up stale state for step {start_step}")
+
+            dispatcher = self._get_dispatcher()
+            workflow_executor = self._get_workflow_executor()
+
+            if dispatcher is not None:
+                # 1. Clear _pending_inputs
+                with dispatcher._input_lock:
+                    stale_inputs = len(dispatcher._pending_inputs)
+                    if stale_inputs > 0:
+                        dispatcher._pending_inputs.clear()
+                        if is_dp_head:
+                            logger.info(f"[Resume] Cleared {stale_inputs} stale pending inputs")
+
+                # 2. Clear AsyncTaskRunner queues
+                runner = dispatcher.runner
+                queue_cleared = 0
+                for q in [runner.input_queue, runner.output_queue]:
+                    while not q.empty():
+                        try:
+                            q.get_nowait()
+                            queue_cleared += 1
+                        except queue.Empty:
+                            break
+                if is_dp_head and queue_cleared > 0:
+                    logger.info(f"[Resume] Cleared {queue_cleared} items from async task queues")
+
+                # 3. CRITICAL: Fix accepted count for staleness capacity calculation
+                # Normal training: accepted = step * consumer_batch_size at each step start
+                # Recovery: version = start_step, so accepted should be start_step * consumer_batch_size
+                sm = dispatcher.staleness_manager
+                with sm.lock:
+                    consumer_bs = sm.consumer_batch_size
+                    completed_steps = start_step
+                    expected_accepted = completed_steps * consumer_bs
+
+                    old_accepted = sm.rollout_stat.accepted
+                    old_running = sm.rollout_stat.running
+                    old_enqueued = sm.rollout_stat.enqueued
+
+                    sm.rollout_stat.running = 0
+                    sm.rollout_stat.enqueued = 0
+
+                    if old_accepted != expected_accepted:
+                        sm.rollout_stat.accepted = expected_accepted
+                        if is_dp_head:
+                            logger.info(
+                                f"[Resume] Fixed accepted count: {old_accepted} -> {expected_accepted} "
+                                f"(expected after {completed_steps} completed steps, consumer_batch_size={consumer_bs})"
+                            )
+                    elif is_dp_head:
+                        logger.info(f"[Resume] accepted count is correct: {old_accepted}")
+
+                    version = self.rollout.get_version()
+                    max_staleness = sm.max_staleness
+                    capacity = (max_staleness + version + 1) * consumer_bs - sm.rollout_stat.accepted
+                    if is_dp_head:
+                        logger.info(
+                            f"[Resume] staleness_capacity = ({max_staleness} + {version} + 1) * {consumer_bs} - "
+                            f"{sm.rollout_stat.accepted} = {capacity}"
+                        )
+
+                # 4. Clear _pending_results
+                with dispatcher._result_lock:
+                    stale_results = len(dispatcher._pending_results)
+                    if stale_results > 0:
+                        dispatcher._pending_results.clear()
+                        dispatcher._active_task_ids.clear()
+                        if is_dp_head:
+                            logger.info(f"[Resume] Cleared {stale_results} stale pending results")
+
+            # 5. Clear data_generator cache
+            if workflow_executor is not None and hasattr(workflow_executor, 'data_generator'):
+                delattr(workflow_executor, 'data_generator')
+                if is_dp_head:
+                    logger.info("[Resume] Cleared data generator cache")
+
+            # 6. Clear workflow internal state (staleness tracker, etc.)
+            self._clear_workflow_state_after_recovery(start_step)
+
+            if is_dp_head:
+                logger.info(f"[Resume] Ready to start from step {start_step}")
+
+    def _clear_workflow_state_after_recovery(self, start_step: int):
+        """Clear workflow internal state after recovery.
+
+        This clears all transient state that should not persist across resumes:
+        - Scheme 1 batch tracking
+        - Staleness tracker (incomplete rollouts from old version)
+        - Parent episodes
+        """
+        is_dp_head = self.actor.rank == 0
+
+        workflow_executor = self._get_workflow_executor()
+        if workflow_executor is None:
+            return
+
+        workflow = None
+        if hasattr(workflow_executor, 'workflow'):
+            workflow = workflow_executor.workflow
+        elif hasattr(workflow_executor, '_workflow'):
+            workflow = workflow_executor._workflow
+
+        if workflow is None:
+            return
+
+        cleared_items = []
+
+        if hasattr(workflow, '_current_batch_parent_ids'):
+            stale_count = len(workflow._current_batch_parent_ids)
+            if stale_count > 0:
+                workflow._current_batch_parent_ids.clear()
+                workflow._expected_batch_size = 0
+                workflow._expected_n_samples = 0
+                cleared_items.append(f"scheme1_batch({stale_count})")
+
+        if hasattr(workflow, '_staleness_tracker'):
+            stale_count = len(workflow._staleness_tracker)
+            if stale_count > 0:
+                workflow._staleness_tracker.clear()
+                cleared_items.append(f"staleness_tracker({stale_count})")
+
+        if hasattr(workflow, '_parent_episodes'):
+            stale_count = len(workflow._parent_episodes)
+            if stale_count > 0:
+                workflow._parent_episodes.clear()
+                cleared_items.append(f"parent_episodes({stale_count})")
+
+        if cleared_items and is_dp_head:
+            logger.info(f"[Resume] Cleared workflow state: {', '.join(cleared_items)}")
 
     def _get_workflow_executor(self):
         """Get workflow executor from rollout."""
