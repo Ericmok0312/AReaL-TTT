@@ -122,6 +122,10 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         self.valid_dataloader = None
         self.valid_dataset = None
 
+        # Align rollout consumer_batch_size with eval batch size so staleness
+        # manager capacity matches the actual dataloader batch size.
+        config.rollout.consumer_batch_size = config.eval_batch_size
+
         # Initialize rollout engine (same as training)
         self.rollout = self._init_rollout(config.rollout, is_eval=False)
 
