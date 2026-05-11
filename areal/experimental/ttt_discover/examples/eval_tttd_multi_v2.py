@@ -359,11 +359,14 @@ class TTTDMultiEvalTrainer(PPOTrainer):
 
         self._clear_workflow_cache()
 
-        # Run rollout using the SAME dataloader and call signature as training
+        # Run rollout via the inference engine directly (bypassing actor's
+        # DistRolloutCoordinator) to avoid the all-gather across DP ranks that
+        # causes NCCL hangs when ranks finish at vastly different times due to
+        # execution timeouts.
         eval_start = time.perf_counter()
         try:
             with stats_tracker.record_timing(f"eval_rollout_{label}"):
-                eval_batch = self.actor.prepare_batch(
+                eval_batch = self.rollout.prepare_batch(
                     self.train_dataloader,
                     workflow=eval_workflow,
                     workflow_kwargs=None,
