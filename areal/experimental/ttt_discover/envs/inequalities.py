@@ -333,7 +333,7 @@ class InequalitiesEnv(BaseEnv):
         log_dir: str = "/tmp/ttt_logs",
         num_cpus: int = 2,
         memory_threshold: float = 0.60,
-        max_memory_mb: int = 2048,
+        max_memory_mb: int = 4096,
     ):
         self.problem_type = problem_type
         self.budget_s = budget_s
