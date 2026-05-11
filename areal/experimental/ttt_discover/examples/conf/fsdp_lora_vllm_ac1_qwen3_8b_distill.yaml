@@ -244,3 +244,7 @@ perf_tracer:
 
 teacher_lora_path: ${teacher.path}
 student_lora_path: ${cluster.fileroot}/eval_checkpoints/student
+
+# Evaluation-specific batch/group sizes (only used by eval_tttd_multi_v2.py)
+eval_batch_size: 8
+eval_group_size: 64

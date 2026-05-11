@@ -306,7 +306,14 @@ class TTTDDistillConfig(TTTDPPOConfig):
         default="",
         metadata={"help": "Path to student LoRA adapter for eval"},
     )
-
+    eval_batch_size: int = field(
+        default=8,
+        metadata={"help": "Batch size for evaluation (number of initial states to sample). Defaults to 8."},
+    )
+    eval_group_size: int = field(
+        default=64,
+        metadata={"help": "Group size for evaluation (number of samples per initial state). Defaults to 64."},
+    )
 
 
 # Import envs here to avoid circular imports

@@ -110,12 +110,12 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         self.actor = self._create_tttd_actor(config.actor)
         self.ref = None
 
-        # Create dataloader (same as training)
+        # Create dataloader for evaluation (use eval_batch_size)
         self.train_dataloader = create_tttd_dataloader(
             state_sampler=self.sampler,
             rank=self.actor.data_parallel_rank,
             world_size=self.actor.data_parallel_world_size,
-            batch_size=config.sampler.batch_size,
+            batch_size=config.eval_batch_size,
             lazy_sampling=config.sampler.lazy_puct_sampling,
         )
         self.train_dataset = self.train_dataloader.dataset
@@ -171,8 +171,8 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         """Initialize training engines."""
         ft_spec = FinetuneSpec(
             total_train_epochs=1,
-            dataset_size=self.config.sampler.batch_size,
-            train_batch_size=self.config.sampler.batch_size,
+            dataset_size=self.config.eval_batch_size,
+            train_batch_size=self.config.eval_batch_size,
         )
         self.actor.initialize(addr=None, ft_spec=ft_spec, alloc_mode=self.allocation_mode, role="actor")
 
@@ -219,8 +219,8 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         config = self.config
         ft_spec = FinetuneSpec(
             total_train_epochs=1,
-            dataset_size=config.sampler.batch_size,
-            train_batch_size=config.sampler.batch_size,
+            dataset_size=config.eval_batch_size,
+            train_batch_size=config.eval_batch_size,
         )
         self.stats_logger = StatsLogger(config, ft_spec)
 
@@ -475,7 +475,7 @@ class TTTDMultiEvalTrainer(PPOTrainer):
                 self._workflow_kwargs['dp_world_size'] = self.actor.data_parallel_world_size
 
         is_dp_head = self.actor.rank == 0
-        group_size = config.gconfig.n_samples
+        group_size = config.eval_group_size
 
         logger.info(f"[MultiEval] Starting evaluation of {len(self._eval_models)} models: {list(self._eval_models.keys())}")
 
@@ -557,8 +557,8 @@ def main(args):
     from areal.api.alloc_mode import _AllocationMode as AllocationMode
     alloc_mode = AllocationMode.from_str(config.allocation_mode)
     train_world_size = alloc_mode.train.world_size
-    local_batch_size = config.sampler.batch_size // train_world_size
-    group_size = config.gconfig.n_samples
+    local_batch_size = config.eval_batch_size // train_world_size
+    group_size = config.eval_group_size
 
     workflow_kwargs = dict(
         env=env,
