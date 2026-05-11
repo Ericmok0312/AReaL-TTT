@@ -1016,6 +1016,14 @@ class TTTDDistillTrainer(PPOTrainer):
 
         privileged_states = self.teacher_sampler.sample_states(num_groups)
 
+        # Log sampled privileged state values for debugging
+        for i, state in enumerate(privileged_states):
+            logger.info(
+                f"[PrivilegedOPD] Sampled state {i}/{num_groups}: "
+                f"value={state.value:.4f}, timestep={state.timestep}, "
+                f"id={state.id[:8] if hasattr(state.id, '__len__') and len(state.id) > 8 else state.id}"
+            )
+
         # ------------------------------------------------------------------
         # 2. Build privileged prompts and tokenize
         # ------------------------------------------------------------------
