@@ -15,7 +15,7 @@ gurobipy
 Mosek
 cylp
 PuLP
-ortools
+ortools<9.15.0
 xpress
 xpresslibs
 networkx
