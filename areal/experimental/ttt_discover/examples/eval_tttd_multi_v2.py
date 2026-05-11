@@ -563,6 +563,10 @@ def main(args):
     train_world_size = alloc_mode.train.world_size
     local_batch_size = config.eval_batch_size // train_world_size
     group_size = config.eval_group_size
+    # Align gconfig.n_samples with eval_group_size so the workflow's internal
+    # expected_children tracking (used for staleness / batch completion) matches
+    # the actual number of rollouts prepared by the actor.
+    config.gconfig.n_samples = group_size
 
     workflow_kwargs = dict(
         env=env,
