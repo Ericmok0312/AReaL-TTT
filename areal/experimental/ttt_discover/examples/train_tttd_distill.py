@@ -118,13 +118,10 @@ class TTTDDistillTrainer(PPOTrainer):
         self._amend_xccl_weight_update_envvar()
 
         # =====================================================================
-        # Load teacher PUCTSampler from teacher checkpoint
+        # Create TWO samplers:
+        #   - student_sampler: fresh, only initial states (for student rollout)
+        #   - teacher_sampler: loaded from teacher checkpoint (for privileged OPD)
         # =====================================================================
-        # max_version_history controls how many historical PUCT snapshots the
-        # sampler keeps. In async mode (max_head_offpolicyness > 0), old
-        # rollouts may return after several training steps, so we need to keep
-        # snapshots of past PUCT states. In sync mode (max_head_offpolicyness=0),
-        # rollout and training are synchronized, so only 1 version is needed.
         max_head_offpolicyness = getattr(config.rollout, 'max_head_offpolicyness', 2)
         max_version_history = max_head_offpolicyness + 1
 
@@ -137,19 +134,17 @@ class TTTDDistillTrainer(PPOTrainer):
             )
             config.sampler.lazy_puct_sampling = False
 
-        # Create sampler using student's config but teacher's checkpoint dir
-        # We use the teacher's checkpoint directory so we can load its state
+        # --- Teacher sampler: loaded from checkpoint, used for privileged OPD ---
         teacher_sampler_config = copy.deepcopy(config.sampler)
         if config.teacher_sampler_checkpoint:
             teacher_sampler_config.checkpoint_dir = config.teacher_sampler_checkpoint
 
-        self.sampler = create_sampler_from_config(
+        self.teacher_sampler = create_sampler_from_config(
             config=teacher_sampler_config,
             env_type=getattr(config.sampler, 'env_type', 'ac1'),
             max_version_history=max_version_history,
         )
 
-        # Load the latest teacher sampler state
         if config.teacher_sampler_checkpoint:
             latest_step = _find_latest_sampler_step(
                 config.teacher_sampler_checkpoint,
@@ -157,23 +152,49 @@ class TTTDDistillTrainer(PPOTrainer):
             )
             if latest_step is not None:
                 logger.info(f"[TeacherSampler] Loading latest checkpoint at step {latest_step}")
-                self.sampler._load(latest_step)
-                # Reset the sampler's internal step counter to avoid confusion
-                self.sampler._current_step = 0
+                self.teacher_sampler._load(latest_step)
+                self.teacher_sampler._current_step = 0
             else:
                 logger.warning(
                     f"[TeacherSampler] No checkpoint found in {config.teacher_sampler_checkpoint}. "
                     f"Using fresh sampler state."
                 )
 
-        # Distillation: use parent_pool sampling by default (random from all teacher-explored parents)
-        self.sampler.sampling_strategy = getattr(config.sampler, 'sampling_strategy', 'parent_pool')
+        # Teacher sampler always uses puct for high-value state selection
+        self.teacher_sampler.sampling_strategy = "puct"
         logger.info(
-            f"[TeacherSampler] Loaded {len(self.sampler._states)} states, "
-            f"T={self.sampler._T}, n_entries={len(self.sampler._n)}, "
-            f"m_entries={len(self.sampler._m)}, "
-            f"sampling_strategy={self.sampler.sampling_strategy}"
+            f"[TeacherSampler] Loaded {len(self.teacher_sampler._states)} states, "
+            f"T={self.teacher_sampler._T}, strategy=puct (for privileged OPD)"
         )
+
+        # --- Student sampler: fresh, only initial states (for student rollout) ---
+        student_sampler_config = copy.deepcopy(config.sampler)
+        # Ensure student sampler uses its own checkpoint dir (not teacher's)
+        # so it doesn't accidentally load teacher states
+        if not getattr(student_sampler_config, 'checkpoint_dir', None):
+            student_sampler_config.checkpoint_dir = os.path.join(
+                config.saver.fileroot, "student_sampler"
+            )
+
+        self.sampler = create_sampler_from_config(
+            config=student_sampler_config,
+            env_type=getattr(config.sampler, 'env_type', 'ac1'),
+            max_version_history=1,  # Student doesn't need version history
+        )
+        # Student sampler uses the config's default strategy (usually parent_pool
+        # or initial) so student sees only initial/random states
+        self.sampler.sampling_strategy = getattr(
+            config.sampler, 'sampling_strategy', 'parent_pool'
+        )
+        logger.info(
+            f"[StudentSampler] Fresh sampler with {len(self.sampler._states)} states, "
+            f"strategy={self.sampler.sampling_strategy} (for student rollout)"
+        )
+
+        # =====================================================================
+        # Create environment (needed for privileged prompt construction)
+        # =====================================================================
+        self.env = create_env_from_config(config)
 
         # =====================================================================
         # Create student actor (with LoRA)
@@ -728,12 +749,12 @@ class TTTDDistillTrainer(PPOTrainer):
                 steps_per_epoch=config.max_steps,
             )
 
-            # Compute teacher logp (native AReaL KDRL path)
+            # Compute teacher logp (privileged OPD path)
             if self.teacher is not None:
                 torch.cuda.empty_cache()
                 with torch.no_grad():
-                    teacher_logps = self.teacher.compute_logp([rollout_batch])
-                rollout_batch["teacher_logp"] = teacher_logps[0]
+                    teacher_logps = self._compute_privileged_teacher_logp(rollout_batch)
+                rollout_batch["teacher_logp"] = teacher_logps
                 rollout_batch["rl_loss_weight"] = self.config.teacher.rl_loss_weight
                 rollout_batch["distill_loss_weight"] = self.config.teacher.distill_loss_weight
 
@@ -754,7 +775,7 @@ class TTTDDistillTrainer(PPOTrainer):
             # Compute dynamic metrics AFTER ppo_update so OOM here doesn't block training
             # =====================================================================
             dynamic_metrics = {}
-            if self.teacher is not None:
+            if self.teacher is not None and global_step % 5 == 0:
                 try:
                     torch.cuda.empty_cache()
                     dynamic_metrics = self._compute_dynamic_metrics(rollout_batch, k=16)
@@ -778,9 +799,13 @@ class TTTDDistillTrainer(PPOTrainer):
             # Record dynamic metrics to history logger (saved as JSON)
             if hasattr(self, 'dynamic_metrics_logger') and self.dynamic_metrics_logger is not None:
                 try:
+                    # Use actual rollout rewards instead of dummy rewards
+                    actual_rewards = rollout_batch["rewards"].cpu().numpy().tolist()
+                    if not isinstance(actual_rewards, list):
+                        actual_rewards = [actual_rewards]
                     self.dynamic_metrics_logger.record_step(
                         step=global_step,
-                        rewards=[0.0],  # dummy: dynamic metrics logger should not store rewards
+                        rewards=actual_rewards,
                         additional_metrics=dynamic_metrics,
                     )
                 except Exception as e:
@@ -944,6 +969,173 @@ class TTTDDistillTrainer(PPOTrainer):
             self.config.recover.fileroot,
         )
         recover_info.dump(recover_info_path)
+
+    def _compute_privileged_teacher_logp(
+        self, rollout_batch: dict[str, Any]
+    ) -> torch.Tensor:
+        """Compute teacher logp on privileged prompts + student completions (group-level).
+
+        We sample one privileged state per group (not per rollout) for stable
+        teacher signal. All rollouts within the same group share the same
+        privileged context.
+
+        Steps:
+        1. Sample privileged states: one per group from teacher PUCTSampler.
+        2. Tokenize privileged prompts via env.get_prompt(state).
+        3. Extract student completions from rollout_batch.
+        4. Build teacher sequences: repeat each privileged prompt group_size
+           times and concatenate with the corresponding student completions.
+        5. Call teacher.compute_logp() and align completion logps back to
+           student sequence positions using the verified offset:
+           teacher_comp_start = priv_len - 1, student_comp_start = prompt_len - 1.
+
+        Returns
+        -------
+        aligned_teacher_logp : torch.Tensor
+            Shape [batch_size, student_seq_len], with teacher completion logps
+            placed at the same positions as student completion tokens.
+        """
+        input_ids = rollout_batch["input_ids"]
+        attention_mask = rollout_batch["attention_mask"]
+        loss_mask = rollout_batch["loss_mask"]
+        batch_size, student_seqlen = input_ids.shape
+        device = input_ids.device
+        group_size = self.config.gconfig.n_samples
+
+        # ------------------------------------------------------------------
+        # 1. Sample privileged states (one per group)
+        # ------------------------------------------------------------------
+        num_groups = batch_size // group_size
+        if num_groups * group_size != batch_size:
+            logger.warning(
+                f"[PrivilegedOPD] batch_size ({batch_size}) is not divisible by "
+                f"group_size ({group_size}). Falling back to sample-level sampling."
+            )
+            num_groups = batch_size
+            group_size = 1
+
+        privileged_states = self.teacher_sampler.sample_states(num_groups)
+
+        # ------------------------------------------------------------------
+        # 2. Build privileged prompts and tokenize
+        # ------------------------------------------------------------------
+        privileged_prompt_ids_list = []
+        for state in privileged_states:
+            prompt = self.env.get_prompt(state)
+            messages = [{"role": "user", "content": prompt}]
+            ids = list(
+                self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    enable_thinking=getattr(self.config, "enable_thinking", False),
+                )
+            )
+            privileged_prompt_ids_list.append(ids)
+
+        # Expand each privileged prompt to group_size copies
+        privileged_prompt_ids_expanded = []
+        for ids in privileged_prompt_ids_list:
+            privileged_prompt_ids_expanded.extend([ids] * group_size)
+
+        # ------------------------------------------------------------------
+        # 3. Extract student completions from rollout_batch
+        # ------------------------------------------------------------------
+        # prompt_len = # of positions where attention_mask=1 and loss_mask=0
+        # comp_len   = # of positions where loss_mask=1
+        prompt_lens = (attention_mask & (loss_mask == 0)).sum(dim=1).cpu().numpy()
+        comp_lens = loss_mask.sum(dim=1).cpu().numpy()
+
+        # ------------------------------------------------------------------
+        # 4. Build teacher sequences: privileged_prompt + student_completion
+        # ------------------------------------------------------------------
+        teacher_seqs = []
+        teacher_loss_masks = []
+        for i in range(batch_size):
+            prompt_len = int(prompt_lens[i])
+            comp_len = int(comp_lens[i])
+            # Student completion tokens
+            student_comp = input_ids[i, prompt_len : prompt_len + comp_len].cpu().tolist()
+            # Privileged prompt tokens
+            priv_prompt = privileged_prompt_ids_expanded[i]
+            priv_len = len(priv_prompt)
+            # Concatenate
+            teacher_seq = priv_prompt + student_comp
+            teacher_seqs.append(torch.tensor(teacher_seq, dtype=torch.int32))
+            # Loss mask: 0 for prompt, 1 for completion
+            teacher_loss_masks.append(
+                torch.tensor([0] * priv_len + [1] * comp_len, dtype=torch.int32)
+            )
+
+        # Pad teacher sequences to max length
+        max_teacher_len = max(len(seq) for seq in teacher_seqs)
+        pad_id = self.tokenizer.pad_token_id or 0
+        teacher_input_ids = torch.stack(
+            [
+                torch.nn.functional.pad(seq, (0, max_teacher_len - len(seq)), value=pad_id)
+                for seq in teacher_seqs
+            ]
+        )
+        teacher_attention_mask = torch.stack(
+            [
+                torch.nn.functional.pad(
+                    torch.ones(len(seq), dtype=torch.bool),
+                    (0, max_teacher_len - len(seq)),
+                    value=False,
+                )
+                for seq in teacher_seqs
+            ]
+        )
+        teacher_loss_mask = torch.stack(
+            [
+                torch.nn.functional.pad(
+                    mask, (0, max_teacher_len - len(mask)), value=0
+                )
+                for mask in teacher_loss_masks
+            ]
+        )
+
+        teacher_batch = {
+            "input_ids": teacher_input_ids,
+            "attention_mask": teacher_attention_mask,
+            "loss_mask": teacher_loss_mask,
+        }
+
+        # ------------------------------------------------------------------
+        # 5. Call teacher.compute_logp()
+        # ------------------------------------------------------------------
+        with torch.no_grad():
+            teacher_logps_list = self.teacher.compute_logp([teacher_batch])
+        teacher_logps_full = teacher_logps_list[0]  # [batch_size, max_teacher_len]
+
+        # ------------------------------------------------------------------
+        # 6. Align completion logps back to student sequence positions
+        # ------------------------------------------------------------------
+        aligned_teacher_logp = torch.zeros(
+            (batch_size, student_seqlen), dtype=torch.float32, device=device
+        )
+        for i in range(batch_size):
+            prompt_len = int(prompt_lens[i])
+            comp_len = int(comp_lens[i])
+            priv_len = len(privileged_prompt_ids_expanded[i])
+            if comp_len == 0:
+                continue
+            # Teacher completion logps:
+            #   compute_logp returns logprobs[j] = log p(input_ids[j+1] | ...)
+            #   So completion logps span [priv_len-1, priv_len+comp_len-1)
+            t_start = priv_len - 1
+            t_end = priv_len + comp_len - 1
+            teacher_comp_logps = teacher_logps_full[i, t_start:t_end]
+
+            # Student completion positions:
+            #   Same offset: [prompt_len-1, prompt_len+comp_len-1)
+            s_start = prompt_len - 1
+            s_end = prompt_len + comp_len - 1
+            aligned_teacher_logp[i, s_start:s_end] = teacher_comp_logps.to(
+                device=device, dtype=torch.float32
+            )
+
+        return aligned_teacher_logp
 
     def _compute_dynamic_metrics(
         self, rollout_batch: dict[str, Any], k: int = 16

@@ -353,6 +353,7 @@ class TTTTrainingLogger:
                         'max_reward': snap['max_reward'],
                         'mean_reward': snap['mean_reward'],
                         'std_reward': snap['std_reward'],
+                        'metrics': snap.get('metrics', {}),
                     }
                     for key, snap in self.history.items()
                 }
