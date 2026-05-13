@@ -452,8 +452,13 @@ try:
     print(f"REWARD_RESULT: {{result}}")
     
 except Exception as e:
+    import io as _io
+    _tb_buf = _io.StringIO()
+    traceback.print_exc(file=_tb_buf)
+    _tb_str = _tb_buf.getvalue()
     print(f"REWARD_ERROR: {{e}}")
-    traceback.print_exc()
+    print(f"REWARD_ERROR_TYPE: {{type(e).__name__}}")
+    print(f"REWARD_TRACEBACK: {{_tb_str}}")
 '''
             f.write(runner_code)
         
@@ -498,6 +503,9 @@ except Exception as e:
                 stderr = stderr.decode("utf-8", errors="replace")
                 
                 # Parse result
+                error_msg = None
+                error_type = None
+                error_traceback = None
                 for line in stdout.split("\n"):
                     if line.startswith("REWARD_RESULT:"):
                         result_str = line.split(":", 1)[1].strip()
@@ -508,7 +516,19 @@ except Exception as e:
                             return None, f"Failed to parse result: {result_str}"
                     elif line.startswith("REWARD_ERROR:"):
                         error_msg = line.split(":", 1)[1].strip()
-                        return None, error_msg
+                    elif line.startswith("REWARD_ERROR_TYPE:"):
+                        error_type = line.split(":", 1)[1].strip()
+                    elif line.startswith("REWARD_TRACEBACK:"):
+                        error_traceback = line.split(":", 1)[1].strip()
+                
+                if error_msg is not None:
+                    parts = [f"[{error_type}]" if error_type else "", error_msg]
+                    if error_traceback:
+                        parts.append(f"Traceback: {error_traceback[:600]}")
+                    if stderr:
+                        parts.append(f"Stderr: {stderr[:400]}")
+                    full_error = " ".join([p for p in parts if p])
+                    return None, full_error
                 
                 # No result found
                 if process.returncode != 0:
@@ -579,6 +599,13 @@ except Exception as e:
                     fail_type = "memory_error"
                 else:
                     fail_type = "execution_error"
+                    # Log generated code snippet for debugging runtime errors
+                    code_preview = "\n".join(code.splitlines()[:20])
+                    logger.warning(
+                        f"[ExecutionError] {error_msg}\n"
+                        f"--- Generated code (first 20 lines) ---\n{code_preview}\n"
+                        f"--- End preview ---"
+                    )
                 return EnvResult(
                     reward=0.0,
                     observation=error_msg,
