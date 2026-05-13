@@ -216,7 +216,7 @@ Unless you make a meaningful improvement, you will not be rewarded.
 
 Rules:
 - You must define the `propose_candidate` function as this is what will be invoked.
-- You can use scientific libraries like scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,GUROBI,MOSEK,PDLP,SCIP,XPRESS,ECOS], math.
+- You can use scientific libraries like scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,ECOS,SCS,PDLP,SCIP], math.
 - You can use up to 2 CPUs.
 - Make all helper functions top level and have no closures from function nesting. Don't use any lambda functions.
 - No filesystem or network IO.
@@ -1239,7 +1239,7 @@ Unless you make a meaningful improvement, you will not be rewarded, if you are s
 
 Rules:
 - You must define the `construct_function` function as this is what will be invoked.
-- You can use scientific libraries like scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,GUROBI,MOSEK,PDLP,SCIP,XPRESS,ECOS], math.
+- You can use scientific libraries like scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,ECOS,SCS,PDLP,SCIP], math.
 - You can use up to {num_cpus} CPUs.
 - Make all helper functions top level and have no closures from function nesting. Don't use any lambda functions.
 - No filesystem or network IO.
