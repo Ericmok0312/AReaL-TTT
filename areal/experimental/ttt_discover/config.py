@@ -106,6 +106,14 @@ class SamplerConfig:
         default=2,
         metadata={"help": "Number of CPUs per task for code execution"},
     )
+    memory_threshold: float = field(
+        default=0.60,
+        metadata={"help": "Pause execution when system memory usage exceeds this ratio"},
+    )
+    max_memory_mb: int = field(
+        default=8192,
+        metadata={"help": "Maximum memory per subprocess (MB)"},
+    )
 
     # Lazy PUCT Sampling configuration
     lazy_puct_sampling: bool = field(
