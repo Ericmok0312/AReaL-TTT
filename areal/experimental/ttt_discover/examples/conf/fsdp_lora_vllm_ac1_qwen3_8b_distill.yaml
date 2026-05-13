@@ -23,7 +23,7 @@ teacher:
   dtype: ${actor.dtype}
   mb_spec:
     max_tokens_per_mb: 32768
-    n_mbs: 4
+    n_mbs: 1
     granularity: 1
   optimizer: null
   scheduling_spec: ${actor.scheduling_spec}
@@ -47,7 +47,7 @@ actor:
   dtype: bfloat16
   mb_spec:
     max_tokens_per_mb: 32768
-    n_mbs: 4
+    n_mbs: 1
     granularity: 1
   scheduling_spec:
   - task_type: worker
