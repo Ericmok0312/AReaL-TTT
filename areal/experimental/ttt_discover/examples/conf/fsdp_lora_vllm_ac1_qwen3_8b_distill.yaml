@@ -191,6 +191,7 @@ sampler:
   gpu_type: H100
   n: 100
   sampling_strategy: parent_pool
+  max_memory_mb: 16384
 
 train_dataset:
   batch_size: ${sampler.batch_size}
