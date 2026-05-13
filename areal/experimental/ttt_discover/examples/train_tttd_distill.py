@@ -173,7 +173,10 @@ class TTTDDistillTrainer(PPOTrainer):
         # so it doesn't accidentally load teacher states
         if not getattr(student_sampler_config, 'checkpoint_dir', None):
             student_sampler_config.checkpoint_dir = os.path.join(
-                config.saver.fileroot, "student_sampler"
+                config.saver.fileroot,
+                config.experiment_name,
+                config.trial_name,
+                "student_sampler",
             )
 
         self.sampler = create_sampler_from_config(
@@ -190,6 +193,19 @@ class TTTDDistillTrainer(PPOTrainer):
             f"[StudentSampler] Fresh sampler with {len(self.sampler._states)} states, "
             f"strategy={self.sampler.sampling_strategy} (for student rollout)"
         )
+
+        # --- Optionally inherit teacher sampler's state pool into student sampler ---
+        if config.student_sampler_inherit_teacher_pool:
+            self.sampler._states = copy.deepcopy(self.teacher_sampler._states)
+            self.sampler._initial_states = copy.deepcopy(self.teacher_sampler._initial_states)
+            self.sampler._n = copy.deepcopy(self.teacher_sampler._n)
+            self.sampler._m = copy.deepcopy(self.teacher_sampler._m)
+            self.sampler._T = self.teacher_sampler._T
+            logger.info(
+                f"[StudentSampler] Inherited teacher pool: {len(self.sampler._states)} states, "
+                f"T={self.sampler._T}, n_entries={len(self.sampler._n)}, "
+                f"m_entries={len(self.sampler._m)}"
+            )
 
         # =====================================================================
         # Create environment (needed for privileged prompt construction)
@@ -231,7 +247,12 @@ class TTTDDistillTrainer(PPOTrainer):
         # Save evaluation checkpoints for base, teacher, and student
         # These are used in the final eval phase to compare three models
         # =====================================================================
-        eval_ckpt_dir = os.path.join(config.saver.fileroot, "eval_checkpoints")
+        eval_ckpt_dir = os.path.join(
+            config.saver.fileroot,
+            config.experiment_name,
+            config.trial_name,
+            "eval_checkpoints",
+        )
         os.makedirs(eval_ckpt_dir, exist_ok=True)
 
         from areal.api.io_struct import SaveLoadMeta
@@ -303,7 +324,12 @@ class TTTDDistillTrainer(PPOTrainer):
         future_save_steps = [s for s in all_save_steps if start_step <= s < max_steps]
 
         rank_suffix = f"_rank{self.actor.dp_rank}" if self.actor.data_parallel_world_size > 1 else ""
-        output_dir = os.path.join(config.saver.fileroot, "dynamic_metrics")
+        output_dir = os.path.join(
+            config.saver.fileroot,
+            config.experiment_name,
+            config.trial_name,
+            "dynamic_metrics",
+        )
         os.makedirs(output_dir, exist_ok=True)
 
         self.dynamic_metrics_logger = TTTTrainingLogger(
@@ -749,11 +775,16 @@ class TTTDDistillTrainer(PPOTrainer):
                 steps_per_epoch=config.max_steps,
             )
 
-            # Compute teacher logp (privileged OPD path)
+            # Compute teacher logp
             if self.teacher is not None:
                 torch.cuda.empty_cache()
                 with torch.no_grad():
-                    teacher_logps = self._compute_privileged_teacher_logp(rollout_batch)
+                    if config.use_privileged_teacher_logp:
+                        teacher_logps = self._compute_privileged_teacher_logp(rollout_batch)
+                    else:
+                        # Teacher and student see the same prompts (no privileged OPD)
+                        teacher_logps_list = self.teacher.compute_logp([rollout_batch])
+                        teacher_logps = teacher_logps_list[0]
                 rollout_batch["teacher_logp"] = teacher_logps
                 rollout_batch["rl_loss_weight"] = self.config.teacher.rl_loss_weight
                 rollout_batch["distill_loss_weight"] = self.config.teacher.distill_loss_weight
@@ -772,10 +803,16 @@ class TTTDDistillTrainer(PPOTrainer):
             self.actor.step_lr_scheduler()
 
             # =====================================================================
+            # =====================================================================
             # Compute dynamic metrics AFTER ppo_update so OOM here doesn't block training
+            # Head (first step) and tail (last step) are always computed.
+            # Middle steps use 1-based modulo: step 4, 9, 14, ... (i.e. (step+1)%5==0)
             # =====================================================================
             dynamic_metrics = {}
-            if self.teacher is not None and global_step % 5 == 0:
+            is_first_step = (global_step == start_step)
+            is_last_step = (global_step == config.max_steps - 1)
+            is_middle_5th = ((global_step + 1) % 5 == 0)
+            if self.teacher is not None and (is_first_step or is_last_step or is_middle_5th):
                 try:
                     torch.cuda.empty_cache()
                     dynamic_metrics = self._compute_dynamic_metrics(rollout_batch, k=16)
@@ -979,6 +1016,11 @@ class TTTDDistillTrainer(PPOTrainer):
         teacher signal. All rollouts within the same group share the same
         privileged context.
 
+        In distributed training (DP > 1), we follow the same global-sample +
+        local-slice pattern as the dataloader: sample `global_num_groups` states
+        on every rank, then each rank takes its `rank * local_num_groups` slice.
+        This ensures different ranks receive distinct privileged states.
+
         Steps:
         1. Sample privileged states: one per group from teacher PUCTSampler.
         2. Tokenize privileged prompts via env.get_prompt(state).
@@ -1003,23 +1045,33 @@ class TTTDDistillTrainer(PPOTrainer):
         group_size = self.config.gconfig.n_samples
 
         # ------------------------------------------------------------------
-        # 1. Sample privileged states (one per group)
+        # 1. Sample privileged states (one per group) with DP sharding
         # ------------------------------------------------------------------
-        num_groups = batch_size // group_size
-        if num_groups * group_size != batch_size:
+        local_num_groups = batch_size // group_size
+        if local_num_groups * group_size != batch_size:
             logger.warning(
                 f"[PrivilegedOPD] batch_size ({batch_size}) is not divisible by "
                 f"group_size ({group_size}). Falling back to sample-level sampling."
             )
-            num_groups = batch_size
+            local_num_groups = batch_size
             group_size = 1
 
-        privileged_states = self.teacher_sampler.sample_states(num_groups)
+        dp_world_size = self.actor.data_parallel_world_size
+        dp_rank = self.actor.data_parallel_rank
+        global_num_groups = local_num_groups * dp_world_size
+
+        # All ranks sample the same global pool (deterministic for puct strategy)
+        all_privileged_states = self.teacher_sampler.sample_states(global_num_groups)
+
+        # Take this rank's slice so each rank gets distinct privileged states
+        start_idx = dp_rank * local_num_groups
+        privileged_states = all_privileged_states[start_idx:start_idx + local_num_groups]
 
         # Log sampled privileged state values for debugging
         for i, state in enumerate(privileged_states):
             logger.info(
-                f"[PrivilegedOPD] Sampled state {i}/{num_groups}: "
+                f"[PrivilegedOPD] Rank {dp_rank} state {i}/{local_num_groups} "
+                f"(global {start_idx + i}/{global_num_groups}): "
                 f"value={state.value:.4f}, timestep={state.timestep}, "
                 f"id={state.id[:8] if hasattr(state.id, '__len__') and len(state.id) > 8 else state.id}"
             )

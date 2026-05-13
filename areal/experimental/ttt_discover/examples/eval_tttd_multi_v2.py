@@ -132,10 +132,15 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         # Determine which models to evaluate
         eval_models = getattr(config, 'eval_models', None)
         if eval_models is None:
-            eval_ckpt_dir = os.path.join(config.saver.fileroot, "eval_checkpoints")
+            eval_ckpt_dir = os.path.join(
+                config.saver.fileroot,
+                config.experiment_name,
+                config.trial_name,
+                "eval_checkpoints",
+            )
             teacher_path = getattr(config, 'teacher_lora_path', None)
             if teacher_path is None:
-                teacher_path = config.teacher_path
+                teacher_path = config.teacher.path
             student_path = getattr(config, 'student_lora_path', None)
             if student_path is None and os.path.isdir(os.path.join(eval_ckpt_dir, "student")):
                 student_path = os.path.join(eval_ckpt_dir, "student")
@@ -418,11 +423,16 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             # Write per-rank rewards to disk instead of all_gather_object
             # to avoid NCCL hang with large Python objects.
             rank = self.actor.data_parallel_rank
-            local_rewards_path = os.path.join(
+            eval_output_dir = os.path.join(
                 self.config.saver.fileroot,
+                self.config.experiment_name,
+                self.config.trial_name,
+            )
+            local_rewards_path = os.path.join(
+                eval_output_dir,
                 f"eval_rewards_{label}_rank{rank}.json"
             )
-            os.makedirs(self.config.saver.fileroot, exist_ok=True)
+            os.makedirs(eval_output_dir, exist_ok=True)
             with open(local_rewards_path, 'w') as f:
                 json.dump(local_rewards_list, f)
 
@@ -497,11 +507,16 @@ class TTTDMultiEvalTrainer(PPOTrainer):
 
         # Merge per-rank reward files on rank 0
         if is_dp_head and dist.is_initialized():
+            eval_output_dir = os.path.join(
+                config.saver.fileroot,
+                config.experiment_name,
+                config.trial_name,
+            )
             for label in self._eval_models:
                 merged_rewards = []
                 for rank in range(self.actor.data_parallel_world_size):
                     rewards_path = os.path.join(
-                        config.saver.fileroot,
+                        eval_output_dir,
                         f"eval_rewards_{label}_rank{rank}.json"
                     )
                     if os.path.exists(rewards_path):
@@ -511,11 +526,16 @@ class TTTDMultiEvalTrainer(PPOTrainer):
 
         # Save comparison results
         if is_dp_head:
-            comparison_path = os.path.join(
+            eval_output_dir = os.path.join(
                 config.saver.fileroot,
+                config.experiment_name,
+                config.trial_name,
+            )
+            comparison_path = os.path.join(
+                eval_output_dir,
                 "eval_comparison.json"
             )
-            os.makedirs(config.saver.fileroot, exist_ok=True)
+            os.makedirs(eval_output_dir, exist_ok=True)
             with open(comparison_path, 'w') as f:
                 json.dump(all_results, f, indent=2, default=str)
             logger.info(f"[MultiEval] Comparison results saved to {comparison_path}")

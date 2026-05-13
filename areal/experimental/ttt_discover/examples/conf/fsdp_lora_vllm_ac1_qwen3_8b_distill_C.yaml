@@ -1,4 +1,4 @@
-experiment_name: tttd-distill-A-privileged-puct
+experiment_name: tttd-distill-C-no-privileged-puct
 trial_name: trial0
 is_tttd_config: true
 seed: 1
@@ -8,7 +8,7 @@ total_train_epochs: 10
 enable_thinking: true
 reset_puct_stats_on_resume: false
 student_sampler_inherit_teacher_pool: true
-use_privileged_teacher_logp: true
+use_privileged_teacher_logp: false
 
 # Native AReaL KDRL teacher config
 teacher:

@@ -323,6 +323,19 @@ class TTTDDistillConfig(TTTDPPOConfig):
         metadata={"help": "Group size for evaluation (number of samples per initial state). Defaults to 64."},
     )
 
+    # Distillation behavior controls
+    use_privileged_teacher_logp: bool = field(
+        default=True,
+        metadata={"help": "If True, teacher sees privileged prompts sampled from teacher PUCTSampler (OPD). "
+                         "If False, teacher and student see the same prompts (no privileged information)."},
+    )
+    student_sampler_inherit_teacher_pool: bool = field(
+        default=True,
+        metadata={"help": "If True, copy teacher sampler's state pool (_states, _n, _m, _T) into student sampler "
+                         "so the student starts from the same parent pool as the teacher. "
+                         "If False, student sampler starts fresh with only initial states."},
+    )
+
 
 # Import envs here to avoid circular imports
 def create_env_from_config(config):

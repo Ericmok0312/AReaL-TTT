@@ -1,4 +1,4 @@
-experiment_name: tttd-distill-A-privileged-puct
+experiment_name: tttd-distill-B-privileged-random
 trial_name: trial0
 is_tttd_config: true
 seed: 1
@@ -192,7 +192,7 @@ sampler:
   num_cpus: 2
   gpu_type: H100
   n: 100
-  sampling_strategy: puct
+  sampling_strategy: parent_pool
   max_memory_mb: 16384
 
 train_dataset:

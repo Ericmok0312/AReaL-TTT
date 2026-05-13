@@ -1,4 +1,4 @@
-experiment_name: tttd-distill-A-privileged-puct
+experiment_name: tttd-distill-D-no-privileged-random
 trial_name: trial0
 is_tttd_config: true
 seed: 1
@@ -8,7 +8,7 @@ total_train_epochs: 10
 enable_thinking: true
 reset_puct_stats_on_resume: false
 student_sampler_inherit_teacher_pool: true
-use_privileged_teacher_logp: true
+use_privileged_teacher_logp: false
 
 # Native AReaL KDRL teacher config
 teacher:
@@ -192,7 +192,7 @@ sampler:
   num_cpus: 2
   gpu_type: H100
   n: 100
-  sampling_strategy: puct
+  sampling_strategy: parent_pool
   max_memory_mb: 16384
 
 train_dataset:
