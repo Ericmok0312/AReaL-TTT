@@ -350,6 +350,8 @@ def create_env_from_config(config):
             eval_timeout=eval_timeout,
             log_dir=config.saver.fileroot,
             num_cpus=getattr(config.sampler, 'num_cpus', 2),
+            memory_threshold=getattr(config.sampler, 'memory_threshold', 0.60),
+            max_memory_mb=getattr(config.sampler, 'max_memory_mb', 8192),
         )
     elif env_type == 'erdos':
         return ErdosEnv(

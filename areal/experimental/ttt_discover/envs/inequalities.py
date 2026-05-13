@@ -333,7 +333,7 @@ class InequalitiesEnv(BaseEnv):
         log_dir: str = "/tmp/ttt_logs",
         num_cpus: int = 2,
         memory_threshold: float = 0.60,
-        max_memory_mb: int = 4096,
+        max_memory_mb: int = 8192,
     ):
         self.problem_type = problem_type
         self.budget_s = budget_s
@@ -437,6 +437,23 @@ os.environ.setdefault("OMP_NUM_THREADS", "{max(1, self.num_cpus)}")
 os.environ.setdefault("MKL_NUM_THREADS", "{max(1, self.num_cpus)}")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "{max(1, self.num_cpus)}")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "{max(1, self.num_cpus)}")
+
+# Disable commercial solvers to force fallback to free ones (ECOS, SCS, CBC, GLPK)
+os.environ["MOSEKLM_LICENSE_FILE"] = ""
+os.environ["GRB_LICENSE_FILE"] = ""
+os.environ["GUROBI_HOME"] = ""
+os.environ["XPRESS"] = ""
+os.environ["XPRESSDIR"] = ""
+
+# Monkey-patch cvxpy: MOSEK/GUROBI/XPRESS → ECOS so generated code still works
+# even if LLM mentions licensed solvers in the prompt
+try:
+    import cvxpy as _cp
+    for _solv in ["MOSEK", "GUROBI", "XPRESS"]:
+        if hasattr(_cp, _solv):
+            setattr(_cp, _solv, "ECOS")
+except Exception:
+    pass
 
 sys.path.insert(0, "{str(self.log_dir)}")
 
