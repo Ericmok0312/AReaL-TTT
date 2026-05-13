@@ -103,7 +103,7 @@ tokenizer_path: ${actor.path}
 cluster:
   n_nodes: 1
   n_gpus_per_node: 8
-  fileroot: ./outputs_ac1_distill_privileged
+  fileroot: ./outputs_ac1_distill
   name_resolve:
     type: nfs
     nfs_record_root: /tmp/areal/name_resolve
