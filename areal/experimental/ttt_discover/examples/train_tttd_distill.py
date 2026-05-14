@@ -795,8 +795,14 @@ class TTTDDistillTrainer(PPOTrainer):
                 prox_logps = self.actor.compute_logp([rollout_batch])
                 rollout_batch["prox_logp"] = prox_logps[0]
 
-            # Compute advantages using TTTDActor (native AReaL logic)
-            rollout_batch = self.actor.compute_advantages(rollout_batch)
+            # Skip expensive advantage computation (pure KD mode: rl_loss_weight=0)
+            # PPO update still expects the "advantages" key, so create dummy zeros
+            rollout_batch["advantages"] = torch.zeros_like(
+                rollout_batch["loss_mask"], dtype=torch.float32
+            )
+
+            # Clear cached memory before backward pass to prevent OOM
+            torch.cuda.empty_cache()
 
             # PPO update: automatically handles KD loss when teacher_logp is present
             self.actor.ppo_update([rollout_batch])
