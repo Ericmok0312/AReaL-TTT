@@ -1215,11 +1215,16 @@ class TTTDDistillTrainer(PPOTrainer):
     ) -> tuple[dict[str, float], torch.Tensor | None, torch.Tensor | None]:
         """Compute dynamic metrics and extract per-token logps in one pass.
 
+        Uses mini-batch forward passes (default batch_size=8) instead of
+        per-sequence forwards for ~8x speedup.  Keeps vocab-dimension chunking
+        to avoid OOM with large vocab sizes.
+
         Returns (metrics_dict, teacher_logp, student_logp).
         teacher_logp and student_logp have shape [batch, seq_len] matching
         compute_logp() output, so caller can skip redundant forward passes.
         """
         seq_chunk_size = getattr(self.config, "metric_seq_chunk_size", 512)
+        mini_batch_size = getattr(self.config, "metric_mini_batch_size", 8)
 
         input_ids = rollout_batch["input_ids"]
         attention_mask = rollout_batch["attention_mask"]
@@ -1233,55 +1238,60 @@ class TTTDDistillTrainer(PPOTrainer):
             entropies = []
             all_token_logps = []
 
-            for i in range(n):
-                ids = input_ids[i : i + 1].to(device)
-                mask = attention_mask[i : i + 1].to(device)
-                lmask = loss_mask[i : i + 1].to(device)
+            # Mini-batch forward: process `mini_batch_size` sequences per pass
+            for start in range(0, n, mini_batch_size):
+                end = min(start + mini_batch_size, n)
+                ids = input_ids[start:end].to(device)
+                mask = attention_mask[start:end].to(device)
+                lmask = loss_mask[start:end].to(device)
 
                 with torch.no_grad():
                     out = engine.model(input_ids=ids, attention_mask=mask)
-                    logits = out.logits.squeeze(0)  # [seqlen, vocab]
+                    logits = out.logits  # [mini_batch, seqlen, vocab]
 
-                active = lmask.squeeze(0) > 0
-                # Build token logps on CPU to avoid holding GPU memory across sequences
-                seq_token_logps = torch.zeros(seqlen, dtype=torch.float32)
+                # Process each sequence in the mini-batch (vocab still chunked)
+                for i in range(end - start):
+                    global_i = start + i
+                    seq_logits = logits[i]  # [seqlen, vocab]
+                    seq_lmask = lmask[i]
 
-                if not active.any():
-                    del out, logits
+                    active = seq_lmask > 0
+                    seq_token_logps = torch.zeros(seqlen, dtype=torch.float32)
+
+                    if not active.any():
+                        all_token_logps.append(seq_token_logps)
+                        continue
+
+                    active_logits = seq_logits[active]  # [n_active, vocab]
+                    n_active = active_logits.shape[0]
+                    token_logps = []
+
+                    for j in range(0, n_active, seq_chunk_size):
+                        chunk_logits = active_logits[j : j + seq_chunk_size]
+                        log_probs = torch.nn.functional.log_softmax(
+                            chunk_logits.float(), dim=-1
+                        )
+
+                        chunk_input_ids = input_ids_full[global_i][active][j : j + seq_chunk_size]
+                        chunk_token_logp = log_probs.gather(
+                            dim=-1, index=chunk_input_ids.unsqueeze(-1)
+                        ).squeeze(-1)
+                        token_logps.append(chunk_token_logp.cpu())
+
+                        entropy = -(log_probs.exp() * log_probs).sum(-1)
+                        entropies.append(entropy.cpu())
+
+                        tk_logp, tk_idx = torch.topk(log_probs, k, dim=-1)
+                        topk_logps.append(tk_logp.cpu())
+                        topk_indices.append(tk_idx.cpu())
+
+                        del chunk_logits, log_probs, entropy, tk_logp, tk_idx
+
+                    active_positions = torch.where(active)[0].cpu()
+                    seq_token_logps[active_positions] = torch.cat(token_logps)
                     all_token_logps.append(seq_token_logps)
-                    continue
 
-                active_logits = logits[active]  # [n_active, vocab]
-                n_active = active_logits.shape[0]
-                token_logps = []
-
-                for j in range(0, n_active, seq_chunk_size):
-                    chunk_logits = active_logits[j : j + seq_chunk_size]
-                    log_probs = torch.nn.functional.log_softmax(
-                        chunk_logits.float(), dim=-1
-                    )
-
-                    # Extract per-token logp for actual tokens (reuse for compute_logp)
-                    chunk_input_ids = input_ids_full[i][active][j : j + seq_chunk_size]
-                    chunk_token_logp = log_probs.gather(
-                        dim=-1, index=chunk_input_ids.unsqueeze(-1)
-                    ).squeeze(-1)
-                    token_logps.append(chunk_token_logp.cpu())
-
-                    entropy = -(log_probs.exp() * log_probs).sum(-1)
-                    entropies.append(entropy.cpu())
-
-                    tk_logp, tk_idx = torch.topk(log_probs, k, dim=-1)
-                    topk_logps.append(tk_logp.cpu())
-                    topk_indices.append(tk_idx.cpu())
-
-                    del chunk_logits, log_probs, entropy, tk_logp, tk_idx
-
-                active_positions = torch.where(active)[0].cpu()
-                seq_token_logps[active_positions] = torch.cat(token_logps)
-                all_token_logps.append(seq_token_logps)
-
-                del out, logits, active_logits, active
+                del out, logits
 
             if not entropies:
                 return None, None, None, None
@@ -1295,7 +1305,6 @@ class TTTDDistillTrainer(PPOTrainer):
         s_idx, s_logp, s_ent, s_token_logp = _get_topk_entropy_and_logp(
             self.actor, self.actor.device, input_ids
         )
-        torch.cuda.empty_cache()
         t_idx, t_logp, t_ent, t_token_logp = _get_topk_entropy_and_logp(
             self.teacher, self.teacher.device, input_ids
         )
