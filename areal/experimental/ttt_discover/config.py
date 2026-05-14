@@ -330,10 +330,15 @@ class TTTDDistillConfig(TTTDPPOConfig):
                          "If False, teacher and student see the same prompts (no privileged information)."},
     )
     student_sampler_inherit_teacher_pool: bool = field(
-        default=True,
+        default=False,
         metadata={"help": "If True, copy teacher sampler's state pool (_states, _n, _m, _T) into student sampler "
                          "so the student starts from the same parent pool as the teacher. "
                          "If False, student sampler starts fresh with only initial states."},
+    )
+    teacher_sampler_strategy: str = field(
+        default="puct",
+        metadata={"help": "Teacher sampler strategy for privileged OPD: 'puct' (top-scoring) or "
+                         "'parent_pool' (random from visited states). Only used when use_privileged_teacher_logp=True."},
     )
 
 

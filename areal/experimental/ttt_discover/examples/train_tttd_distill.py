@@ -160,8 +160,8 @@ class TTTDDistillTrainer(PPOTrainer):
                     f"Using fresh sampler state."
                 )
 
-        # Teacher sampler always uses puct for high-value state selection
-        self.teacher_sampler.sampling_strategy = "puct"
+        # Teacher sampler strategy for privileged OPD (configurable)
+        self.teacher_sampler.sampling_strategy = config.teacher_sampler_strategy
         logger.info(
             f"[TeacherSampler] Loaded {len(self.teacher_sampler._states)} states, "
             f"T={self.teacher_sampler._T}, strategy=puct (for privileged OPD)"
