@@ -267,9 +267,6 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         # Key: (parent_id, sampled_step), Value: episode dict
         # Using composite key to handle same parent sampled in multiple steps
         self._parent_episodes: dict[tuple[str, int], dict] = {}
-        
-        # Buffer to expose rollout states for downstream privileged OPD
-        self._rollout_state_buffer: list[Any] = []
 
     def get_execute_tail_latency(self, clear: bool = True) -> float:
         """
@@ -325,6 +322,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         self,
         resp: ModelResponse,
         reward: float,
+        state: "State | None" = None,
     ) -> dict[str, torch.Tensor]:
         """Create trajectory tensors from response and reward."""
         seq = resp.input_tokens + resp.output_tokens
@@ -339,6 +337,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             "versions": torch.tensor(versions, dtype=torch.int32).unsqueeze(0),
             "attention_mask": torch.ones(len(seq), dtype=torch.bool).unsqueeze(0),
             "rewards": torch.tensor([reward], dtype=torch.float32),
+            "_student_prompts": [self.env.get_prompt(state) if state is not None else ""],
         }
     
     def _create_failed_trajectory(
@@ -365,13 +364,15 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         Returns:
             Dictionary with trajectory tensors
         """
-        return self.env.create_failed_trajectory(
+        trajectory = self.env.create_failed_trajectory(
             state=state,
             input_ids=input_ids,
             tokenizer=self.tokenizer,
             fail_type=fail_type,
             error_msg=error_msg,
         )
+        trajectory["_student_prompts"] = [self.env.get_prompt(state) if state is not None else ""]
+        return trajectory
 
     @trace_session("reward")
     async def _compute_reward(
@@ -700,9 +701,6 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         # Ensure state is available in data for _compute_reward
         data["_state_obj"] = state
         
-        # Buffer state for downstream privileged OPD (train_tttd_distill.py)
-        self._rollout_state_buffer.append(state)
-        
         # Get the step when this parent was sampled (from dataloader)
         # This is CRITICAL for staleness tracking with composite key
         sampled_step = data.get('_sampled_step', self._current_version if hasattr(self, '_current_version') else 0)
@@ -846,7 +844,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             
             # Create trajectory - use failed trajectory for invalid results
             if result.is_valid:
-                trajectory = self._create_trajectory(resp, reward)
+                trajectory = self._create_trajectory(resp, reward, state=state)
             else:
                 # Use fail_type from result if available, otherwise default to execution_error
                 fail_type = result.fail_type or "execution_error"

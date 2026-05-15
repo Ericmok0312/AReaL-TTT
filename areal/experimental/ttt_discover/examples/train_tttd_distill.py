@@ -780,19 +780,12 @@ class TTTDDistillTrainer(PPOTrainer):
                 steps_per_epoch=config.max_steps,
             )
 
-            # Retrieve rollout states from workflow buffer for privileged OPD
-            student_states = []
-            if config.use_privileged_teacher_logp and hasattr(distill_workflow, '_rollout_state_buffer'):
-                student_states = distill_workflow._rollout_state_buffer.copy()
-                distill_workflow._rollout_state_buffer.clear()
-                logger.info(f"[Distill][Step {global_step}] Retrieved {len(student_states)} rollout states from workflow buffer")
-
             # Compute teacher logp
             if self.teacher is not None:
                 torch.cuda.empty_cache()
                 with torch.no_grad():
                     if config.use_privileged_teacher_logp:
-                        teacher_logps = self._compute_privileged_teacher_logp(rollout_batch, student_states)
+                        teacher_logps = self._compute_privileged_teacher_logp(rollout_batch)
                     else:
                         # Teacher and student see the same prompts (no privileged OPD)
                         teacher_logps_list = self.teacher.compute_logp([rollout_batch])
@@ -1035,21 +1028,20 @@ class TTTDDistillTrainer(PPOTrainer):
         return f"\n\n[Hint] A known good approach for this problem:\n{hint_text}\nYou can learn from this approach but try to improve it further.\n"
 
     def _compute_privileged_teacher_logp(
-        self, rollout_batch: dict[str, Any], student_states: list[Any] | None = None
+        self, rollout_batch: dict[str, Any]
     ) -> torch.Tensor:
         """Compute teacher logp with hint-based privileged prompts.
 
-        Uses workflow buffer states to reconstruct the exact student prompt,
-        then appends a [Hint] with privileged information (better state code/value).
-        This ensures teacher and student share the same base context,
-        minimizing context mismatch.
+        Reads student prompts from the rollout batch (_student_prompts field)
+        so the ordering is correct regardless of async execution or DP
+        redistribution.  Appends a [Hint] with privileged information
+        (better state code/value) to each student prompt.
 
         Parameters
         ----------
         rollout_batch : dict
-            Standard rollout batch with input_ids, loss_mask, attention_mask.
-        student_states : list[State] | None
-            Rollout states from workflow buffer (same states student used for generation).
+            Standard rollout batch with input_ids, loss_mask, attention_mask,
+            plus _student_prompts (list[str]) attached by the workflow.
 
         Returns
         -------
@@ -1095,15 +1087,13 @@ class TTTDDistillTrainer(PPOTrainer):
             privileged_states_expanded.extend([state] * group_size)
 
         # ------------------------------------------------------------------
-        # 2. Build teacher prompts from student states + hint
+        # 2. Build teacher prompts from student prompts + hint
         # ------------------------------------------------------------------
-        # If student_states not provided or length mismatch, fall back to
-        # reconstructing from rollout_batch (less accurate but robust).
-        use_states = (student_states is not None and len(student_states) > 0)
-        if use_states and len(student_states) != batch_size:
+        student_prompts = rollout_batch.get("_student_prompts", [])
+        if len(student_prompts) != batch_size:
             logger.warning(
-                f"[PrivilegedOPD] student_states length ({len(student_states)}) != "
-                f"batch_size ({batch_size}). Using available states cyclically."
+                f"[PrivilegedOPD] _student_prompts length ({len(student_prompts)}) != "
+                f"batch_size ({batch_size}). Using available prompts cyclically."
             )
 
         # Determine prompt mode
@@ -1115,12 +1105,9 @@ class TTTDDistillTrainer(PPOTrainer):
 
             if prompt_mode == 'hint':
                 # Hint mode: student prompt + [Hint] privileged info
-                if use_states:
-                    student_state = student_states[i % len(student_states)]
-                    student_prompt = self.env.get_prompt(student_state)
-                else:
-                    student_prompt = ""
-                    logger.warning(f"[PrivilegedOPD] No student_states for item {i}, using empty prompt base")
+                student_prompt = student_prompts[i % len(student_prompts)] if student_prompts else ""
+                if not student_prompt:
+                    logger.warning(f"[PrivilegedOPD] Empty student prompt for item {i}")
                 hint = self._build_hint(priv_state)
                 teacher_prompt = student_prompt + hint
             else:
