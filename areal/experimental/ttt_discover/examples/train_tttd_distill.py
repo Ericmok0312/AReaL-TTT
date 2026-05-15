@@ -647,7 +647,20 @@ class TTTDDistillTrainer(PPOTrainer):
             if len(rollout_batch) == 1:
                 return rollout_batch[0]
             from areal.utils.data import concat_batch
+            # Manually flat-concat _student_prompts because all_gather_tensor_container
+            # turns lists into tuples via list(zip(*data)), and concat_padded_tensors
+            # only flat-concats lists (tuples are treated as scalars and only the
+            # first element is kept).
+            student_prompts: list[str] = []
+            for d in rollout_batch:
+                sp = d.pop("_student_prompts", None)
+                if isinstance(sp, (list, tuple)):
+                    student_prompts.extend(sp)
+                elif sp is not None:
+                    student_prompts.append(sp)
             batched, _meta = concat_batch(rollout_batch)
+            if student_prompts:
+                batched["_student_prompts"] = student_prompts
             return batched
         raise TypeError(f"Unexpected rollout_batch type: {type(rollout_batch)}")
 
