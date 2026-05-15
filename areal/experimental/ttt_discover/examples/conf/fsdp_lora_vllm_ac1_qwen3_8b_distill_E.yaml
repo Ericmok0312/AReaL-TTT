@@ -10,7 +10,7 @@ reset_puct_stats_on_resume: false
 student_sampler_inherit_teacher_pool: false
 use_privileged_teacher_logp: true
 teacher_sampler_strategy: puct
-privileged_prompt_mode: evaluation
+privileged_prompt_mode: hint
 
 # Native AReaL KDRL teacher config
 teacher:

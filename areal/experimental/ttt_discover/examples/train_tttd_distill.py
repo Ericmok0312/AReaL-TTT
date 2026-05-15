@@ -780,12 +780,19 @@ class TTTDDistillTrainer(PPOTrainer):
                 steps_per_epoch=config.max_steps,
             )
 
+            # Retrieve rollout states from workflow buffer for privileged OPD
+            student_states = []
+            if config.use_privileged_teacher_logp and hasattr(distill_workflow, '_rollout_state_buffer'):
+                student_states = distill_workflow._rollout_state_buffer.copy()
+                distill_workflow._rollout_state_buffer.clear()
+                logger.info(f"[Distill][Step {global_step}] Retrieved {len(student_states)} rollout states from workflow buffer")
+
             # Compute teacher logp
             if self.teacher is not None:
                 torch.cuda.empty_cache()
                 with torch.no_grad():
                     if config.use_privileged_teacher_logp:
-                        teacher_logps = self._compute_privileged_teacher_logp(rollout_batch)
+                        teacher_logps = self._compute_privileged_teacher_logp(rollout_batch, student_states)
                     else:
                         # Teacher and student see the same prompts (no privileged OPD)
                         teacher_logps_list = self.teacher.compute_logp([rollout_batch])
@@ -1015,98 +1022,39 @@ class TTTDDistillTrainer(PPOTrainer):
         )
         recover_info.dump(recover_info_path)
 
-    def _build_evaluation_prompt(self, state) -> str:
-        """Build a neutral evaluation prompt for privileged teacher OPD.
-
-        Unlike env.get_prompt(state), this prompt presents the state's code/value
-        as a 'known good solution' and asks the teacher to evaluate a candidate
-        solution, removing continuation bias (e.g., 'further improve', 'last code').
-        """
-        env_type = getattr(self.config.sampler, 'env_type', 'ac1')
-        if env_type in ('ac1', 'ac2'):
-            metric_name = "upper bound" if env_type == 'ac1' else "lower bound"
-            target = 1.5030 if env_type == 'ac1' else 0.97
-            is_maximize = False if env_type == 'ac1' else True
-            budget_s = getattr(self.config.sampler, 'budget_s', 1000)
-
-            task_desc = f"""Act as an expert evaluator for AC1 optimization.
-
-Your task is to find the sequence of non-negative heights of a step function that minimizes the following evaluation function:
-
-{AC1_EVAL_FUNCTION}
-
-{AC1_LITERATURE}
-
-Your task is to write a search function that searches for the best sequence of coefficients. Your function will have {budget_s} seconds to run, and after that it has to have returned the best sequence it found. If after {budget_s} seconds it has not returned anything, it will be terminated with negative infinity points. All numbers in your sequence have to be positive or zero. Larger sequences with 1000s of items often have better attack surface, but too large sequences with 100s of thousands of items may be too slow to search.
-
-You may code up any search method you want, and you are allowed to call the evaluate_sequence() function as many times as you want. You have access to it, you don't need to code up the evaluate_sequence() function.
-"""
-
-            # Neutral privileged context: state code/value as known good solution
-            privileged_ctx = ""
-            if state.code and state.code.strip():
-                privileged_ctx += f"""
-[Known Good Solution]
-A high-quality solution has been found for this problem with the following code:
-```python
-{state.code.strip()}
-```
-"""
-            if state.value is not None:
-                after_value = state.value if is_maximize else -state.value
-                privileged_ctx += f"This solution achieves a {metric_name} of {after_value:.6f} (target: {target}).\n"
-            if getattr(state, 'construction', None):
-                privileged_ctx += f"The resulting construction (first 20 values): {list(state.construction)[:20]}...\n"
-
-            privileged_ctx += """
-Now evaluate the following candidate solution for the SAME problem. Consider whether the candidate would find a good solution and whether it is a reasonable approach.
-
-Rules:
-- You must define the `propose_candidate` function as this is what will be invoked.
-- You can use scientific libraries like scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,ECOS,SCS,PDLP,SCIP], math.
-- You can use up to 2 CPUs.
-- Make all helper functions top level and have no closures from function nesting. Don't use any lambda functions.
-- No filesystem or network IO.
-- Do not import evaluate_sequence yourself. Assume it will already be imported and can be directly invoked.
-- **Print statements**: Use `print()` to log progress, intermediate bounds, timing info, etc. Your output will be shown back to you.
-- Include a short docstring at the top summarizing your algorithm.
-
-Make sure to think and return the final program between ```python and ```.
-"""
-            return task_desc + privileged_ctx
-        else:
-            # Fallback to original prompt for non-AC1 environments
-            return self.env.get_prompt(state)
+    def _build_hint(self, privileged_state) -> str:
+        """Build a short hint from privileged state for teacher prompt."""
+        hint_parts = []
+        if privileged_state.code and privileged_state.code.strip():
+            hint_parts.append(f"```python\n{privileged_state.code.strip()}\n```")
+        if privileged_state.value is not None:
+            # AC1: state.value = -raw_score
+            raw_score = -privileged_state.value
+            hint_parts.append(f"This achieves a score of {raw_score:.6f}.")
+        hint_text = "\n".join(hint_parts)
+        return f"\n\n[Hint] A known good approach for this problem:\n{hint_text}\nYou can learn from this approach but try to improve it further.\n"
 
     def _compute_privileged_teacher_logp(
-        self, rollout_batch: dict[str, Any]
+        self, rollout_batch: dict[str, Any], student_states: list[Any] | None = None
     ) -> torch.Tensor:
-        """Compute teacher logp on privileged prompts + student completions (group-level).
+        """Compute teacher logp with hint-based privileged prompts.
 
-        We sample one privileged state per group (not per rollout) for stable
-        teacher signal. All rollouts within the same group share the same
-        privileged context.
+        Uses workflow buffer states to reconstruct the exact student prompt,
+        then appends a [Hint] with privileged information (better state code/value).
+        This ensures teacher and student share the same base context,
+        minimizing context mismatch.
 
-        In distributed training (DP > 1), we follow the same global-sample +
-        local-slice pattern as the dataloader: sample `global_num_groups` states
-        on every rank, then each rank takes its `rank * local_num_groups` slice.
-        This ensures different ranks receive distinct privileged states.
-
-        Steps:
-        1. Sample privileged states: one per group from teacher PUCTSampler.
-        2. Build privileged prompts (continuation or evaluation mode).
-        3. Extract student completions from rollout_batch.
-        4. Build teacher sequences: repeat each privileged prompt group_size
-           times and concatenate with the corresponding student completions.
-        5. Call teacher.compute_logp() and align completion logps back to
-           student sequence positions using the verified offset:
-           teacher_comp_start = priv_len - 1, student_comp_start = prompt_len - 1.
+        Parameters
+        ----------
+        rollout_batch : dict
+            Standard rollout batch with input_ids, loss_mask, attention_mask.
+        student_states : list[State] | None
+            Rollout states from workflow buffer (same states student used for generation).
 
         Returns
         -------
         aligned_teacher_logp : torch.Tensor
-            Shape [batch_size, student_seq_len], with teacher completion logps
-            placed at the same positions as student completion tokens.
+            Shape [batch_size, student_seq_len].
         """
         input_ids = rollout_batch["input_ids"]
         attention_mask = rollout_batch["attention_mask"]
@@ -1121,8 +1069,8 @@ Make sure to think and return the final program between ```python and ```.
         local_num_groups = batch_size // group_size
         if local_num_groups * group_size != batch_size:
             logger.warning(
-                f"[PrivilegedOPD] batch_size ({batch_size}) is not divisible by "
-                f"group_size ({group_size}). Falling back to sample-level sampling."
+                f"[PrivilegedOPD] batch_size ({batch_size}) not divisible by "
+                f"group_size ({group_size}). Using sample-level."
             )
             local_num_groups = batch_size
             group_size = 1
@@ -1131,32 +1079,56 @@ Make sure to think and return the final program between ```python and ```.
         dp_rank = self.actor.data_parallel_rank
         global_num_groups = local_num_groups * dp_world_size
 
-        # All ranks sample the same global pool (deterministic for puct strategy)
         all_privileged_states = self.teacher_sampler.sample_states(global_num_groups)
-
-        # Take this rank's slice so each rank gets distinct privileged states
         start_idx = dp_rank * local_num_groups
         privileged_states = all_privileged_states[start_idx:start_idx + local_num_groups]
 
-        # Log sampled privileged state values for debugging
         for i, state in enumerate(privileged_states):
             logger.info(
-                f"[PrivilegedOPD] Rank {dp_rank} state {i}/{local_num_groups} "
-                f"(global {start_idx + i}/{global_num_groups}): "
-                f"value={state.value:.4f}, timestep={state.timestep}, "
-                f"id={state.id[:8] if hasattr(state.id, '__len__') and len(state.id) > 8 else state.id}"
+                f"[PrivilegedOPD] Rank {dp_rank} priv_state {i}/{local_num_groups} "
+                f"value={state.value:.4f}, id={state.id[:8] if hasattr(state.id, '__len__') and len(state.id) > 8 else state.id}"
             )
 
-        # ------------------------------------------------------------------
-        # 2. Build privileged prompts and tokenize
-        # ------------------------------------------------------------------
-        privileged_prompt_ids_list = []
+        # Expand privileged states to match rollouts (group_size copies per group)
+        privileged_states_expanded = []
         for state in privileged_states:
-            if getattr(self.config, 'privileged_prompt_mode', 'continuation') == 'evaluation':
-                prompt = self._build_evaluation_prompt(state)
+            privileged_states_expanded.extend([state] * group_size)
+
+        # ------------------------------------------------------------------
+        # 2. Build teacher prompts from student states + hint
+        # ------------------------------------------------------------------
+        # If student_states not provided or length mismatch, fall back to
+        # reconstructing from rollout_batch (less accurate but robust).
+        use_states = (student_states is not None and len(student_states) > 0)
+        if use_states and len(student_states) != batch_size:
+            logger.warning(
+                f"[PrivilegedOPD] student_states length ({len(student_states)}) != "
+                f"batch_size ({batch_size}). Using available states cyclically."
+            )
+
+        # Determine prompt mode
+        prompt_mode = getattr(self.config, 'privileged_prompt_mode', 'continuation')
+
+        teacher_prompt_ids_list = []
+        for i in range(batch_size):
+            priv_state = privileged_states_expanded[i]
+
+            if prompt_mode == 'hint':
+                # Hint mode: student prompt + [Hint] privileged info
+                if use_states:
+                    student_state = student_states[i % len(student_states)]
+                    student_prompt = self.env.get_prompt(student_state)
+                else:
+                    student_prompt = ""
+                    logger.warning(f"[PrivilegedOPD] No student_states for item {i}, using empty prompt base")
+                hint = self._build_hint(priv_state)
+                teacher_prompt = student_prompt + hint
             else:
-                prompt = self.env.get_prompt(state)
-            messages = [{"role": "user", "content": prompt}]
+                # Continuation mode (original Setup A behavior):
+                # Use env.get_prompt(privileged_state) directly
+                teacher_prompt = self.env.get_prompt(priv_state)
+
+            messages = [{"role": "user", "content": teacher_prompt}]
             ids = list(
                 self.tokenizer.apply_chat_template(
                     messages,
@@ -1165,69 +1137,50 @@ Make sure to think and return the final program between ```python and ```.
                     enable_thinking=getattr(self.config, "enable_thinking", False),
                 )
             )
-            privileged_prompt_ids_list.append(ids)
-
-        # Expand each privileged prompt to group_size copies
-        privileged_prompt_ids_expanded = []
-        for ids in privileged_prompt_ids_list:
-            privileged_prompt_ids_expanded.extend([ids] * group_size)
+            teacher_prompt_ids_list.append(ids)
 
         # ------------------------------------------------------------------
         # 3. Extract student completions from rollout_batch
         # ------------------------------------------------------------------
-        # prompt_len = # of positions where attention_mask=1 and loss_mask=0
-        # comp_len   = # of positions where loss_mask=1
         prompt_lens = (attention_mask & (loss_mask == 0)).sum(dim=1).cpu().numpy()
         comp_lens = loss_mask.sum(dim=1).cpu().numpy()
 
         # ------------------------------------------------------------------
-        # 4. Build teacher sequences: privileged_prompt + student_completion
+        # 4. Build teacher sequences: teacher_prompt + student_completion
         # ------------------------------------------------------------------
         teacher_seqs = []
         teacher_loss_masks = []
         for i in range(batch_size):
             prompt_len = int(prompt_lens[i])
             comp_len = int(comp_lens[i])
-            # Student completion tokens
             student_comp = input_ids[i, prompt_len : prompt_len + comp_len].cpu().tolist()
-            # Privileged prompt tokens
-            priv_prompt = privileged_prompt_ids_expanded[i]
-            priv_len = len(priv_prompt)
-            # Concatenate
-            teacher_seq = priv_prompt + student_comp
+            teacher_prompt_ids = teacher_prompt_ids_list[i]
+            teacher_prompt_len = len(teacher_prompt_ids)
+            teacher_seq = teacher_prompt_ids + student_comp
             teacher_seqs.append(torch.tensor(teacher_seq, dtype=torch.int32))
-            # Loss mask: 0 for prompt, 1 for completion
             teacher_loss_masks.append(
-                torch.tensor([0] * priv_len + [1] * comp_len, dtype=torch.int32)
+                torch.tensor([0] * teacher_prompt_len + [1] * comp_len, dtype=torch.int32)
             )
 
-        # Pad teacher sequences to max length
+        # Pad to max length
         max_teacher_len = max(len(seq) for seq in teacher_seqs)
         pad_id = self.tokenizer.pad_token_id or 0
-        teacher_input_ids = torch.stack(
-            [
-                torch.nn.functional.pad(seq, (0, max_teacher_len - len(seq)), value=pad_id)
-                for seq in teacher_seqs
-            ]
-        )
-        teacher_attention_mask = torch.stack(
-            [
-                torch.nn.functional.pad(
-                    torch.ones(len(seq), dtype=torch.bool),
-                    (0, max_teacher_len - len(seq)),
-                    value=False,
-                )
-                for seq in teacher_seqs
-            ]
-        )
-        teacher_loss_mask = torch.stack(
-            [
-                torch.nn.functional.pad(
-                    mask, (0, max_teacher_len - len(mask)), value=0
-                )
-                for mask in teacher_loss_masks
-            ]
-        )
+        teacher_input_ids = torch.stack([
+            torch.nn.functional.pad(seq, (0, max_teacher_len - len(seq)), value=pad_id)
+            for seq in teacher_seqs
+        ])
+        teacher_attention_mask = torch.stack([
+            torch.nn.functional.pad(
+                torch.ones(len(seq), dtype=torch.bool),
+                (0, max_teacher_len - len(seq)),
+                value=False,
+            )
+            for seq in teacher_seqs
+        ])
+        teacher_loss_mask = torch.stack([
+            torch.nn.functional.pad(mask, (0, max_teacher_len - len(mask)), value=0)
+            for mask in teacher_loss_masks
+        ])
 
         teacher_batch = {
             "input_ids": teacher_input_ids,
@@ -1240,7 +1193,7 @@ Make sure to think and return the final program between ```python and ```.
         # ------------------------------------------------------------------
         with torch.no_grad():
             teacher_logps_list = self.teacher.compute_logp([teacher_batch])
-        teacher_logps_full = teacher_logps_list[0]  # [batch_size, max_teacher_len]
+        teacher_logps_full = teacher_logps_list[0]
 
         # ------------------------------------------------------------------
         # 6. Align completion logps back to student sequence positions
@@ -1251,18 +1204,15 @@ Make sure to think and return the final program between ```python and ```.
         for i in range(batch_size):
             prompt_len = int(prompt_lens[i])
             comp_len = int(comp_lens[i])
-            priv_len = len(privileged_prompt_ids_expanded[i])
+            teacher_prompt_len = len(teacher_prompt_ids_list[i])
             if comp_len == 0:
                 continue
-            # Teacher completion logps:
-            #   compute_logp returns logprobs[j] = log p(input_ids[j+1] | ...)
-            #   So completion logps span [priv_len-1, priv_len+comp_len-1)
-            t_start = priv_len - 1
-            t_end = priv_len + comp_len - 1
+            # Teacher completion logps: [teacher_prompt_len-1, teacher_prompt_len+comp_len-1)
+            t_start = teacher_prompt_len - 1
+            t_end = teacher_prompt_len + comp_len - 1
             teacher_comp_logps = teacher_logps_full[i, t_start:t_end]
 
-            # Student completion positions:
-            #   Same offset: [prompt_len-1, prompt_len+comp_len-1)
+            # Student completion positions: [prompt_len-1, prompt_len+comp_len-1)
             s_start = prompt_len - 1
             s_end = prompt_len + comp_len - 1
             aligned_teacher_logp[i, s_start:s_end] = teacher_comp_logps.to(

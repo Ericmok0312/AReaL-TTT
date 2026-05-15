@@ -267,6 +267,9 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         # Key: (parent_id, sampled_step), Value: episode dict
         # Using composite key to handle same parent sampled in multiple steps
         self._parent_episodes: dict[tuple[str, int], dict] = {}
+        
+        # Buffer to expose rollout states for downstream privileged OPD
+        self._rollout_state_buffer: list[Any] = []
 
     def get_execute_tail_latency(self, clear: bool = True) -> float:
         """
@@ -696,6 +699,9 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         """Execute the actual rollout (VLLM + Execution)."""
         # Ensure state is available in data for _compute_reward
         data["_state_obj"] = state
+        
+        # Buffer state for downstream privileged OPD (train_tttd_distill.py)
+        self._rollout_state_buffer.append(state)
         
         # Get the step when this parent was sampled (from dataloader)
         # This is CRITICAL for staleness tracking with composite key
