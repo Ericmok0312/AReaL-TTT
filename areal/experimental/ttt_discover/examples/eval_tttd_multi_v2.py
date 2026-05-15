@@ -38,6 +38,7 @@ from areal.experimental.ttt_discover.config import (
 )
 from areal.experimental.ttt_discover.sampler import (
     create_sampler_from_config,
+    create_sampler,
     _find_latest_sampler_step,
 )
 from areal.experimental.ttt_discover.dataloader import create_tttd_dataloader
@@ -82,21 +83,33 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         self.rollout_alloc = ModelAllocation.from_str(config.rollout.backend, name="rollout")
         self._amend_xccl_weight_update_envvar()
 
-        # Create sampler from initial state (no teacher checkpoint loading)
+        # Create a fresh sampler with ONLY initial states for fair evaluation.
+        # We explicitly force resume_step=None to avoid loading any trained sampler state.
         max_head_offpolicyness = getattr(config.rollout, 'max_head_offpolicyness', 2)
         max_version_history = max_head_offpolicyness + 1
         self.is_sync_mode = (max_head_offpolicyness == 0)
         if self.is_sync_mode and config.sampler.lazy_puct_sampling:
             config.sampler.lazy_puct_sampling = False
 
-        teacher_sampler_config = copy.deepcopy(config.sampler)
         import tempfile
-        teacher_sampler_config.checkpoint_dir = tempfile.mkdtemp(prefix="eval_fresh_sampler_")
+        fresh_log_path = tempfile.mkdtemp(prefix="eval_fresh_sampler_")
 
-        self.sampler = create_sampler_from_config(
-            config=teacher_sampler_config,
+        self.sampler = create_sampler(
+            sampler_type=getattr(config.sampler, 'type', 'puct'),
+            log_path=fresh_log_path,
             env_type=getattr(config.sampler, 'env_type', 'ac1'),
+            budget_s=getattr(config.sampler, 'save_freq', 100),
+            initial_exp_type=getattr(config.sampler, 'initial_exp_type', 'best_available'),
+            batch_size=getattr(config.sampler, 'batch_size', 8),
+            resume_step=None,  # FORCE fresh initial-state-only sampler
+            c_puct=getattr(config.sampler, 'c_puct', 1.5),
+            gamma=getattr(config.sampler, 'gamma', 0.95),
+            max_children=getattr(config.sampler, 'max_children', 100),
+            max_states=getattr(config.sampler, 'max_states', 10000),
+            top_k=getattr(config.sampler, 'top_k', 1000),
+            temperature=getattr(config.sampler, 'temperature', 1.0),
             max_version_history=max_version_history,
+            sampling_strategy=getattr(config.sampler, 'sampling_strategy', 'puct'),
         )
         
 
@@ -144,11 +157,37 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             student_path = getattr(config, 'student_lora_path', None)
             if student_path is None and os.path.isdir(os.path.join(eval_ckpt_dir, "student")):
                 student_path = os.path.join(eval_ckpt_dir, "student")
+            current_exp = config.experiment_name
             eval_models = {
                 "baseline": None,  # Pure base model (no LoRA adapter)
                 "teacher": teacher_path,
-                "student": student_path,
+                f"{current_exp}-student": student_path,
             }
+
+            # Auto-discover students from other experiments under the same fileroot
+            fileroot = config.saver.fileroot
+            trial_name = config.trial_name
+            if os.path.isdir(fileroot):
+                for exp_name in sorted(os.listdir(fileroot)):
+                    exp_dir = os.path.join(fileroot, exp_name)
+                    if not os.path.isdir(exp_dir):
+                        continue
+                    other_student = os.path.join(
+                        exp_dir, trial_name, "eval_checkpoints", "student"
+                    )
+                    if os.path.isdir(other_student):
+                        label = f"{exp_name}-student"
+                        # Skip if this is the current experiment (already added above)
+                        if exp_name == current_exp:
+                            continue
+                        # Avoid overwriting existing labels
+                        if label not in eval_models:
+                            eval_models[label] = other_student
+                            logger.info(
+                                f"[MultiEval] Auto-discovered student from other experiment: "
+                                f"{label} -> {other_student}"
+                            )
+
         # Keep baseline even when its path is None/empty; filter out other null paths
         eval_models = {k: v for k, v in eval_models.items() if v is not None or k == "baseline"}
         if not eval_models:
@@ -546,7 +585,7 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             for label in self._eval_models:
                 r = all_results[label]
                 logger.info(
-                    f"{label:10s} | max_reward={r['max_reward']:.4f} | "
+                    f"{label:40s} | max_reward={r['max_reward']:.4f} | "
                     f"mean_reward={r['mean_reward']:.4f} | "
                     f"rollouts={r['global_rollouts']} | "
                     f"children={r['n_children']} | failed={r['n_failed']}"
