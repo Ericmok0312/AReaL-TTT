@@ -194,7 +194,7 @@ sampler:
   gpu_type: H100
   n: 100
   sampling_strategy: puct
-  max_memory_mb: 16384
+  max_memory_mb: 0
 
 train_dataset:
   batch_size: ${sampler.batch_size}
