@@ -340,6 +340,13 @@ class TTTDDistillConfig(TTTDPPOConfig):
         metadata={"help": "Teacher sampler strategy for privileged OPD: 'puct' (top-scoring) or "
                          "'parent_pool' (random from visited states). Only used when use_privileged_teacher_logp=True."},
     )
+    privileged_prompt_mode: str = field(
+        default="continuation",
+        metadata={"help": "How to build the privileged prompt for teacher evaluation. "
+                         "'continuation': use env.get_prompt(state) with continuation bias (default, original behavior). "
+                         "'evaluation': use a neutral evaluation prompt that presents the state's code/value as a 'known good solution' "
+                         "and asks the teacher to evaluate the candidate code, removing continuation bias."},
+    )
 
 
 # Import envs here to avoid circular imports

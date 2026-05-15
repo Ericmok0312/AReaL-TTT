@@ -45,6 +45,11 @@ from areal.experimental.ttt_discover.config import (
 )
 from areal.experimental.ttt_discover.dataloader import create_tttd_dataloader
 from areal.experimental.ttt_discover.envs.env import EnvResult
+from areal.experimental.ttt_discover.envs.inequalities import (
+    AC1_EVAL_FUNCTION,
+    AC1_LITERATURE,
+    get_ac1_prompt,
+)
 from areal.experimental.ttt_discover.sampler import (
     _find_latest_sampler_step,
     create_sampler_from_config,
@@ -1010,6 +1015,69 @@ class TTTDDistillTrainer(PPOTrainer):
         )
         recover_info.dump(recover_info_path)
 
+    def _build_evaluation_prompt(self, state) -> str:
+        """Build a neutral evaluation prompt for privileged teacher OPD.
+
+        Unlike env.get_prompt(state), this prompt presents the state's code/value
+        as a 'known good solution' and asks the teacher to evaluate a candidate
+        solution, removing continuation bias (e.g., 'further improve', 'last code').
+        """
+        env_type = getattr(self.config.sampler, 'env_type', 'ac1')
+        if env_type in ('ac1', 'ac2'):
+            metric_name = "upper bound" if env_type == 'ac1' else "lower bound"
+            target = 1.5030 if env_type == 'ac1' else 0.97
+            is_maximize = False if env_type == 'ac1' else True
+            budget_s = getattr(self.config.sampler, 'budget_s', 1000)
+
+            task_desc = f"""Act as an expert evaluator for AC1 optimization.
+
+Your task is to find the sequence of non-negative heights of a step function that minimizes the following evaluation function:
+
+{AC1_EVAL_FUNCTION}
+
+{AC1_LITERATURE}
+
+Your task is to write a search function that searches for the best sequence of coefficients. Your function will have {budget_s} seconds to run, and after that it has to have returned the best sequence it found. If after {budget_s} seconds it has not returned anything, it will be terminated with negative infinity points. All numbers in your sequence have to be positive or zero. Larger sequences with 1000s of items often have better attack surface, but too large sequences with 100s of thousands of items may be too slow to search.
+
+You may code up any search method you want, and you are allowed to call the evaluate_sequence() function as many times as you want. You have access to it, you don't need to code up the evaluate_sequence() function.
+"""
+
+            # Neutral privileged context: state code/value as known good solution
+            privileged_ctx = ""
+            if state.code and state.code.strip():
+                privileged_ctx += f"""
+[Known Good Solution]
+A high-quality solution has been found for this problem with the following code:
+```python
+{state.code.strip()}
+```
+"""
+            if state.value is not None:
+                after_value = state.value if is_maximize else -state.value
+                privileged_ctx += f"This solution achieves a {metric_name} of {after_value:.6f} (target: {target}).\n"
+            if getattr(state, 'construction', None):
+                privileged_ctx += f"The resulting construction (first 20 values): {list(state.construction)[:20]}...\n"
+
+            privileged_ctx += """
+Now evaluate the following candidate solution for the SAME problem. Consider whether the candidate would find a good solution and whether it is a reasonable approach.
+
+Rules:
+- You must define the `propose_candidate` function as this is what will be invoked.
+- You can use scientific libraries like scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,ECOS,SCS,PDLP,SCIP], math.
+- You can use up to 2 CPUs.
+- Make all helper functions top level and have no closures from function nesting. Don't use any lambda functions.
+- No filesystem or network IO.
+- Do not import evaluate_sequence yourself. Assume it will already be imported and can be directly invoked.
+- **Print statements**: Use `print()` to log progress, intermediate bounds, timing info, etc. Your output will be shown back to you.
+- Include a short docstring at the top summarizing your algorithm.
+
+Make sure to think and return the final program between ```python and ```.
+"""
+            return task_desc + privileged_ctx
+        else:
+            # Fallback to original prompt for non-AC1 environments
+            return self.env.get_prompt(state)
+
     def _compute_privileged_teacher_logp(
         self, rollout_batch: dict[str, Any]
     ) -> torch.Tensor:
@@ -1026,7 +1094,7 @@ class TTTDDistillTrainer(PPOTrainer):
 
         Steps:
         1. Sample privileged states: one per group from teacher PUCTSampler.
-        2. Tokenize privileged prompts via env.get_prompt(state).
+        2. Build privileged prompts (continuation or evaluation mode).
         3. Extract student completions from rollout_batch.
         4. Build teacher sequences: repeat each privileged prompt group_size
            times and concatenate with the corresponding student completions.
@@ -1084,7 +1152,10 @@ class TTTDDistillTrainer(PPOTrainer):
         # ------------------------------------------------------------------
         privileged_prompt_ids_list = []
         for state in privileged_states:
-            prompt = self.env.get_prompt(state)
+            if getattr(self.config, 'privileged_prompt_mode', 'continuation') == 'evaluation':
+                prompt = self._build_evaluation_prompt(state)
+            else:
+                prompt = self.env.get_prompt(state)
             messages = [{"role": "user", "content": prompt}]
             ids = list(
                 self.tokenizer.apply_chat_template(
