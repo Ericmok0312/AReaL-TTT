@@ -347,6 +347,12 @@ class TTTDDistillConfig(TTTDPPOConfig):
                          "'evaluation': use a neutral evaluation prompt that presents the state's code/value as a 'known good solution' "
                          "and asks the teacher to evaluate the candidate code, removing continuation bias."},
     )
+    eval_models: dict[str, str] | None = field(
+        default=None,
+        metadata={"help": "Explicit dict of {label: lora_path} for eval_tttd_multi_v2. "
+                         "If None, auto-discovers baseline/teacher/student. "
+                         "If set, only evaluates the specified models."},
+    )
 
 
 # Import envs here to avoid circular imports
