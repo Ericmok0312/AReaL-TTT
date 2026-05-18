@@ -257,9 +257,9 @@ eval_group_size: 32
 # loaded directly by eval_tttd_multi_v2. Uncomment the step you want to evaluate.
 # Saver path: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/
 eval_models:
-  F-step60: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch0epochstep59globalstep59
-  F-step70: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch0epochstep69globalstep69
-  F-step80: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch0epochstep79globalstep79
-  F-step90: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch0epochstep89globalstep89
+  F-step60: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch59epochstep59globalstep59
+  F-step70: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch69epochstep69globalstep69
+  F-step80: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch79epochstep79globalstep79
+  F-step90: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch89epochstep89globalstep89
 # eval_models:
 #   F-student: ${cluster.fileroot}/${experiment_name}/${trial_name}/eval_checkpoints/student
