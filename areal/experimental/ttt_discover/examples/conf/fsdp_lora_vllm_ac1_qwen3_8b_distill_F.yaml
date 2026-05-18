@@ -252,6 +252,6 @@ student_lora_path: ${cluster.fileroot}/${experiment_name}/${trial_name}/eval_che
 
 # Evaluation-specific batch/group sizes (only used by eval_tttd_multi_v2.py)
 eval_batch_size: 8
-eval_group_size: 64
+eval_group_size: 32
 eval_models:
   F-student: ${cluster.fileroot}/${experiment_name}/${trial_name}/eval_checkpoints/student
