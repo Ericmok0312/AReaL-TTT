@@ -60,6 +60,8 @@ class TTTDActor(FSDPEngine):
         - R(a) is the external reward (sequence-level)
         - KL penalty is applied at token level
         """
+        if getattr(self.config, 'use_standard_grpo', False):
+            return self._compute_standard_grpo_advantages(data)
         bs = data["input_ids"].shape[0]
         max_seqlen = data["input_ids"].shape[1]
         batch_indices = torch.arange(bs, device=data["input_ids"].device, dtype=torch.long)
@@ -553,3 +555,123 @@ class TTTDActor(FSDPEngine):
         # All ranks wait here to ensure synchronization is complete
         if dist.is_initialized():
             dist.barrier(group=self.data_parallel_group)
+
+    def _compute_standard_grpo_advantages(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Standard GRPO advantage computation (DeepSeekMath-style).
+        
+        Advantage = (reward - group_mean) / (group_std + eps) - lambda * KL
+        
+        Optionally adds a small anchor bonus for rollouts close to the sampler's
+        best known reward (best_reward_anchor=True).
+        """
+        bs = data["input_ids"].shape[0]
+        max_seqlen = data["input_ids"].shape[1]
+        device = data["input_ids"].device
+        batch_indices = torch.arange(bs, device=device, dtype=torch.long)
+
+        # Reward Penalty on length
+        if self.config.overlong_reward_penalty:
+            data = reward_overlong_penalty(
+                data,
+                overlong_tokens=self.config.overlong_tokens,
+                overlong_penalty_factor=self.config.overlong_penalty_factor,
+                max_response_length=self.config.max_new_tokens,
+            )
+
+        # Reward Scaling
+        reward_score = data["rewards"]
+        if reward_score.dim() > 1:
+            reward_score = reward_score.squeeze(-1)
+        reward_score = (reward_score + self.actor.reward_bias) * self.actor.reward_scaling
+        reward_score = torch.clip(
+            reward_score, max=self.actor.reward_clip, min=-self.actor.reward_clip
+        )
+        if self.actor.reward_norm:
+            reward_score = self.actor.reward_norm(reward_score)
+
+        loss_mask = data["loss_mask"].float()
+        loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
+
+        # Apply the mask to log probabilities (same as standard PPO)
+        if not self.config.use_decoupled_loss and self.config.recompute_logprob:
+            prox_logp_value = data["prox_logp"]
+            if prox_logp_value is None:
+                raise ValueError(
+                    "prox_logp is None but recompute_logprob=True. "
+                    "This indicates compute_logp() was skipped incorrectly."
+                )
+            old_logp = data["logprobs"] = prox_logp_value
+        else:
+            old_logp = torch.roll(data["logprobs"], shifts=-1, dims=-1)
+            if not self.config.use_decoupled_loss:
+                data["prox_logp"] = old_logp
+        ref_logp = data.get("ref_logp")
+        if ref_logp is None:
+            ref_logp = torch.zeros_like(old_logp)
+        ref_logp *= loss_mask
+        old_logp *= loss_mask
+
+        # Compute KL divergence.
+        attn_mask = data["attention_mask"]
+        seqlens = attn_mask.sum(-1).long()
+        kl_div = self.actor.kl_estimator(old_logp, ref_logp)
+        kl_penalty = self.actor.kl_ctl * kl_div
+        kl_rewards = -kl_penalty
+        kl_rewards[batch_indices, seqlens - 1] = 0
+
+        # Extract group ids
+        group_ids = self._extract_group_ids(data, bs)
+
+        # Compute standard GRPO advantages per group
+        grpo_adv_seq = torch.zeros_like(reward_score)
+        unique_groups = torch.unique(group_ids)
+        for gid in unique_groups:
+            mask = (group_ids == gid)
+            group_rewards = reward_score[mask]
+            group_mean = group_rewards.mean()
+            group_std = group_rewards.std() + 1e-8
+            grpo_adv_seq[mask] = (group_rewards - group_mean) / group_std
+
+        # Optional: best reward anchor for small-group stability
+        if getattr(self.config, 'best_reward_anchor', False) and self.sampler is not None:
+            try:
+                best_solution = self.sampler.get_best_solution()
+                if best_solution is not None:
+                    best_value = best_solution.get('value')
+                    if best_value is not None:
+                        best_reward = (best_value + self.actor.reward_bias) * self.actor.reward_scaling
+                        # Small Gaussian bonus for rollouts close to best
+                        for gid in unique_groups:
+                            mask = (group_ids == gid)
+                            group_rewards = reward_score[mask]
+                            group_std = group_rewards.std() + 1e-8
+                            closeness = torch.exp(-((group_rewards - best_reward) ** 2) / (2 * group_std ** 2))
+                            grpo_adv_seq[mask] = grpo_adv_seq[mask] + 0.1 * closeness
+            except Exception:
+                pass  # Silently skip if sampler doesn't support get_best_solution
+
+        # Broadcast to token level
+        grpo_adv_token = grpo_adv_seq.unsqueeze(-1).expand(-1, max_seqlen)
+        advantages = grpo_adv_token - kl_penalty
+        advantages = advantages * loss_mask
+
+        data["returns"] = advantages
+        if self.actor.adv_norm is not None:
+            advantages = self.actor.adv_norm(advantages, loss_mask)
+
+        # Compute total rewards for logging
+        tot_rewards = kl_rewards.clone()
+        indices = torch.clip(seqlens - 2, min=0)
+        seq_no_eos_mask = seqlens == attn_mask.shape[1]
+        if getattr(self.actor, 'mask_no_eos_with_zero', False):
+            tot_rewards[batch_indices, indices] += torch.where(seq_no_eos_mask, 0, reward_score)
+        else:
+            tot_rewards[batch_indices, indices] += reward_score
+
+        data["advantages"] = advantages
+        data["kl_rewards"] = kl_rewards * loss_mask
+        data["tot_rewards"] = tot_rewards
+        data["loss_mask"] = loss_mask
+        data["logprobs"] = old_logp
+
+        return data

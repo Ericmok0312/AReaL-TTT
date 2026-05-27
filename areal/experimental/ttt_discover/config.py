@@ -182,6 +182,19 @@ class TTTDPPOActorConfig(PPOActorConfig):
         metadata={"help": "Binary search iterations for adaptive beta"},
     )
 
+    # Standard GRPO option (for hybrid RL+distillation)
+    use_standard_grpo: bool = field(
+        default=False,
+        metadata={"help": "If True, use standard GRPO advantage (reward - group_mean) / group_std "
+                         "instead of TTT-Discover entropic objective (w_beta - 1)."},
+    )
+    best_reward_anchor: bool = field(
+        default=False,
+        metadata={"help": "If True, add a small Gaussian bonus to GRPO advantages for rollouts "
+                         "close to the sampler's best known reward. Stabilizes training "
+                         "with small group sizes by anchoring to a global reference."},
+    )
+
     # Grouping strategy
     group_size: int | None = field(
         default=None,
@@ -352,6 +365,23 @@ class TTTDDistillConfig(TTTDPPOConfig):
         metadata={"help": "Explicit dict of {label: lora_path} for eval_tttd_multi_v2. "
                          "If None, auto-discovers baseline/teacher/student. "
                          "If set, only evaluates the specified models."},
+    )
+    use_real_reward: bool = field(
+        default=False,
+        metadata={"help": "If True, use real environment reward (tttd_reward_fn) during "
+                         "distillation rollouts instead of dummy_reward_fn. Enables "
+                         "joint RL + OPD distillation (KDRL)."},
+    )
+    use_standard_grpo: bool = field(
+        default=False,
+        metadata={"help": "If True, use standard GRPO advantage (reward - group_mean) / group_std "
+                         "instead of TTT-Discover entropic objective (w_beta - 1)."},
+    )
+    best_reward_anchor: bool = field(
+        default=False,
+        metadata={"help": "If True, add a small bonus to GRPO advantages for rollouts "
+                         "close to the sampler's best known reward. Stabilizes training "
+                         "with small group sizes by anchoring to a global reference."},
     )
 
 

@@ -220,6 +220,11 @@ class TTTDDistillTrainer(PPOTrainer):
         # =====================================================================
         # Create student actor (with LoRA)
         # =====================================================================
+        # Propagate standard GRPO settings from top-level config to actor config
+        config.actor.use_standard_grpo = getattr(config, 'use_standard_grpo', False)
+        config.actor.best_reward_anchor = getattr(config, 'best_reward_anchor', False)
+        # Set group_size for correct GRPO grouping (one group per prompt)
+        config.actor.group_size = config.gconfig.n_samples
         self.actor = self._create_tttd_actor(config.actor)
         self.ref = None  # No ref model needed (kl_ctl=0)
 
@@ -726,10 +731,14 @@ class TTTDDistillTrainer(PPOTrainer):
 
             step_start_time = time.perf_counter()
 
-            # Create distill workflow with dummy reward (no verification)
+            # Create distill workflow (dummy or real reward)
             distill_kwargs = self._workflow_kwargs.copy()
-            distill_kwargs['reward_fn'] = dummy_reward_fn
-            distill_kwargs['max_reward_workers'] = 1  # Dummy reward is fast
+            if config.use_real_reward:
+                distill_kwargs['reward_fn'] = tttd_reward_fn
+                # Use default max_reward_workers from workflow_kwargs
+            else:
+                distill_kwargs['reward_fn'] = dummy_reward_fn
+                distill_kwargs['max_reward_workers'] = 1  # Dummy reward is fast
             distill_workflow = workflow(**distill_kwargs)
 
             # Set current version for tracking
