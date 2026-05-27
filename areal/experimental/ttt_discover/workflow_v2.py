@@ -346,31 +346,53 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         input_ids: list[int],
         fail_type: str,
         error_msg: str = "",
+        resp: "ModelResponse | None" = None,
     ) -> dict[str, torch.Tensor]:
         """
         Create a trajectory for failed rollouts.
         
-        Delegates to the environment to control:
-        - Reward value for different failure types
-        - Whether the failure contributes to training (loss_mask)
-        - Failure-specific observations
+        If ``resp`` is provided (model already generated a completion but execution
+        failed), the full prompt + completion sequence is preserved with a correct
+        loss_mask so that prompt_len > 0 and privileged teacher logp alignment works.
         
         Args:
             state: The state object (may be None)
-            input_ids: Input token IDs
+            input_ids: Input token IDs (fallback when resp is None)
             fail_type: Type of failure (timeout, code_extraction_failed, execution_error, missing_state)
             error_msg: Additional error message
+            resp: Optional model response containing the generated completion
             
         Returns:
             Dictionary with trajectory tensors
         """
-        trajectory = self.env.create_failed_trajectory(
-            state=state,
-            input_ids=input_ids,
-            tokenizer=self.tokenizer,
-            fail_type=fail_type,
-            error_msg=error_msg,
-        )
+        if resp is not None:
+            # Preserve the full generated sequence (prompt + completion) with correct masks
+            seq = resp.input_tokens + resp.output_tokens
+            loss_mask = [0] * resp.input_len + [1] * resp.output_len
+            logprobs = [0.0] * resp.input_len + resp.output_logprobs
+            versions = [-1] * resp.input_len + resp.output_versions
+            
+            # Get reward from env (may vary by fail_type)
+            result = self.env.get_failure_result(state, fail_type, error_msg)
+            
+            trajectory = {
+                "input_ids": torch.tensor(seq, dtype=torch.int32).unsqueeze(0),
+                "loss_mask": torch.tensor(loss_mask, dtype=torch.int32).unsqueeze(0),
+                "logprobs": torch.tensor(logprobs, dtype=torch.float32).unsqueeze(0),
+                "versions": torch.tensor(versions, dtype=torch.int32).unsqueeze(0),
+                "attention_mask": torch.ones(len(seq), dtype=torch.bool).unsqueeze(0),
+                "rewards": torch.tensor([result.reward], dtype=torch.float32),
+            }
+        else:
+            # Fallback: no response available (e.g. missing state, engine exception)
+            trajectory = self.env.create_failed_trajectory(
+                state=state,
+                input_ids=input_ids,
+                tokenizer=self.tokenizer,
+                fail_type=fail_type,
+                error_msg=error_msg,
+            )
+        
         trajectory["_student_prompts"] = [self.env.get_prompt(state) if state is not None else ""]
         return trajectory
 
@@ -853,6 +875,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                     input_ids=input_ids,
                     fail_type=fail_type,
                     error_msg=result.observation,
+                    resp=resp,
                 )
             
             # Create child state and buffer sampler update (thread-safe)
