@@ -50,6 +50,7 @@ from areal.experimental.ttt_discover.envs.inequalities import (
     AC1_LITERATURE,
     get_ac1_prompt,
 )
+from areal.experimental.ttt_discover.reward import tttd_reward_fn
 from areal.experimental.ttt_discover.sampler import (
     _find_latest_sampler_step,
     create_sampler_from_config,
