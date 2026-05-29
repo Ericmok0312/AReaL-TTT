@@ -18,8 +18,8 @@ best_reward_anchor: true
 # Native AReaL KDRL teacher config
 teacher:
   backend: fsdp:d4p1t1
-  rl_loss_weight: 1.5
-  distill_loss_weight: 1.0
+  rl_loss_weight: 1.0
+  distill_loss_weight: 2.0
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: ./outputs_ac1_async_v2/checkpoints/eric/tttd-async-qwen3-8b-ac1/trial0/default/epoch49epochstep49globalstep49
@@ -77,8 +77,8 @@ actor:
     warmup_steps_proportion: 0.001
   eps_clip: 0.4
   temperature: ${gconfig.temperature}
-  reward_scaling: 10.0
-  reward_bias: -0.5
+  reward_scaling: 2.0
+  reward_bias: -1.0
   kl_ctl: 0.0
   ppo_n_minibatches: 1
   recompute_logprob: true
