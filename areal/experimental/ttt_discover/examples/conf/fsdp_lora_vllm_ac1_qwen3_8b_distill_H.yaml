@@ -266,4 +266,18 @@ eval_group_size: 64
 #   G-step40: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch39epochstep39globalstep39
 #   G-step50: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch49epochstep49globalstep49
 eval_models:
-  H-student: ${cluster.fileroot}/${experiment_name}/${trial_name}/eval_checkpoints/student
+  H-step10: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch9epochstep9globalstep9
+  H-step20: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch19epochstep19globalstep19
+  H-step30: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch29epochstep29globalstep29
+  H-step40: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch39epochstep39globalstep39
+  H-step50: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch49epochstep49globalstep49
+  H-step60: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch59epochstep59globalstep59
+  H-step70: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch69epochstep69globalstep69
+  H-step80: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch79epochstep79globalstep79
+  H-step90: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch89epochstep89globalstep89
+  H-step100: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch99epochstep99globalstep99
+  H-step110: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch109epochstep109globalstep109
+  H-step120: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch119epochstep119globalstep119
+  H-step130: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch129epochstep129globalstep129
+  H-step140: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch139epochstep139globalstep139
+  H-step150: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch149epochstep149globalstep149
