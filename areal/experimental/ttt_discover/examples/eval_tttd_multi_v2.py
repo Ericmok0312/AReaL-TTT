@@ -351,11 +351,27 @@ class TTTDMultiEvalTrainer(PPOTrainer):
                 if hasattr(we, 'data_generator'):
                     delattr(we, 'data_generator')
                     targets.append("workflow_executor.data_generator")
+                # Also clear workflow reference to force using the new workflow
+                if hasattr(we, 'workflow'):
+                    delattr(we, 'workflow')
+                    targets.append("workflow_executor.workflow")
+                # Clear any cached states
+                for attr in ['_workflow', '_cached_workflow', 'last_workflow']:
+                    if hasattr(we, attr):
+                        delattr(we, attr)
+                        targets.append(f"workflow_executor.{attr}")
 
         # rollout directly
         if hasattr(self.rollout, 'data_generator'):
             delattr(self.rollout, 'data_generator')
             targets.append("rollout.data_generator")
+        if hasattr(self.rollout, 'workflow'):
+            delattr(self.rollout, 'workflow')
+            targets.append("rollout.workflow")
+
+        # Force garbage collection to ensure old workflow is fully released
+        import gc
+        gc.collect()
 
         if targets:
             logger.info(f"[MultiEval] Cleared caches: {', '.join(targets)}")
@@ -400,6 +416,10 @@ class TTTDMultiEvalTrainer(PPOTrainer):
         eval_kwargs = self._workflow_kwargs.copy()
         eval_kwargs['reward_fn'] = tttd_reward_fn
         eval_workflow = workflow_class(**eval_kwargs)
+        logger.info(
+            f"[MultiEval-{label}] Created fresh workflow instance: {id(eval_workflow)}, "
+            f"pending_children={len(getattr(eval_workflow, '_pending_children', []))}"
+        )
 
         self._clear_workflow_cache()
 
@@ -424,6 +444,14 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             logger.error(traceback.format_exc())
             raise
         eval_rollout_time = time.perf_counter() - eval_start
+        
+        # Diagnostic: check workflow pending updates immediately after prepare_batch
+        immediate_children = len(getattr(eval_workflow, '_pending_children', []))
+        immediate_parents = len(getattr(eval_workflow, '_pending_parents', []))
+        logger.info(
+            f"[MultiEval-{label}] After prepare_batch: pending_children={immediate_children}, "
+            f"pending_parents={immediate_parents}"
+        )
 
         # Normalize batch
         eval_batch = self._normalize_eval_batch(eval_batch)
@@ -481,11 +509,16 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             all_rewards_list = local_rewards_list
 
         # Get pending updates
+        logger.info(f"[MultiEval-{label}] Getting pending updates from workflow...")
         eval_updates = eval_workflow.get_pending_updates(clear=True)
         if len(eval_updates) == 5:
             eval_children, eval_parents, eval_failed, eval_metadata, _ = eval_updates
         else:
             eval_children, eval_parents, eval_failed, eval_metadata = eval_updates
+        logger.info(
+            f"[MultiEval-{label}] Pending updates: children={len(eval_children)}, "
+            f"parents={len(eval_parents)}, failed={len(eval_failed)}"
+        )
 
         result = {
             "model": label,
@@ -499,15 +532,69 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             "n_failed": len(eval_failed),
             "rollout_time_s": eval_rollout_time,
             "children": [],
+            "parents": [],
+            "failed": [],
         }
 
+        # Save detailed children info
         for child in eval_children:
-            result["children"].append({
-                "id": child.id,
-                "timestep": child.timestep,
-                "value": child.value,
+            child_data = {
+                "id": getattr(child, 'id', None),
+                "timestep": getattr(child, 'timestep', None),
+                "value": getattr(child, 'value', None),
                 "code": getattr(child, 'code', None),
-            })
+                "construction": getattr(child, 'construction', None),
+                "parent_values": getattr(child, 'parent_values', None),
+                "parents": getattr(child, 'parents', None),
+                "observation": getattr(child, 'observation', None),
+                "exec_time_ms": getattr(child, 'exec_time_ms', None),
+            }
+            result["children"].append(child_data)
+
+        # Save parents info
+        for parent in eval_parents:
+            parent_data = {
+                "id": getattr(parent, 'id', None),
+                "timestep": getattr(parent, 'timestep', None),
+                "value": getattr(parent, 'value', None),
+                "code": getattr(parent, 'code', None),
+                "construction": getattr(parent, 'construction', None),
+            }
+            result["parents"].append(parent_data)
+
+        # Save failed rollouts info
+        for failed in eval_failed:
+            failed_data = {
+                "id": getattr(failed, 'id', None),
+                "timestep": getattr(failed, 'timestep', None),
+                "value": getattr(failed, 'value', None),
+                "code": getattr(failed, 'code', None),
+                "construction": getattr(failed, 'construction', None),
+                "observation": getattr(failed, 'observation', None),
+            }
+            result["failed"].append(failed_data)
+
+        # Save per-rank detailed data to disk (avoid NCCL hang with large objects)
+        eval_output_dir = os.path.join(
+            self.config.saver.fileroot,
+            self.config.experiment_name,
+            self.config.trial_name,
+        )
+        rank = self.actor.data_parallel_rank if hasattr(self.actor, 'data_parallel_rank') else 0
+        detailed_path = os.path.join(
+            eval_output_dir,
+            f"eval_detailed_{label}_rank{rank}.json"
+        )
+        os.makedirs(eval_output_dir, exist_ok=True)
+        with open(detailed_path, 'w') as f:
+            json.dump({
+                "model": label,
+                "rank": rank,
+                "children": result["children"],
+                "parents": result["parents"],
+                "failed": result["failed"],
+            }, f, indent=2, default=str)
+        logger.info(f"[MultiEval-{label}] Saved detailed data to {detailed_path}")
 
         logger.info(
             f"[MultiEval-{label}] max={eval_max_reward:.4f}, mean={eval_mean_reward:.4f}, "
@@ -544,7 +631,7 @@ class TTTDMultiEvalTrainer(PPOTrainer):
                 label, idx , workflow_class, group_size
             )
 
-        # Merge per-rank reward files on rank 0
+        # Merge per-rank data on rank 0
         if is_dp_head and dist.is_initialized():
             eval_output_dir = os.path.join(
                 config.saver.fileroot,
@@ -552,8 +639,13 @@ class TTTDMultiEvalTrainer(PPOTrainer):
                 config.trial_name,
             )
             for label in self._eval_models:
+                # Merge rewards
                 merged_rewards = []
+                merged_children = []
+                merged_parents = []
+                merged_failed = []
                 for rank in range(self.actor.data_parallel_world_size):
+                    # Rewards
                     rewards_path = os.path.join(
                         eval_output_dir,
                         f"eval_rewards_{label}_rank{rank}.json"
@@ -561,7 +653,44 @@ class TTTDMultiEvalTrainer(PPOTrainer):
                     if os.path.exists(rewards_path):
                         with open(rewards_path, 'r') as f:
                             merged_rewards.extend(json.load(f))
+                    
+                    # Detailed data
+                    detailed_path = os.path.join(
+                        eval_output_dir,
+                        f"eval_detailed_{label}_rank{rank}.json"
+                    )
+                    if os.path.exists(detailed_path):
+                        with open(detailed_path, 'r') as f:
+                            detailed_data = json.load(f)
+                            merged_children.extend(detailed_data.get("children", []))
+                            merged_parents.extend(detailed_data.get("parents", []))
+                            merged_failed.extend(detailed_data.get("failed", []))
+                
                 all_results[label]["all_rewards"] = merged_rewards
+                all_results[label]["children"] = merged_children
+                all_results[label]["parents"] = merged_parents
+                all_results[label]["failed"] = merged_failed
+                all_results[label]["n_children"] = len(merged_children)
+                all_results[label]["n_parents"] = len(merged_parents)
+                all_results[label]["n_failed"] = len(merged_failed)
+                
+                # Save merged detailed data
+                merged_detailed_path = os.path.join(
+                    eval_output_dir,
+                    f"eval_detailed_{label}_merged.json"
+                )
+                with open(merged_detailed_path, 'w') as f:
+                    json.dump({
+                        "model": label,
+                        "children": merged_children,
+                        "parents": merged_parents,
+                        "failed": merged_failed,
+                    }, f, indent=2, default=str)
+                logger.info(
+                    f"[MultiEval] Merged detailed data for {label}: "
+                    f"{len(merged_children)} children, {len(merged_parents)} parents, "
+                    f"{len(merged_failed)} failed"
+                )
 
         # Save comparison results
         if is_dp_head:
