@@ -658,15 +658,34 @@ class TTTDDistillTrainer(PPOTrainer):
             # only flat-concats lists (tuples are treated as scalars and only the
             # first element is kept).
             student_prompts: list[str] = []
+            breakthrough_parents: list[Any] = []
+            breakthrough_children: list[Any] = []
             for d in rollout_batch:
                 sp = d.pop("_student_prompts", None)
                 if isinstance(sp, (list, tuple)):
                     student_prompts.extend(sp)
                 elif sp is not None:
                     student_prompts.append(sp)
+                
+                bp = d.pop("_breakthrough_parent", None)
+                if isinstance(bp, (list, tuple)):
+                    breakthrough_parents.extend(bp)
+                elif bp is not None:
+                    breakthrough_parents.append(bp)
+                
+                bc = d.pop("_breakthrough_child", None)
+                if isinstance(bc, (list, tuple)):
+                    breakthrough_children.extend(bc)
+                elif bc is not None:
+                    breakthrough_children.append(bc)
+            
             batched, _meta = concat_batch(rollout_batch)
             if student_prompts:
                 batched["_student_prompts"] = student_prompts
+            if breakthrough_parents:
+                batched["_breakthrough_parent"] = breakthrough_parents
+            if breakthrough_children:
+                batched["_breakthrough_child"] = breakthrough_children
             return batched
         raise TypeError(f"Unexpected rollout_batch type: {type(rollout_batch)}")
 
