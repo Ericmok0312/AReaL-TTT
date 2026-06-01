@@ -81,6 +81,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         dp_rank: int = 0,
         dp_world_size: int = 1,
         hint_fn: Callable | None = None,
+        hint_placement: str = "append",
     ):
         """
         Initialize TTT-Discover Workflow V2.
@@ -118,6 +119,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         """
         self.env = env
         self.hint_fn = hint_fn  # Optional hint function: fn(state) -> str
+        self.hint_placement = hint_placement  # 'append', 'replace_code', or 'replace_no_code'
         self.sampler = sampler  # PUCTSampler reference for lazy sampling
         self.auto_flush = auto_flush
         self.max_prompt_thinking_tokens = max_prompt_thinking_tokens
@@ -321,13 +323,40 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         return stats
 
     def _get_prompt(self, state, use_hint: bool = True) -> str:
-        """Get prompt for state, optionally appending hint."""
+        """Get prompt for state, optionally appending or replacing with hint."""
         prompt = self.env.get_prompt(state)
         if use_hint and self.hint_fn is not None and state is not None:
             try:
                 hint = self.hint_fn(state)
                 if hint:
-                    prompt = prompt + hint
+                    if self.hint_placement == "replace_code":
+                        import re
+                        # Replace "Here is the last code we ran:" block
+                        pattern = r"\nHere is the last code we ran:\n```python\n.*?```\n"
+                        match = re.search(pattern, prompt, re.DOTALL)
+                        if match:
+                            prompt = prompt[:match.start()] + "\n" + hint + prompt[match.end():]
+                            return prompt
+                        # Fallback: replace "No previous code available."
+                        pattern2 = r"\nNo previous code available\."
+                        match2 = re.search(pattern2, prompt)
+                        if match2:
+                            prompt = prompt[:match2.start()] + "\n" + hint + prompt[match2.end():]
+                            return prompt
+                        # Final fallback: append
+                        prompt = prompt + "\n\n" + hint
+                    elif self.hint_placement == "replace_no_code":
+                        import re
+                        pattern = r"\nNo previous code available\."
+                        match = re.search(pattern, prompt)
+                        if match:
+                            prompt = prompt[:match.start()] + "\n" + hint + prompt[match.end():]
+                            return prompt
+                        # Fallback: append
+                        prompt = prompt + "\n\n" + hint
+                    else:
+                        # Default: append
+                        prompt = prompt + hint
             except Exception as e:
                 logger.warning(f"[Workflow] hint_fn failed: {e}")
         return prompt

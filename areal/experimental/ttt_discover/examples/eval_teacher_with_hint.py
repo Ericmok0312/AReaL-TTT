@@ -375,52 +375,12 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
                 # No hint_fn
             )
         else:
-            # Hint mode: replace "No previous code available." with hint in value_context position
-            # Monkey-patch env.get_prompt to inject hint at the right place
-            original_get_prompt = self.env.get_prompt
-            
-            def get_prompt_with_hint(state):
-                prompt = original_get_prompt(state)
-                
-                # Get current state's upper bound (raw_score)
-                current_raw_score = None
-                if hasattr(state, 'value') and state.value is not None:
-                    val = state.value
-                    if abs(val) < 1.0:
-                        current_raw_score = 1.0 / (-val) if val < 0 else 1.0 / val
-                    else:
-                        current_raw_score = -val if val < 0 else val
-                
-                # Sample hint state
+            # Hint mode: use hint_fn with replace_code placement via workflow
+            def hint_fn(state):
                 hint_states = self.hint_sampler.sample_states(1)
-                if hint_states and hint_states[0].code:
-                    hint = self._build_hint(hint_states[0], current_raw_score)
-                    
-                    # Replace the entire "Here is the last code we ran..." block with hint
-                    # This handles both cases: states with code and without code
-                    import re
-                    
-                    # Pattern 1: State has code ("Here is the last code we ran:")
-                    pattern1 = r"\nHere is the last code we ran:\n```python\n.*?```\n"
-                    match1 = re.search(pattern1, prompt, re.DOTALL)
-                    if match1:
-                        modified = prompt[:match1.start()] + "\n" + hint + prompt[match1.end():]
-                        return modified
-                    
-                    # Pattern 2: State has no code ("No previous code available.")
-                    pattern2 = r"\nNo previous code available\."
-                    match2 = re.search(pattern2, prompt)
-                    if match2:
-                        modified = prompt[:match2.start()] + "\n" + hint + prompt[match2.end():]
-                        return modified
-                    
-                    # Fallback: append hint at end
-                    logger.warning("[Eval] Could not find code block in prompt, appending hint instead.")
-                    return prompt + "\n\n" + hint
-                
-                return prompt
-            
-            self.env.get_prompt = get_prompt_with_hint
+                if hint_states:
+                    return self._build_hint(hint_states[0])
+                return ""
             
             workflow_kwargs = dict(
                 env=self.env,
@@ -434,7 +394,8 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
                 vllm_concurrency=getattr(config.sampler, 'vllm_concurrency', None),
                 execution_concurrency=getattr(config.sampler, 'execution_concurrency', 64),
                 reward_fn=tttd_reward_fn,
-                # No hint_fn - hint is injected via env.get_prompt
+                hint_fn=hint_fn,
+                hint_placement="replace_code",
             )
         eval_workflow = TTTDiscoverWorkflowV2(**workflow_kwargs)
 
