@@ -220,7 +220,7 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
         
         current_score_text = ""
         if current_raw_score is not None:
-            current_score_text = f" The current initial state has a raw score of {current_raw_score:.6f}."
+            current_score_text = f" The current initial state has a raw score of {current_raw_score:.6f}. (Note the lower the raw score, the better the code.)"
         
         return (
             f"Here is a known good approach for this problem:\n"
