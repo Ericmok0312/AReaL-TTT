@@ -477,12 +477,16 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
             logger.info(f"[Eval] Results saved to {output_path}")
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python eval_teacher_with_hint.py --config <path_to_config.yaml>")
-        sys.exit(1)
-
-    config = load_expr_config(sys.argv[1], TTTDDistillConfig)
+def main(args):
+    config, _ = load_expr_config(args, TTTDDistillConfig)
+    
+    if config.tokenizer_path:
+        from areal.utils.hf_utils import load_hf_tokenizer
+        tokenizer = load_hf_tokenizer(config.tokenizer_path)
+        if tokenizer.pad_token_id not in config.gconfig.stop_token_ids:
+            config.gconfig.stop_token_ids.append(tokenizer.pad_token_id)
+        if tokenizer.eos_token_id not in config.gconfig.stop_token_ids:
+            config.gconfig.stop_token_ids.append(tokenizer.eos_token_id)
     
     # Override eval batch size if needed
     if not hasattr(config, 'eval_batch_size'):
@@ -495,4 +499,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])
