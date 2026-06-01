@@ -124,27 +124,36 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
         # Store base env directly (hint will be applied via workflow hint_fn)
         self.env = self.base_env
 
-        # Create a fresh initial-state sampler for evaluation
-        import tempfile
-        fresh_log_path = tempfile.mkdtemp(prefix="eval_fresh_sampler_")
-        from areal.experimental.ttt_discover.sampler import create_sampler
-        self.sampler = create_sampler(
-            sampler_type=getattr(config.sampler, 'type', 'puct'),
-            log_path=fresh_log_path,
-            env_type=getattr(config.sampler, 'env_type', 'ac1'),
-            budget_s=getattr(config.sampler, 'save_freq', 100),
-            initial_exp_type=getattr(config.sampler, 'initial_exp_type', 'best_available'),
-            batch_size=getattr(config.sampler, 'batch_size', 8),
-            resume_step=None,
-            c_puct=getattr(config.sampler, 'c_puct', 1.5),
-            gamma=getattr(config.sampler, 'gamma', 0.95),
-            max_children=getattr(config.sampler, 'max_children', 100),
-            max_states=getattr(config.sampler, 'max_states', 10000),
-            top_k=getattr(config.sampler, 'top_k', 1000),
-            temperature=getattr(config.sampler, 'temperature', 1.0),
-            max_version_history=max_version_history,
-            sampling_strategy=getattr(config.sampler, 'sampling_strategy', 'puct'),
-        )
+        # Determine eval prompt mode
+        self.eval_prompt_mode = getattr(config, 'eval_prompt_mode', 'hint')
+        logger.info(f"[Eval] Prompt mode: {self.eval_prompt_mode}")
+
+        if self.eval_prompt_mode == 'continuation':
+            # Continuation mode: use hint_sampler directly for both prompt and states
+            # No need for fresh sampler
+            self.sampler = self.hint_sampler
+        else:
+            # Hint mode: fresh initial-state sampler for eval
+            import tempfile
+            fresh_log_path = tempfile.mkdtemp(prefix="eval_fresh_sampler_")
+            from areal.experimental.ttt_discover.sampler import create_sampler
+            self.sampler = create_sampler(
+                sampler_type=getattr(config.sampler, 'type', 'puct'),
+                log_path=fresh_log_path,
+                env_type=getattr(config.sampler, 'env_type', 'ac1'),
+                budget_s=getattr(config.sampler, 'save_freq', 100),
+                initial_exp_type=getattr(config.sampler, 'initial_exp_type', 'best_available'),
+                batch_size=getattr(config.sampler, 'batch_size', 8),
+                resume_step=None,
+                c_puct=getattr(config.sampler, 'c_puct', 1.5),
+                gamma=getattr(config.sampler, 'gamma', 0.95),
+                max_children=getattr(config.sampler, 'max_children', 100),
+                max_states=getattr(config.sampler, 'max_states', 10000),
+                top_k=getattr(config.sampler, 'top_k', 1000),
+                temperature=getattr(config.sampler, 'temperature', 1.0),
+                max_version_history=max_version_history,
+                sampling_strategy=getattr(config.sampler, 'sampling_strategy', 'puct'),
+            )
 
         # Create actor
         self.actor = self._create_tttd_actor(config.actor)
@@ -326,27 +335,44 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
         local_batch_size = config.eval_batch_size // self.actor.data_parallel_world_size
         group_size = config.gconfig.n_samples
         
-        # Build hint_fn that samples from hint_sampler for each state
-        def hint_fn(state):
-            hint_states = self.hint_sampler.sample_states(1)
-            if hint_states:
-                return self._build_hint(hint_states[0])
-            return ""
-        
-        workflow_kwargs = dict(
-            env=self.env,
-            gconfig=config.gconfig,
-            tokenizer=self.tokenizer,
-            enable_thinking=getattr(config, 'enable_thinking', False),
-            max_prompt_thinking_tokens=getattr(config, 'max_prompt_thinking_tokens', 26000),
-            batch_size=local_batch_size,
-            group_size=group_size,
-            lazy_sampling=config.sampler.lazy_puct_sampling,
-            vllm_concurrency=getattr(config.sampler, 'vllm_concurrency', None),
-            execution_concurrency=getattr(config.sampler, 'execution_concurrency', 64),
-            reward_fn=tttd_reward_fn,
-            hint_fn=hint_fn,
-        )
+        if self.eval_prompt_mode == 'continuation':
+            # Continuation mode: no hint, prompt is based on privileged state directly
+            workflow_kwargs = dict(
+                env=self.env,
+                gconfig=config.gconfig,
+                tokenizer=self.tokenizer,
+                enable_thinking=getattr(config, 'enable_thinking', False),
+                max_prompt_thinking_tokens=getattr(config, 'max_prompt_thinking_tokens', 26000),
+                batch_size=local_batch_size,
+                group_size=group_size,
+                lazy_sampling=config.sampler.lazy_puct_sampling,
+                vllm_concurrency=getattr(config.sampler, 'vllm_concurrency', None),
+                execution_concurrency=getattr(config.sampler, 'execution_concurrency', 64),
+                reward_fn=tttd_reward_fn,
+                # No hint_fn
+            )
+        else:
+            # Hint mode: append hint to prompt
+            def hint_fn(state):
+                hint_states = self.hint_sampler.sample_states(1)
+                if hint_states:
+                    return self._build_hint(hint_states[0])
+                return ""
+            
+            workflow_kwargs = dict(
+                env=self.env,
+                gconfig=config.gconfig,
+                tokenizer=self.tokenizer,
+                enable_thinking=getattr(config, 'enable_thinking', False),
+                max_prompt_thinking_tokens=getattr(config, 'max_prompt_thinking_tokens', 26000),
+                batch_size=local_batch_size,
+                group_size=group_size,
+                lazy_sampling=config.sampler.lazy_puct_sampling,
+                vllm_concurrency=getattr(config.sampler, 'vllm_concurrency', None),
+                execution_concurrency=getattr(config.sampler, 'execution_concurrency', 64),
+                reward_fn=tttd_reward_fn,
+                hint_fn=hint_fn,
+            )
         eval_workflow = TTTDiscoverWorkflowV2(**workflow_kwargs)
 
         self._clear_workflow_cache()
@@ -359,6 +385,26 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
 
         for step in range(num_steps):
             logger.info(f"[Eval] Step {step + 1}/{num_steps}")
+            
+            # Log sampled states before rollout
+            preview_states = self.sampler.sample_states(config.eval_batch_size)
+            state_values = []
+            for i, s in enumerate(preview_states):
+                val = getattr(s, 'value', None)
+                raw_score = -val if val is not None else None
+                state_values.append(f"state{i}: value={val:.4f}, raw_score={raw_score:.4f}" if val is not None else f"state{i}: N/A")
+            logger.info(f"[Eval] Sampled states for step {step+1}: {', '.join(state_values)}")
+            
+            if self.eval_prompt_mode == 'hint':
+                # Also log hint states
+                hint_states = self.hint_sampler.sample_states(config.eval_batch_size)
+                hint_values = []
+                for i, s in enumerate(hint_states):
+                    val = getattr(s, 'value', None)
+                    raw_score = -val if val is not None else None
+                    hint_values.append(f"hint{i}: value={val:.4f}, raw_score={raw_score:.4f}" if val is not None else f"hint{i}: N/A")
+                logger.info(f"[Eval] Hint states for step {step+1}: {', '.join(hint_values)}")
+            
             eval_start = time.perf_counter()
             try:
                 with stats_tracker.record_timing("eval_rollout_teacher_hint"):
@@ -424,9 +470,13 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
 
         # Print results
         logger.info("=" * 60)
-        logger.info("TEACHER WITH HINT - EVALUATION RESULTS")
+        if self.eval_prompt_mode == 'continuation':
+            logger.info("TEACHER CONTINUATION - EVALUATION RESULTS")
+        else:
+            logger.info("TEACHER WITH HINT - EVALUATION RESULTS")
         logger.info("=" * 60)
         logger.info(f"Teacher path: {self._teacher_path}")
+        logger.info(f"Prompt mode: {self.eval_prompt_mode}")
         logger.info(f"Total rollouts: {global_count}")
         logger.info(f"Max reward: {global_max:.4f}")
         logger.info(f"Mean reward: {global_mean:.4f}")
