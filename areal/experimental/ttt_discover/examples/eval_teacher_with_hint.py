@@ -361,10 +361,23 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
         logger.info("[Eval] Weights pushed and rollout resumed.")
 
         # Create workflow with hint-wrapped env
-        workflow_kwargs = self._workflow_kwargs.copy()
-        workflow_kwargs['reward_fn'] = tttd_reward_fn
-        # Override env in workflow kwargs with our hint wrapper
-        workflow_kwargs['env'] = self.env
+        config = self.config
+        local_batch_size = config.eval_batch_size // self.actor.data_parallel_world_size
+        group_size = config.gconfig.n_samples
+        
+        workflow_kwargs = dict(
+            env=self.env,
+            gconfig=config.gconfig,
+            tokenizer=self.tokenizer,
+            enable_thinking=getattr(config, 'enable_thinking', False),
+            max_prompt_thinking_tokens=getattr(config, 'max_prompt_thinking_tokens', 26000),
+            batch_size=local_batch_size,
+            group_size=group_size,
+            lazy_sampling=config.sampler.lazy_puct_sampling,
+            vllm_concurrency=getattr(config.sampler, 'vllm_concurrency', None),
+            execution_concurrency=getattr(config.sampler, 'execution_concurrency', 64),
+            reward_fn=tttd_reward_fn,
+        )
         eval_workflow = TTTDiscoverWorkflowV2(**workflow_kwargs)
 
         self._clear_workflow_cache()
