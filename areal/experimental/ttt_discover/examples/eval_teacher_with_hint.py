@@ -367,6 +367,10 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
             def get_prompt_with_hint(state):
                 prompt = original_get_prompt(state)
                 
+                # DEBUG: log actual prompt snippet
+                if 'No previous code' not in prompt:
+                    logger.warning(f"[Eval-DEBUG] Prompt does NOT contain 'No previous code'. Prompt snippet around value context:\n{prompt[prompt.find('You are iteratively'):prompt.find('You may want to start')][:500]}")
+                
                 # Get current state's raw score
                 current_raw_score = None
                 if hasattr(state, 'value') and state.value is not None:
