@@ -385,12 +385,13 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             "_student_prompts": [self._get_prompt(state, use_hint=False) if state is not None else ""],
         }
         # Attach breakthrough parent/child for Breakthrough-Aware OPD
-        # parent = the state this rollout started from
-        # child = the breakthrough state sampled alongside this parent
+        # Wrap in list so concat_padded_tensors flat-concats them correctly
+        # (concat_padded_tensors handles list values by flat-concat, but treats
+        # non-list scalars as identical and keeps only the first dict's value)
         if state is not None:
-            trajectory["_breakthrough_parent"] = state
+            trajectory["_breakthrough_parent"] = [state]
         if breakthrough_child is not None:
-            trajectory["_breakthrough_child"] = breakthrough_child
+            trajectory["_breakthrough_child"] = [breakthrough_child]
             # Log alignment at trajectory creation time
             improvement = (breakthrough_child.value if breakthrough_child.value is not None else 0) - (
                 state.value if state is not None and state.value is not None else 0
@@ -458,10 +459,11 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         trajectory["_student_prompts"] = [self._get_prompt(state, use_hint=False) if state is not None else ""]
         
         # Attach breakthrough parent/child for Breakthrough-Aware OPD
+        # Wrap in list so concat_padded_tensors flat-concats them correctly
         if state is not None:
-            trajectory["_breakthrough_parent"] = state
+            trajectory["_breakthrough_parent"] = [state]
         if breakthrough_child is not None:
-            trajectory["_breakthrough_child"] = breakthrough_child
+            trajectory["_breakthrough_child"] = [breakthrough_child]
         
         return trajectory
 
