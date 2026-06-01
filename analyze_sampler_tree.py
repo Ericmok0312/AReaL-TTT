@@ -231,9 +231,13 @@ def analyze_sampler_tree(config_path: str, output_dir: str | None = None):
             'total_states': total_states,
             'n_transitions': len(transitions),
             'n_root_states': len(root_states),
-            'thresholds': {
+            'abs_thresholds': {
+                str(threshold): sum(1 for t in transitions if t['absolute_improvement'] >= threshold)
+                for threshold in abs_thresholds
+            },
+            'rel_thresholds': {
                 str(threshold): sum(1 for t in transitions if t['relative_improvement'] >= threshold)
-                for threshold in thresholds
+                for threshold in rel_thresholds
             },
             'parent_raw_stats': {
                 'min': float(min(parent_raws)),
