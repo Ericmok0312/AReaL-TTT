@@ -377,7 +377,11 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
                 if hint_states and hint_states[0].code:
                     hint = self._build_hint(hint_states[0], current_raw_score)
                     # Replace "No previous code available." with hint
-                    modified = prompt.replace("No previous code available.", hint)
+                    # Note: actual string in state.to_prompt() is "\nNo previous code available."
+                    modified = prompt.replace("\nNo previous code available.", "\n" + hint)
+                    if modified == prompt:
+                        # Try without leading newline as fallback
+                        modified = prompt.replace("No previous code available.", hint)
                     if modified == prompt:
                         logger.warning("[Eval] Could not find 'No previous code available.' in prompt, appending hint instead.")
                         return prompt + "\n\n" + hint
