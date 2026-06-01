@@ -191,7 +191,9 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
         return (
             f"\n\n[Hint] A known good approach for this problem:\n"
             f"{hint_text}\n"
-            f"You can learn from this approach but try to improve it further.\n"
+            f"Your task is to reuse the above algorithm with minimal modifications. "
+            f"Do NOT invent a completely different approach. "
+            f"The hint code is proven to work — your job is to adapt it, not replace it.\n"
         )
 
     def _create_tttd_actor(self, actor_config):
