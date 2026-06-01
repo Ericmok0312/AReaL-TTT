@@ -202,9 +202,19 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
         if privileged_state.code and privileged_state.code.strip():
             hint_parts.append(f"```python\n{privileged_state.code.strip()}\n```")
         if privileged_state.value is not None:
-            # AC1: state.value = -reward, so reward = -value, raw_score = 1.0 / reward
-            hint_reward = -privileged_state.value
-            hint_raw_score = 1.0 / hint_reward if hint_reward > 0 else float('inf')
+            # AC1: state.value stores display metric.
+            # Based on observed values: value ~ -0.664 (reward) or value ~ -1.506 (raw_score)
+            # Use abs to handle both cases robustly.
+            val = privileged_state.value
+            abs_val = abs(val)
+            if abs_val > 1.0:
+                # Likely -raw_score (e.g., -1.506)
+                hint_raw_score = abs_val
+                hint_reward = 1.0 / hint_raw_score
+            else:
+                # Likely -reward (e.g., -0.664)
+                hint_reward = abs_val
+                hint_raw_score = 1.0 / hint_reward if hint_reward > 0 else float('inf')
             hint_parts.append(f"This approach achieves a raw score of {hint_raw_score:.6f} (reward: {hint_reward:.6f}).")
         hint_text = "\n".join(hint_parts)
         
@@ -372,12 +382,14 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
             def get_prompt_with_hint(state):
                 prompt = original_get_prompt(state)
                 
-                # Get current state's raw score
-                # AC1: state.value = -reward, so raw_score = 1.0 / (-value)
+                # Get current state's upper bound (raw_score)
                 current_raw_score = None
                 if hasattr(state, 'value') and state.value is not None:
-                    current_reward = -state.value
-                    current_raw_score = 1.0 / current_reward if current_reward > 0 else float('inf')
+                    val = state.value
+                    if abs(val) < 1.0:
+                        current_raw_score = 1.0 / (-val) if val < 0 else 1.0 / val
+                    else:
+                        current_raw_score = -val if val < 0 else val
                 
                 # Sample hint state
                 hint_states = self.hint_sampler.sample_states(1)
