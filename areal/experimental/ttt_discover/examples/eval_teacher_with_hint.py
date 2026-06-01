@@ -386,6 +386,10 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
                     match1 = re.search(pattern1, prompt, re.DOTALL)
                     if match1:
                         modified = prompt[:match1.start()] + "\n" + hint + prompt[match1.end():]
+                        # Log the modified prompt snippet
+                        start_idx = max(0, match1.start() - 100)
+                        end_idx = min(len(modified), match1.start() + len(hint) + 100)
+                        logger.info(f"[Eval] Replaced 'Here is the last code we ran' with hint. Modified prompt snippet:\n{modified[start_idx:end_idx]}")
                         return modified
                     
                     # Pattern 2: State has no code ("No previous code available.")
@@ -393,6 +397,10 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
                     match2 = re.search(pattern2, prompt)
                     if match2:
                         modified = prompt[:match2.start()] + "\n" + hint + prompt[match2.end():]
+                        # Log the modified prompt snippet
+                        start_idx = max(0, match2.start() - 100)
+                        end_idx = min(len(modified), match2.start() + len(hint) + 100)
+                        logger.info(f"[Eval] Replaced 'No previous code available' with hint. Modified prompt snippet:\n{modified[start_idx:end_idx]}")
                         return modified
                     
                     # Fallback: append hint at end
