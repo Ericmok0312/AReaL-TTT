@@ -456,6 +456,13 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             )
         
         trajectory["_student_prompts"] = [self._get_prompt(state, use_hint=False) if state is not None else ""]
+        
+        # Attach breakthrough parent/child for Breakthrough-Aware OPD
+        if state is not None:
+            trajectory["_breakthrough_parent"] = state
+        if breakthrough_child is not None:
+            trajectory["_breakthrough_child"] = breakthrough_child
+        
         return trajectory
 
     @trace_session("reward")

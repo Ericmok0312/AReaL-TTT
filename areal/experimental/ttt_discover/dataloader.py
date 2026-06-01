@@ -75,12 +75,25 @@ class _StateSamplerIterableDataset(IterableDataset):
             else:
                 # Eager mode: sample immediately (original behavior)
                 global_batch_size = self.local_batch_size * self.world_size
-                states = self.state_sampler.sample_states(global_batch_size)
+                
+                # Support breakthrough_parent strategy in eager mode
+                if getattr(self.state_sampler, 'sampling_strategy', None) == 'breakthrough_parent':
+                    if hasattr(self.state_sampler, 'sample_breakthrough_parents'):
+                        all_pairs = self.state_sampler.sample_breakthrough_parents(global_batch_size)
+                        states = [p for p, _c in all_pairs]
+                        breakthrough_children = [_c for _p, _c in all_pairs]
+                    else:
+                        states = self.state_sampler.sample_states(global_batch_size)
+                        breakthrough_children = [None] * len(states)
+                else:
+                    states = self.state_sampler.sample_states(global_batch_size)
+                    breakthrough_children = [None] * len(states)
                 
                 # Shard for current rank
                 start_idx = self.rank * self.local_batch_size
                 end_idx = start_idx + self.local_batch_size
                 local_states = states[start_idx:end_idx]
+                local_children = breakthrough_children[start_idx:end_idx]
                 
                 # Yield individual samples for collation
                 # Get PUCT stats if available (for Q-value estimation error analysis)
@@ -106,6 +119,10 @@ class _StateSamplerIterableDataset(IterableDataset):
                         "_state_obj": state,
                         "_sampled_step": sampled_step,  # Record when this parent was sampled
                     }
+                    
+                    # Attach breakthrough child for Breakthrough-Aware OPD
+                    if i < len(local_children) and local_children[i] is not None:
+                        sample["_breakthrough_child"] = local_children[i]
                     
                     # Record PUCT selection stats if available
                     # This enables analysis of: "what was the PUCT score at selection time"
