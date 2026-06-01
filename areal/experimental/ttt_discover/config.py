@@ -340,6 +340,11 @@ class TTTDDistillConfig(TTTDPPOConfig):
         metadata={"help": "Prompt mode for teacher eval: 'hint' (initial state + hint appended) or "
                          "'continuation' (directly use PUCT sampler's privileged state as prompt base)."},
     )
+    test_construction_match: bool = field(
+        default=False,
+        metadata={"help": "TEST ONLY: If True, replace initial state's construction with hint state's construction "
+                         "to verify if construction quality is the bottleneck."},
+    )
 
     # Distillation behavior controls
     use_privileged_teacher_logp: bool = field(

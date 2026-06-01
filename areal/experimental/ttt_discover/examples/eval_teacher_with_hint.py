@@ -126,7 +126,10 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
 
         # Determine eval prompt mode
         self.eval_prompt_mode = getattr(config, 'eval_prompt_mode', 'hint')
+        self.test_construction_match = getattr(config, 'test_construction_match', False)
         logger.info(f"[Eval] Prompt mode: {self.eval_prompt_mode}")
+        if self.test_construction_match:
+            logger.info("[Eval] TEST MODE: initial states will use hint states' constructions!")
 
         if self.eval_prompt_mode == 'continuation':
             # Continuation mode: use hint_sampler directly for both prompt and states
@@ -191,36 +194,30 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
     def _build_hint(self, privileged_state, current_raw_score: float | None = None) -> str:
         """Build hint from privileged state, placed in value_context position.
         
-        AC1 state.value stores -reward (e.g., -0.664 for reward=0.664).
-        Raw score = 1.0 / reward (e.g., 1.0 / 0.664 = 1.506).
-        
-        Distinguishes between:
-        - hint_raw_score: the raw score achieved by the hint code
-        - current_raw_score: the raw score of the current initial state
+        Uses 'upper bound' consistently since AC1 minimize upper bound (lower is better).
         """
         hint_parts = []
         if privileged_state.code and privileged_state.code.strip():
             hint_parts.append(f"```python\n{privileged_state.code.strip()}\n```")
         if privileged_state.value is not None:
-            # AC1: state.value stores display metric.
-            # Based on observed values: value ~ -0.664 (reward) or value ~ -1.506 (raw_score)
-            # Use abs to handle both cases robustly.
+            # Convert state.value to upper bound (raw_score), lower is better
             val = privileged_state.value
-            abs_val = abs(val)
-            if abs_val > 1.0:
-                # Likely -raw_score (e.g., -1.506)
-                hint_raw_score = abs_val
-                hint_reward = 1.0 / hint_raw_score
+            if abs(val) < 1.0:
+                upper_bound = 1.0 / (-val) if val < 0 else 1.0 / val
             else:
-                # Likely -reward (e.g., -0.664)
-                hint_reward = abs_val
-                hint_raw_score = 1.0 / hint_reward if hint_reward > 0 else float('inf')
-            hint_parts.append(f"This approach achieves a raw score of {hint_raw_score:.6f} (reward: {hint_reward:.6f}).")
+                upper_bound = -val if val < 0 else val
+            hint_parts.append(
+                f"This approach achieves an upper bound of {upper_bound:.6f} "
+                f"(lower is better — a significant improvement over random initial states)."
+            )
         hint_text = "\n".join(hint_parts)
         
         current_score_text = ""
         if current_raw_score is not None:
-            current_score_text = f" The current initial state has a raw score of {current_raw_score:.6f}. (Note the lower the raw score, the better the code.)"
+            current_score_text = (
+                f" The current initial state has an upper bound of {current_raw_score:.6f}. "
+                f"Remember: lower upper bound is better."
+            )
         
         return (
             f"Here is a known good approach for this problem:\n"
@@ -379,7 +376,17 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
             def hint_fn(state):
                 hint_states = self.hint_sampler.sample_states(1)
                 if hint_states:
-                    return self._build_hint(hint_states[0])
+                    hint_state = hint_states[0]
+                    if self.test_construction_match and hasattr(state, 'construction'):
+                        # TEST: replace initial state's construction with hint state's
+                        logger.info(
+                            f"[TEST] Replacing initial construction (len={len(state.construction) if state.construction else 0}) "
+                            f"with hint construction (len={len(hint_state.construction) if hint_state.construction else 0})"
+                        )
+                        state.construction = hint_state.construction
+                        if hasattr(state, 'value'):
+                            state.value = hint_state.value
+                    return self._build_hint(hint_state)
                 return ""
             
             workflow_kwargs = dict(
