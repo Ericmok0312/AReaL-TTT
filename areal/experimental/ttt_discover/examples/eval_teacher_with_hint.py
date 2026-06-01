@@ -405,7 +405,6 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
                     match1 = re.search(pattern1, prompt, re.DOTALL)
                     if match1:
                         modified = prompt[:match1.start()] + "\n" + hint + prompt[match1.end():]
-                        print(f"\n{'='*60}\nFULL PROMPT (replaced 'Here is the last code'):\n{'='*60}\n{modified}\n{'='*60}\n")
                         return modified
                     
                     # Pattern 2: State has no code ("No previous code available.")
@@ -413,7 +412,6 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
                     match2 = re.search(pattern2, prompt)
                     if match2:
                         modified = prompt[:match2.start()] + "\n" + hint + prompt[match2.end():]
-                        print(f"\n{'='*60}\nFULL PROMPT (replaced 'No previous code'):\n{'='*60}\n{modified}\n{'='*60}\n")
                         return modified
                     
                     # Fallback: append hint at end
