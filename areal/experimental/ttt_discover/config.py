@@ -370,6 +370,20 @@ class TTTDDistillConfig(TTTDPPOConfig):
                          "'evaluation': use a neutral evaluation prompt that presents the state's code/value as a 'known good solution' "
                          "and asks the teacher to evaluate the candidate code, removing continuation bias."},
     )
+    use_breakthrough_opd: bool = field(
+        default=False,
+        metadata={"help": "If True, teacher privileged prompts are built from breakthrough transitions "
+                         "(parent→child pairs with large reward improvement) instead of random high-value states. "
+                         "The teacher hint shows the student how a previous state was dramatically improved, "
+                         "not just what a good final state looks like."},
+    )
+    breakthrough_min_improvement: float = field(
+        default=0.001,
+        metadata={"help": "Minimum absolute value improvement (child.value - parent.value) for a transition "
+                         "to be considered a breakthrough when use_breakthrough_opd=True. "
+                         "Larger values select only the most dramatic breakthroughs (exploration); "
+                         "smaller values include refinement transitions as well."},
+    )
     eval_models: dict[str, str] | None = field(
         default=None,
         metadata={"help": "Explicit dict of {label: lora_path} for eval_tttd_multi_v2. "

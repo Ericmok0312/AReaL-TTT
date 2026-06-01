@@ -153,6 +153,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             self._exec_sem = asyncio.Semaphore(max(1, execution_concurrency))
             # Batch-level parent caching (version mapping is in sampler)
             self._batch_parents: dict[int, list] = {}
+            self._batch_breakthrough_children: dict[int, list] = {}
             self._cache_lock = asyncio.Lock()
             logger.info(f"TTTDiscoverWorkflowV2: Lazy sampling enabled, "
                        f"vllm_sem={max(1, vllm_concurrency)} (slot-level per-rank), "
@@ -366,6 +367,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         resp: ModelResponse,
         reward: float,
         state: "State | None" = None,
+        breakthrough_child: "State | None" = None,
     ) -> dict[str, torch.Tensor]:
         """Create trajectory tensors from response and reward."""
         seq = resp.input_tokens + resp.output_tokens
@@ -373,7 +375,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         loss_mask = [0] * resp.input_len + [1] * resp.output_len
         versions = [-1] * resp.input_len + resp.output_versions
         
-        return {
+        trajectory = {
             "input_ids": torch.tensor(seq, dtype=torch.int32).unsqueeze(0),
             "loss_mask": torch.tensor(loss_mask, dtype=torch.int32).unsqueeze(0),
             "logprobs": torch.tensor(logprobs, dtype=torch.float32).unsqueeze(0),
@@ -382,6 +384,22 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             "rewards": torch.tensor([reward], dtype=torch.float32),
             "_student_prompts": [self._get_prompt(state, use_hint=False) if state is not None else ""],
         }
+        # Attach breakthrough parent/child for Breakthrough-Aware OPD
+        # parent = the state this rollout started from
+        # child = the breakthrough state sampled alongside this parent
+        if state is not None:
+            trajectory["_breakthrough_parent"] = state
+        if breakthrough_child is not None:
+            trajectory["_breakthrough_child"] = breakthrough_child
+            # Log alignment at trajectory creation time
+            improvement = (breakthrough_child.value if breakthrough_child.value is not None else 0) - (
+                state.value if state is not None and state.value is not None else 0
+            )
+            logger.info(
+                f"[BREAKTHROUGH_ALIGN] trajectory parent={state.id[:8] if state else 'None'} "
+                f"child={breakthrough_child.id[:8]} improvement={improvement:.6f}"
+            )
+        return trajectory
     
     def _create_failed_trajectory(
         self,
@@ -390,6 +408,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         fail_type: str,
         error_msg: str = "",
         resp: "ModelResponse | None" = None,
+        breakthrough_child: "State | None" = None,
     ) -> dict[str, torch.Tensor]:
         """
         Create a trajectory for failed rollouts.
@@ -573,21 +592,55 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             # Sample parents (only once per batch per rank)
             if batch_id not in self._batch_parents:
                 global_batch = self.batch_size * self.dp_world_size
-                all_parents = self.sampler.sample_states_for_version(
-                    num_states=global_batch,
-                    target_version=version
-                )
+                
+                # Breakthrough-parent strategy: sample parents that have breakthrough children
+                if getattr(self.sampler, 'sampling_strategy', None) == 'breakthrough_parent':
+                    min_improvement = getattr(self.config, 'breakthrough_min_improvement', 0.001)
+                    all_pairs = self.sampler.sample_breakthrough_parents(
+                        num_states=global_batch,
+                        min_improvement=min_improvement,
+                    )
+                    all_parents = [p for p, _c in all_pairs]
+                    all_children = [_c for _p, _c in all_pairs]
+                else:
+                    all_parents = self.sampler.sample_states_for_version(
+                        num_states=global_batch,
+                        target_version=version
+                    )
+                    all_children = [None] * len(all_parents)
                 
                 # Take this rank's slice
                 start_idx = self.dp_rank * self.batch_size
                 my_parents = all_parents[start_idx:start_idx + self.batch_size]
+                my_children = all_children[start_idx:start_idx + self.batch_size]
                 self._batch_parents[batch_id] = my_parents
+                self._batch_breakthrough_children[batch_id] = my_children
                 
-                logger.info(
-                    f"[LAZY_SAMPLE] batch_id={batch_id} rank={self.dp_rank} "
-                    f"version={version} "
-                    f"parents={[p.id[:8] for p in my_parents]}"
-                )
+                # Log parent-child alignment for Breakthrough-Aware OPD verification
+                if getattr(self.sampler, 'sampling_strategy', None) == 'breakthrough_parent':
+                    pair_info = []
+                    for p, c in zip(my_parents, my_children):
+                        if c is not None:
+                            improvement = (c.value if c.value is not None else 0) - (p.value if p.value is not None else 0)
+                            pair_info.append(f"{p.id[:8]}->{c.id[:8]}(+{improvement:.4f})")
+                        else:
+                            pair_info.append(f"{p.id[:8]}->None")
+                    logger.info(
+                        f"[LAZY_SAMPLE] batch_id={batch_id} rank={self.dp_rank} "
+                        f"version={version} strategy=breakthrough_parent "
+                        f"pairs={pair_info}"
+                    )
+                else:
+                    logger.info(
+                        f"[LAZY_SAMPLE] batch_id={batch_id} rank={self.dp_rank} "
+                        f"version={version} strategy=puct "
+                        f"parents={[p.id[:8] for p in my_parents]}"
+                    )
+            
+            # Attach breakthrough child to data for trajectory/teacher logp
+            breakthrough_children = self._batch_breakthrough_children.get(batch_id, [])
+            if batch_idx < len(breakthrough_children):
+                data['_breakthrough_child'] = breakthrough_children[batch_idx]
             
             return self._batch_parents[batch_id][batch_idx]
     
@@ -651,13 +704,14 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         if not self.lazy_sampling:
             return
         
-        # Clean up _batch_parents (workflow-local cache)
+        # Clean up _batch_parents and breakthrough children (workflow-local cache)
         sorted_batches = sorted(self._batch_parents.keys())
         if len(sorted_batches) > max_history:
             to_remove = sorted_batches[:-max_history]  # Remove oldest
             
             for bid in to_remove:
                 self._batch_parents.pop(bid, None)
+                self._batch_breakthrough_children.pop(bid, None)
             
             logger.info(
                 f"[LAZY_CLEANUP] Step {current_step}: Cleaned up {len(to_remove)} old batches, "
@@ -909,7 +963,10 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             
             # Create trajectory - use failed trajectory for invalid results
             if result.is_valid:
-                trajectory = self._create_trajectory(resp, reward, state=state)
+                trajectory = self._create_trajectory(
+                    resp, reward, state=state,
+                    breakthrough_child=data.get('_breakthrough_child')
+                )
             else:
                 # Use fail_type from result if available, otherwise default to execution_error
                 fail_type = result.fail_type or "execution_error"
@@ -919,6 +976,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                     fail_type=fail_type,
                     error_msg=result.observation,
                     resp=resp,
+                    breakthrough_child=data.get('_breakthrough_child'),
                 )
             
             # Create child state and buffer sampler update (thread-safe)

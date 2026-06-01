@@ -1124,6 +1124,172 @@ class PUCTSampler(StateSampler):
             rows.append((idx, state.timestep, state.value, 0, parent_val, constr_len, obs_len, n, Q, P, bonus, score))
         return columns, rows
     
+    def sample_breakthrough_transitions(
+        self,
+        num_transitions: int,
+        min_improvement: float = 0.001,
+    ) -> list[tuple[State, State]]:
+        """Sample breakthrough (parent, child) transitions.
+
+        A breakthrough transition is one where the child achieves significantly
+        higher value than its parent.  These transitions capture the "aha moments"
+        in the search tree — e.g. jumping from a random construction (reward≈0.5)
+        to a well-structured one (reward≈0.636).
+
+        Parameters
+        ----------
+        num_transitions : int
+            Number of transitions to sample.
+        min_improvement : float
+            Minimum absolute value improvement (child.value - parent.value) for a
+            transition to be considered a breakthrough.
+
+        Returns
+        -------
+        list[tuple[State, State]]
+            List of (parent_state, child_state) pairs.
+        """
+        import logging
+        logger = logging.getLogger("PUCTSampler")
+
+        with self._lock:
+            # Build id -> state map for fast lookup
+            state_by_id = {s.id: s for s in self._states}
+
+            # Collect all valid parent->child transitions
+            transitions: list[tuple[float, State, State]] = []
+            for child in self._states:
+                if not child.parents:
+                    continue
+                parent_id = child.parents[0].get("id")
+                if not parent_id:
+                    continue
+                parent = state_by_id.get(str(parent_id))
+                if parent is None:
+                    continue
+                improvement = (child.value if child.value is not None else float("-inf")) - (
+                    parent.value if parent.value is not None else float("-inf")
+                )
+                # Only include transitions with positive improvement
+                if improvement > 0:
+                    transitions.append((improvement, parent, child))
+
+            if not transitions:
+                # Fallback: return random parent->child pairs (any improvement)
+                logger.warning(
+                    f"[Breakthrough] No transitions found, returning empty list"
+                )
+                return []
+
+            # Sort by improvement descending
+            transitions.sort(key=lambda x: x[0], reverse=True)
+
+            # Filter to breakthrough transitions
+            breakthroughs = [t for t in transitions if t[0] >= min_improvement]
+
+            # If not enough breakthroughs, fall back to all positive transitions
+            pool = breakthroughs if len(breakthroughs) >= num_transitions else transitions
+
+            if len(pool) >= num_transitions:
+                # Weighted sampling by improvement
+                weights = np.array([t[0] for t in pool])
+                weights = weights + 1e-6
+                weights = weights / weights.sum()
+                indices = np.random.choice(
+                    len(pool), size=num_transitions, p=weights, replace=True
+                )
+                return [(pool[i][1], pool[i][2]) for i in indices]
+            else:
+                # Cycle through available transitions
+                result = []
+                for i in range(num_transitions):
+                    result.append((pool[i % len(pool)][1], pool[i % len(pool)][2]))
+                return result
+
+    def sample_breakthrough_parents(
+        self,
+        num_states: int,
+        min_improvement: float = 0.001,
+    ) -> list[tuple[State, State]]:
+        """Sample parent states that have breakthrough children.
+
+        For each parent in the tree, finds its best child (max improvement).
+        Returns (parent_state, best_child_state) pairs sorted by improvement.
+        This is deterministic — all ranks calling with same parameters get
+        the same result, ensuring distributed consistency.
+
+        Parameters
+        ----------
+        num_states : int
+            Number of parent states to sample.
+        min_improvement : float
+            Minimum child.value - parent.value for a transition to qualify.
+
+        Returns
+        -------
+        list[tuple[State, State]]
+            List of (parent, best_child) pairs.
+        """
+        import logging
+        logger = logging.getLogger("PUCTSampler")
+
+        with self._lock:
+            state_by_id = {s.id: s for s in self._states}
+
+            # parent_id -> (improvement, parent, best_child)
+            parent_best: dict[str, tuple[float, State, State]] = {}
+
+            for child in self._states:
+                if not child.parents:
+                    continue
+                parent_id = child.parents[0].get("id")
+                if not parent_id:
+                    continue
+                parent = state_by_id.get(str(parent_id))
+                if parent is None:
+                    continue
+
+                improvement = (child.value if child.value is not None else float("-inf")) - (
+                    parent.value if parent.value is not None else float("-inf")
+                )
+                if improvement <= 0:
+                    continue
+
+                # Keep best child per parent
+                if parent_id not in parent_best or improvement > parent_best[parent_id][0]:
+                    parent_best[parent_id] = (improvement, parent, child)
+
+            # Filter by min_improvement and sort descending
+            breakthroughs = [
+                (imp, p, c) for _pid, (imp, p, c) in parent_best.items()
+                if imp >= min_improvement
+            ]
+            breakthroughs.sort(key=lambda x: x[0], reverse=True)
+
+            if not breakthroughs:
+                logger.warning(
+                    f"[BreakthroughParents] No breakthroughs found with "
+                    f"min_improvement={min_improvement}. Total parents={len(parent_best)}"
+                )
+                # Fall back to any positive improvement
+                breakthroughs = list(parent_best.values())
+                breakthroughs.sort(key=lambda x: x[0], reverse=True)
+
+            if not breakthroughs:
+                return []
+
+            # Deterministic: cycle through sorted breakthroughs
+            result = []
+            for i in range(num_states):
+                result.append((breakthroughs[i % len(breakthroughs)][1],
+                               breakthroughs[i % len(breakthroughs)][2]))
+
+            logger.info(
+                f"[BreakthroughParents] Sampled {num_states} parents from "
+                f"{len(breakthroughs)} breakthroughs (min_improvement={min_improvement})"
+            )
+            return result
+
     def deserialize_full_state(self, state_data: dict) -> None:
         """
         Atomically replace entire sampler state from serialized data.

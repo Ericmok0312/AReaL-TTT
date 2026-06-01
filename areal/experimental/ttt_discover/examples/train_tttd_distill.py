@@ -1050,6 +1050,53 @@ class TTTDDistillTrainer(PPOTrainer):
         hint_text = "\n".join(hint_parts)
         return f"\n\n[Hint] A known good approach for this problem:\n{hint_text}\nYou can learn from this approach but try to improve it further.\n"
 
+    def _build_breakthrough_hint(self, parent_state, child_state) -> str:
+        """Build a breakthrough hint showing parent -> child improvement.
+
+        This gives the teacher privileged access to a "breakthrough transition"
+        — a pair where the child significantly outperforms its parent.
+        The teacher can then better evaluate whether the student's code
+        captures the key algorithmic insight behind the breakthrough.
+        """
+        hint_parts = []
+
+        # Parent info (the starting point)
+        if parent_state.value is not None:
+            # state.value is negative; for AC1 lower raw_score is better.
+            # We display as "reward-like" numbers (0.5–0.664) for readability.
+            parent_display = -parent_state.value
+            hint_parts.append(f"A previous approach achieved value {parent_display:.6f}.")
+
+        # Child info (the breakthrough)
+        if child_state.value is not None:
+            child_display = -child_state.value
+            improvement = child_display - (-parent_state.value if parent_state.value is not None else 0)
+            hint_parts.append(
+                f"A breakthrough approach achieves {child_display:.6f} "
+                f"(improvement: +{improvement:.6f})."
+            )
+
+        # Child code — the key algorithmic insight
+        if child_state.code and child_state.code.strip():
+            code = child_state.code.strip()
+            # Truncate very long code to avoid blowing up the prompt
+            max_code_len = 4000
+            if len(code) > max_code_len:
+                code = code[:max_code_len] + "\n... (truncated)"
+            hint_parts.append(f"```python\n{code}\n```")
+
+        # Construction metadata
+        if hasattr(child_state, 'construction') and child_state.construction:
+            hint_parts.append(f"This breakthrough uses a sequence of length {len(child_state.construction)}.")
+
+        hint_text = "\n".join(hint_parts)
+        return (
+            f"\n\n[Breakthrough Hint] Here is an example of a dramatic improvement "
+            f"from a similar starting point:\n{hint_text}\n"
+            f"Study this breakthrough strategy and apply similar ideas to improve "
+            f"the current construction.\n"
+        )
+
     def _compute_privileged_teacher_logp(
         self, rollout_batch: dict[str, Any]
     ) -> torch.Tensor:
@@ -1094,20 +1141,66 @@ class TTTDDistillTrainer(PPOTrainer):
         dp_rank = self.actor.data_parallel_rank
         global_num_groups = local_num_groups * dp_world_size
 
-        all_privileged_states = self.teacher_sampler.sample_states(global_num_groups)
-        start_idx = dp_rank * local_num_groups
-        privileged_states = all_privileged_states[start_idx:start_idx + local_num_groups]
+        # ------------------------------------------------------------------
+        # 1. Check for Breakthrough-Aware OPD data from workflow
+        # ------------------------------------------------------------------
+        use_breakthrough_opd = getattr(self.config, 'use_breakthrough_opd', False)
+        breakthrough_parents = rollout_batch.get("_breakthrough_parent", [])
+        breakthrough_children = rollout_batch.get("_breakthrough_child", [])
+        has_breakthrough_data = (
+            use_breakthrough_opd
+            and len(breakthrough_parents) > 0
+            and len(breakthrough_children) > 0
+        )
 
-        for i, state in enumerate(privileged_states):
+        if not has_breakthrough_data:
+            # Standard OPD: sample privileged states directly
+            all_privileged_states = self.teacher_sampler.sample_states(global_num_groups)
+            start_idx = dp_rank * local_num_groups
+            privileged_states = all_privileged_states[start_idx:start_idx + local_num_groups]
+
+            for i, state in enumerate(privileged_states):
+                logger.info(
+                    f"[PrivilegedOPD] Rank {dp_rank} priv_state {i}/{local_num_groups} "
+                    f"value={state.value:.4f}, id={state.id[:8] if hasattr(state.id, '__len__') and len(state.id) > 8 else state.id}"
+                )
+
+            # Expand privileged states to match rollouts (group_size copies per group)
+            privileged_states_expanded = []
+            for state in privileged_states:
+                privileged_states_expanded.extend([state] * group_size)
+        else:
+            # Breakthrough-Aware OPD: parent/child pairs come from workflow (aligned)
             logger.info(
-                f"[PrivilegedOPD] Rank {dp_rank} priv_state {i}/{local_num_groups} "
-                f"value={state.value:.4f}, id={state.id[:8] if hasattr(state.id, '__len__') and len(state.id) > 8 else state.id}"
+                f"[BreakthroughOPD] Rank {dp_rank} using aligned breakthrough data: "
+                f"parents={len(breakthrough_parents)} children={len(breakthrough_children)} "
+                f"batch_size={batch_size}"
             )
-
-        # Expand privileged states to match rollouts (group_size copies per group)
-        privileged_states_expanded = []
-        for state in privileged_states:
-            privileged_states_expanded.extend([state] * group_size)
+            # Validate length alignment
+            if len(breakthrough_parents) != batch_size or len(breakthrough_children) != batch_size:
+                logger.warning(
+                    f"[BreakthroughOPD] LENGTH_MISMATCH! parents={len(breakthrough_parents)} "
+                    f"children={len(breakthrough_children)} batch_size={batch_size}"
+                )
+            # Log first few items for verification (with IDs for cross-reference)
+            for i in range(min(5, batch_size)):
+                parent = breakthrough_parents[i] if i < len(breakthrough_parents) else None
+                child = breakthrough_children[i] if i < len(breakthrough_children) else None
+                if parent is not None and child is not None:
+                    improvement = (child.value if child.value is not None else 0) - (
+                        parent.value if parent.value is not None else 0
+                    )
+                    logger.info(
+                        f"[BreakthroughOPD] item {i}: parent_id={parent.id[:8]} "
+                        f"parent_value={parent.value:.4f} child_id={child.id[:8]} "
+                        f"child_value={child.value:.4f} improvement={improvement:.6f}"
+                    )
+                elif parent is not None:
+                    logger.info(
+                        f"[BreakthroughOPD] item {i}: parent_id={parent.id[:8]} "
+                        f"parent_value={parent.value:.4f} child=None"
+                    )
+            privileged_states_expanded = None
 
         # ------------------------------------------------------------------
         # 2. Build teacher prompts from student prompts + hint
@@ -1124,19 +1217,38 @@ class TTTDDistillTrainer(PPOTrainer):
 
         teacher_prompt_ids_list = []
         for i in range(batch_size):
-            priv_state = privileged_states_expanded[i]
-
-            if prompt_mode == 'hint':
-                # Hint mode: student prompt + [Hint] privileged info
+            if has_breakthrough_data:
+                # Breakthrough-Aware OPD: aligned parent/child from workflow
+                parent_state = breakthrough_parents[i] if i < len(breakthrough_parents) else None
+                child_state = breakthrough_children[i] if i < len(breakthrough_children) else None
                 student_prompt = student_prompts[i % len(student_prompts)] if student_prompts else ""
                 if not student_prompt:
-                    logger.warning(f"[PrivilegedOPD] Empty student prompt for item {i}")
-                hint = self._build_hint(priv_state)
+                    logger.warning(f"[BreakthroughOPD] Empty student prompt for item {i}")
+
+                if parent_state is not None and child_state is not None:
+                    hint = self._build_breakthrough_hint(parent_state, child_state)
+                elif child_state is not None:
+                    # Fallback: no parent, just use child as regular hint
+                    hint = self._build_hint(child_state)
+                else:
+                    # No breakthrough data for this item, fallback to standard
+                    hint = ""
                 teacher_prompt = student_prompt + hint
             else:
-                # Continuation mode (original Setup A behavior):
-                # Use env.get_prompt(privileged_state) directly
-                teacher_prompt = self.env.get_prompt(priv_state)
+                # Standard OPD
+                priv_state = privileged_states_expanded[i]
+
+                if prompt_mode == 'hint':
+                    # Hint mode: student prompt + [Hint] privileged info
+                    student_prompt = student_prompts[i % len(student_prompts)] if student_prompts else ""
+                    if not student_prompt:
+                        logger.warning(f"[PrivilegedOPD] Empty student prompt for item {i}")
+                    hint = self._build_hint(priv_state)
+                    teacher_prompt = student_prompt + hint
+                else:
+                    # Continuation mode (original Setup A behavior):
+                    # Use env.get_prompt(privileged_state) directly
+                    teacher_prompt = self.env.get_prompt(priv_state)
 
             messages = [{"role": "user", "content": teacher_prompt}]
             ids = list(
