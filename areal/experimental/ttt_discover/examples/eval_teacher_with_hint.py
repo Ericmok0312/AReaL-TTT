@@ -191,21 +191,26 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
     def _build_hint(self, privileged_state, current_raw_score: float | None = None) -> str:
         """Build hint from privileged state, placed in value_context position.
         
+        AC1 state.value stores -reward (e.g., -0.664 for reward=0.664).
+        Raw score = 1.0 / reward (e.g., 1.0 / 0.664 = 1.506).
+        
         Distinguishes between:
-        - hint_raw_score: the score achieved by the hint code
-        - current_raw_score: the score of the current initial state
+        - hint_raw_score: the raw score achieved by the hint code
+        - current_raw_score: the raw score of the current initial state
         """
         hint_parts = []
         if privileged_state.code and privileged_state.code.strip():
             hint_parts.append(f"```python\n{privileged_state.code.strip()}\n```")
         if privileged_state.value is not None:
-            hint_raw_score = -privileged_state.value
-            hint_parts.append(f"This approach achieves a score of {hint_raw_score:.6f}.")
+            # AC1: state.value = -reward, so reward = -value, raw_score = 1.0 / reward
+            hint_reward = -privileged_state.value
+            hint_raw_score = 1.0 / hint_reward if hint_reward > 0 else float('inf')
+            hint_parts.append(f"This approach achieves a raw score of {hint_raw_score:.6f} (reward: {hint_reward:.6f}).")
         hint_text = "\n".join(hint_parts)
         
         current_score_text = ""
         if current_raw_score is not None:
-            current_score_text = f" The current initial state has a score of {current_raw_score:.6f}."
+            current_score_text = f" The current initial state has a raw score of {current_raw_score:.6f}."
         
         return (
             f"Here is a known good approach for this problem:\n"
@@ -368,9 +373,11 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
                 prompt = original_get_prompt(state)
                 
                 # Get current state's raw score
+                # AC1: state.value = -reward, so raw_score = 1.0 / (-value)
                 current_raw_score = None
                 if hasattr(state, 'value') and state.value is not None:
-                    current_raw_score = -state.value
+                    current_reward = -state.value
+                    current_raw_score = 1.0 / current_reward if current_reward > 0 else float('inf')
                 
                 # Sample hint state
                 hint_states = self.hint_sampler.sample_states(1)
@@ -386,10 +393,7 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
                     match1 = re.search(pattern1, prompt, re.DOTALL)
                     if match1:
                         modified = prompt[:match1.start()] + "\n" + hint + prompt[match1.end():]
-                        # Log the modified prompt snippet
-                        start_idx = max(0, match1.start() - 100)
-                        end_idx = min(len(modified), match1.start() + len(hint) + 100)
-                        logger.info(f"[Eval] Replaced 'Here is the last code we ran' with hint. Modified prompt snippet:\n{modified[start_idx:end_idx]}")
+                        print(f"\n{'='*60}\nFULL PROMPT (replaced 'Here is the last code'):\n{'='*60}\n{modified}\n{'='*60}\n")
                         return modified
                     
                     # Pattern 2: State has no code ("No previous code available.")
@@ -397,10 +401,7 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
                     match2 = re.search(pattern2, prompt)
                     if match2:
                         modified = prompt[:match2.start()] + "\n" + hint + prompt[match2.end():]
-                        # Log the modified prompt snippet
-                        start_idx = max(0, match2.start() - 100)
-                        end_idx = min(len(modified), match2.start() + len(hint) + 100)
-                        logger.info(f"[Eval] Replaced 'No previous code available' with hint. Modified prompt snippet:\n{modified[start_idx:end_idx]}")
+                        print(f"\n{'='*60}\nFULL PROMPT (replaced 'No previous code'):\n{'='*60}\n{modified}\n{'='*60}\n")
                         return modified
                     
                     # Fallback: append hint at end
