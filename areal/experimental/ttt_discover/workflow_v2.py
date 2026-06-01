@@ -80,6 +80,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         execution_concurrency: int = 64,  # Per-rank, should match AsyncRewardWrapper max_workers
         dp_rank: int = 0,
         dp_world_size: int = 1,
+        hint_fn: Callable | None = None,
     ):
         """
         Initialize TTT-Discover Workflow V2.
@@ -116,6 +117,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             dp_world_size: Total number of data parallel ranks
         """
         self.env = env
+        self.hint_fn = hint_fn  # Optional hint function: fn(state) -> str
         self.sampler = sampler  # PUCTSampler reference for lazy sampling
         self.auto_flush = auto_flush
         self.max_prompt_thinking_tokens = max_prompt_thinking_tokens
@@ -171,6 +173,18 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             self._delayed_puct_parents: list[Any] = []
             self._delayed_rollout_metadata: list[dict] = []
         
+    def _get_prompt(self, state, use_hint: bool = True) -> str:
+        """Get prompt for state, optionally appending hint."""
+        prompt = self.env.get_prompt(state)
+        if use_hint and self.hint_fn is not None and state is not None:
+            try:
+                hint = self.hint_fn(state)
+                if hint:
+                    prompt = prompt + hint
+            except Exception as e:
+                logger.warning(f"[Workflow] hint_fn failed: {e}")
+        return prompt
+
         # Initialize tokenizer
         if isinstance(tokenizer, str):
             from areal.utils.hf_utils import load_hf_tokenizer
@@ -337,7 +351,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             "versions": torch.tensor(versions, dtype=torch.int32).unsqueeze(0),
             "attention_mask": torch.ones(len(seq), dtype=torch.bool).unsqueeze(0),
             "rewards": torch.tensor([reward], dtype=torch.float32),
-            "_student_prompts": [self.env.get_prompt(state) if state is not None else ""],
+            "_student_prompts": [self._get_prompt(state, use_hint=False) if state is not None else ""],
         }
     
     def _create_failed_trajectory(
@@ -393,7 +407,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 error_msg=error_msg,
             )
         
-        trajectory["_student_prompts"] = [self.env.get_prompt(state) if state is not None else ""]
+        trajectory["_student_prompts"] = [self._get_prompt(state, use_hint=False) if state is not None else ""]
         return trajectory
 
     @trace_session("reward")
@@ -781,7 +795,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         
         try:
             # Generate - Phase 1: Normal thinking
-            prompt = self.env.get_prompt(state)
+            prompt = self._get_prompt(state)
             messages = [{"role": "user", "content": prompt}]
             input_ids = list(self.tokenizer.apply_chat_template(
                 messages,
@@ -1015,7 +1029,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             logger.error(f"arun_episode failed: {e}", exc_info=True)
             # Return failed trajectory - let env decide reward and loss_mask
             if state:
-                prompt = self.env.get_prompt(state)
+                prompt = self._get_prompt(state)
                 messages = [{"role": "user", "content": prompt}]
                 try:
                     input_ids = list(self.tokenizer.apply_chat_template(

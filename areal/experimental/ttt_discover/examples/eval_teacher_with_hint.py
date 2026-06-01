@@ -48,43 +48,6 @@ from areal.experimental.ttt_discover.reward import tttd_reward_fn
 logger = logging.getLogger("eval_teacher_with_hint")
 
 
-class HintEnvWrapper:
-    """Wrapper that appends privileged hint to environment prompts.
-    
-    Delegates all environment operations to the base env, but intercepts
-    get_prompt() to append a [Hint] block with a sampled privileged state.
-    """
-    
-    def __init__(self, base_env, hint_sampler, build_hint_fn):
-        self.base_env = base_env
-        self.hint_sampler = hint_sampler
-        self.build_hint_fn = build_hint_fn
-        # Expose any attributes the workflow might access directly
-        self.env_type = getattr(base_env, 'env_type', None)
-        
-    def get_prompt(self, state) -> str:
-        prompt = self.base_env.get_prompt(state)
-        # Sample a privileged state for this prompt
-        hint_states = self.hint_sampler.sample_states(1)
-        if hint_states:
-            hint = self.build_hint_fn(hint_states[0])
-            return prompt + hint
-        return prompt
-    
-    def execute(self, code: str, state) -> Any:
-        return self.base_env.execute(code, state)
-    
-    def get_failure_result(self, state, fail_type: str, error_msg: str = "") -> Any:
-        return self.base_env.get_failure_result(state, fail_type, error_msg)
-    
-    def create_failed_trajectory(self, state, fail_type: str, error_msg: str = "") -> Any:
-        return self.base_env.create_failed_trajectory(state, fail_type, error_msg)
-    
-    def __getattr__(self, name):
-        # Delegate unknown attributes to base env
-        return getattr(self.base_env, name)
-
-
 class TeacherWithHintEvalTrainer(PPOTrainer):
     """Evaluate teacher model with privileged hints.
     
@@ -158,12 +121,8 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
             f"T={self.hint_sampler._T}"
         )
 
-        # Wrap env with hint wrapper
-        self.env = HintEnvWrapper(
-            base_env=self.base_env,
-            hint_sampler=self.hint_sampler,
-            build_hint_fn=self._build_hint,
-        )
+        # Store base env directly (hint will be applied via workflow hint_fn)
+        self.env = self.base_env
 
         # Create a fresh initial-state sampler for evaluation
         import tempfile
@@ -360,10 +319,17 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
         self.rollout.resume()
         logger.info("[Eval] Weights pushed and rollout resumed.")
 
-        # Create workflow with hint-wrapped env
+        # Create workflow with hint_fn hook
         config = self.config
         local_batch_size = config.eval_batch_size // self.actor.data_parallel_world_size
         group_size = config.gconfig.n_samples
+        
+        # Build hint_fn that samples from hint_sampler for each state
+        def hint_fn(state):
+            hint_states = self.hint_sampler.sample_states(1)
+            if hint_states:
+                return self._build_hint(hint_states[0])
+            return ""
         
         workflow_kwargs = dict(
             env=self.env,
@@ -377,6 +343,7 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
             vllm_concurrency=getattr(config.sampler, 'vllm_concurrency', None),
             execution_concurrency=getattr(config.sampler, 'execution_concurrency', 64),
             reward_fn=tttd_reward_fn,
+            hint_fn=hint_fn,
         )
         eval_workflow = TTTDiscoverWorkflowV2(**workflow_kwargs)
 
