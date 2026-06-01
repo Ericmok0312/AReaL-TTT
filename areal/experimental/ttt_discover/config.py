@@ -335,6 +335,11 @@ class TTTDDistillConfig(TTTDPPOConfig):
         default=64,
         metadata={"help": "Group size for evaluation (number of samples per initial state). Defaults to 64."},
     )
+    eval_prompt_mode: str = field(
+        default="hint",
+        metadata={"help": "Prompt mode for teacher eval: 'hint' (initial state + hint appended) or "
+                         "'continuation' (directly use PUCT sampler's privileged state as prompt base)."},
+    )
 
     # Distillation behavior controls
     use_privileged_teacher_logp: bool = field(
