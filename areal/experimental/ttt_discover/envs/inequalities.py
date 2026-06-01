@@ -201,7 +201,7 @@ Your task is to generate the sequence of non-negative heights of a step function
 
 {AC1_LITERATURE}
 
-Your task is to write a search function that searches for the best sequence of coefficients. Your function will have {budget_s} seconds to run, and after that it has to have returned the best sequence it found. If after {budget_s} seconds it has not returned anything, it will be terminated with negative infinity points. All numbers in your sequence have to be positive or zero. Larger sequences with 1000s of items often have better attack surface, but too large sequences with 100s of thousands of items may be too slow to search.
+Your task is to write a search function that searches for the best sequence of coefficients. Your function will have {budget_s} seconds to run, and after that it has to have returned the best sequence it found. If after {budget_s} seconds it has not returned anything, it will be terminated with negative infinity points. All numbers in your sequence have to be positive or zero. Larger sequences with 1000s of items often have better attack surface, but too large sequences with 100s of thousands of items may be too slow to search. **Important: try multiple sequence lengths (e.g., 500, 1000, 2000, 5000, 10000) and compare their scores — the optimal length is a critical hyperparameter.**
 
 You may code up any search method you want, and you are allowed to call the evaluate_sequence() function as many times as you want. You have access to it, you don't need to code up the evaluate_sequence() function.
 
@@ -288,7 +288,7 @@ def propose_candidate(seed=42, budget_s={num_seconds}, **kwargs):
         best_sequence = list(height_sequence_1)
     else:
         # Start from random initialization
-        best_sequence = [np.random.random()] * np.random.randint(100, 1000)
+        best_sequence = [np.random.random()] * np.random.randint(500, 10000)
     curr_sequence = best_sequence.copy()
     best_score = evaluate_sequence(best_sequence)
     
