@@ -173,18 +173,6 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             self._delayed_puct_parents: list[Any] = []
             self._delayed_rollout_metadata: list[dict] = []
         
-    def _get_prompt(self, state, use_hint: bool = True) -> str:
-        """Get prompt for state, optionally appending hint."""
-        prompt = self.env.get_prompt(state)
-        if use_hint and self.hint_fn is not None and state is not None:
-            try:
-                hint = self.hint_fn(state)
-                if hint:
-                    prompt = prompt + hint
-            except Exception as e:
-                logger.warning(f"[Workflow] hint_fn failed: {e}")
-        return prompt
-
         # Initialize tokenizer
         if isinstance(tokenizer, str):
             from areal.utils.hf_utils import load_hf_tokenizer
@@ -331,6 +319,18 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             self._rollout_timing_pairs = []
         
         return stats
+
+    def _get_prompt(self, state, use_hint: bool = True) -> str:
+        """Get prompt for state, optionally appending hint."""
+        prompt = self.env.get_prompt(state)
+        if use_hint and self.hint_fn is not None and state is not None:
+            try:
+                hint = self.hint_fn(state)
+                if hint:
+                    prompt = prompt + hint
+            except Exception as e:
+                logger.warning(f"[Workflow] hint_fn failed: {e}")
+        return prompt
 
     def _create_trajectory(
         self,
