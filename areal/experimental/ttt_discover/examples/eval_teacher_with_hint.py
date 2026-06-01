@@ -385,8 +385,7 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
                 
                 return prompt
             
-            import types
-            self.env.get_prompt = types.MethodType(get_prompt_with_hint, self.env)
+            self.env.get_prompt = get_prompt_with_hint
             
             workflow_kwargs = dict(
                 env=self.env,
