@@ -188,21 +188,29 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
         self._setup_stats_logger()
         self._workflow_kwargs = {}
 
-    def _build_hint(self, privileged_state) -> str:
-        """Build hint from privileged state (same logic as training)."""
+    def _build_hint(self, privileged_state, current_raw_score: float | None = None) -> str:
+        """Build hint from privileged state, placed in value_context position.
+        
+        Distinguishes between:
+        - hint_raw_score: the score achieved by the hint code
+        - current_raw_score: the score of the current initial state
+        """
         hint_parts = []
         if privileged_state.code and privileged_state.code.strip():
             hint_parts.append(f"```python\n{privileged_state.code.strip()}\n```")
         if privileged_state.value is not None:
-            raw_score = -privileged_state.value
-            hint_parts.append(f"This achieves a score of {raw_score:.6f}.")
+            hint_raw_score = -privileged_state.value
+            hint_parts.append(f"This approach achieves a score of {hint_raw_score:.6f}.")
         hint_text = "\n".join(hint_parts)
+        
+        current_score_text = ""
+        if current_raw_score is not None:
+            current_score_text = f" The current initial state has a score of {current_raw_score:.6f}."
+        
         return (
-            f"\n\n[Hint] A known good approach for this problem:\n"
+            f"Here is a known good approach for this problem:\n"
             f"{hint_text}\n"
-            f"Your task is to reuse the above algorithm with minimal modifications. "
-            f"Do NOT invent a completely different approach. "
-            f"The hint code is proven to work — your job is to adapt it, not replace it.\n"
+            f"You should adapt this approach to improve the current initial state.{current_score_text}\n"
         )
 
     def _create_tttd_actor(self, actor_config):
@@ -352,12 +360,33 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
                 # No hint_fn
             )
         else:
-            # Hint mode: append hint to prompt
-            def hint_fn(state):
+            # Hint mode: replace "No previous code available." with hint in value_context position
+            # Monkey-patch env.get_prompt to inject hint at the right place
+            original_get_prompt = self.env.get_prompt
+            
+            def get_prompt_with_hint(state):
+                prompt = original_get_prompt(state)
+                
+                # Get current state's raw score
+                current_raw_score = None
+                if hasattr(state, 'value') and state.value is not None:
+                    current_raw_score = -state.value
+                
+                # Sample hint state
                 hint_states = self.hint_sampler.sample_states(1)
-                if hint_states:
-                    return self._build_hint(hint_states[0])
-                return ""
+                if hint_states and hint_states[0].code:
+                    hint = self._build_hint(hint_states[0], current_raw_score)
+                    # Replace "No previous code available." with hint
+                    modified = prompt.replace("No previous code available.", hint)
+                    if modified == prompt:
+                        logger.warning("[Eval] Could not find 'No previous code available.' in prompt, appending hint instead.")
+                        return prompt + "\n\n" + hint
+                    return modified
+                
+                return prompt
+            
+            import types
+            self.env.get_prompt = types.MethodType(get_prompt_with_hint, self.env)
             
             workflow_kwargs = dict(
                 env=self.env,
@@ -371,7 +400,7 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
                 vllm_concurrency=getattr(config.sampler, 'vllm_concurrency', None),
                 execution_concurrency=getattr(config.sampler, 'execution_concurrency', 64),
                 reward_fn=tttd_reward_fn,
-                hint_fn=hint_fn,
+                # No hint_fn - hint is injected via env.get_prompt
             )
         eval_workflow = TTTDiscoverWorkflowV2(**workflow_kwargs)
 
