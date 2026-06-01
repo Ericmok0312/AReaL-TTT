@@ -367,10 +367,6 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
             def get_prompt_with_hint(state):
                 prompt = original_get_prompt(state)
                 
-                # DEBUG: log actual prompt snippet
-                if 'No previous code' not in prompt:
-                    logger.warning(f"[Eval-DEBUG] Prompt does NOT contain 'No previous code'. Prompt snippet around value context:\n{prompt[prompt.find('You are iteratively'):prompt.find('You may want to start')][:500]}")
-                
                 # Get current state's raw score
                 current_raw_score = None
                 if hasattr(state, 'value') and state.value is not None:
@@ -380,16 +376,28 @@ class TeacherWithHintEvalTrainer(PPOTrainer):
                 hint_states = self.hint_sampler.sample_states(1)
                 if hint_states and hint_states[0].code:
                     hint = self._build_hint(hint_states[0], current_raw_score)
-                    # Replace "No previous code available." with hint
-                    # Note: actual string in state.to_prompt() is "\nNo previous code available."
-                    modified = prompt.replace("\nNo previous code available.", "\n" + hint)
-                    if modified == prompt:
-                        # Try without leading newline as fallback
-                        modified = prompt.replace("No previous code available.", hint)
-                    if modified == prompt:
-                        logger.warning("[Eval] Could not find 'No previous code available.' in prompt, appending hint instead.")
-                        return prompt + "\n\n" + hint
-                    return modified
+                    
+                    # Replace the entire "Here is the last code we ran..." block with hint
+                    # This handles both cases: states with code and without code
+                    import re
+                    
+                    # Pattern 1: State has code ("Here is the last code we ran:")
+                    pattern1 = r"\nHere is the last code we ran:\n```python\n.*?```\n"
+                    match1 = re.search(pattern1, prompt, re.DOTALL)
+                    if match1:
+                        modified = prompt[:match1.start()] + "\n" + hint + prompt[match1.end():]
+                        return modified
+                    
+                    # Pattern 2: State has no code ("No previous code available.")
+                    pattern2 = r"\nNo previous code available\."
+                    match2 = re.search(pattern2, prompt)
+                    if match2:
+                        modified = prompt[:match2.start()] + "\n" + hint + prompt[match2.end():]
+                        return modified
+                    
+                    # Fallback: append hint at end
+                    logger.warning("[Eval] Could not find code block in prompt, appending hint instead.")
+                    return prompt + "\n\n" + hint
                 
                 return prompt
             
