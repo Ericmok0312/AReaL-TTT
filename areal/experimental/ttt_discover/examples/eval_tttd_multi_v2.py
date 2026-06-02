@@ -109,7 +109,9 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             top_k=getattr(config.sampler, 'top_k', 1000),
             temperature=getattr(config.sampler, 'temperature', 1.0),
             max_version_history=max_version_history,
-            sampling_strategy=getattr(config.sampler, 'sampling_strategy', 'puct'),
+            # Eval uses a fresh sampler with only initial states; breakthrough_parent
+            # requires trained state history (parents with breakthrough children).
+            sampling_strategy='puct',
         )
         
 
