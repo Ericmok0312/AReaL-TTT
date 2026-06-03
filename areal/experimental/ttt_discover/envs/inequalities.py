@@ -227,6 +227,39 @@ Rules:
 Make sure to think and return the final program between ```python and ```.'''
 
 
+def get_ac1_prompt_distill(budget_s: int, value_context: str) -> str:
+    """Generate AC1 prompt for from-scratch distillation (no height_sequence_1 reference)."""
+    return f'''Act as an expert software developer and inequality specialist specializing in creating step functions with certain properties.
+
+Your task is to generate the sequence of non-negative heights of a step function, that minimizes the following evaluation function:
+
+{AC1_EVAL_FUNCTION}
+
+{AC1_LITERATURE}
+
+Your task is to write a search function that searches for the best sequence of coefficients. Your function will have {budget_s} seconds to run, and after that it has to have returned the best sequence it found. If after {budget_s} seconds it has not returned anything, it will be terminated with negative infinity points. All numbers in your sequence have to be positive or zero. Larger sequences with 1000s of items often have better attack surface, but too large sequences with 100s of thousands of items may be too slow to search.
+
+You may code up any search method you want, and you are allowed to call the evaluate_sequence() function as many times as you want. You have access to it, you don't need to code up the evaluate_sequence() function.
+
+{value_context}
+
+Reason about how you could design a search algorithm to find good sequences.
+Ideally, try to do something novel. Could be using different algorithmic ideas, adjusting your heuristics, adjusting / sweeping your hyperparemeters, etc. 
+Unless you make a meaningful improvement, you will not be rewarded.
+
+Rules:
+- You must define the `propose_candidate` function as this is what will be invoked.
+- You can use scientific libraries like scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,ECOS,SCS,PDLP,SCIP], math.
+- You can use up to 2 CPUs.
+- Make all helper functions top level and have no closures from function nesting. Don't use any lambda functions.
+- No filesystem or network IO.
+- Do not import evaluate_sequence yourself. Assume it will already be imported and can be directly invoked.
+- **Print statements**: Use `print()` to log progress, intermediate bounds, timing info, etc. Your output will be shown back to you.
+- Include a short docstring at the top summarizing your algorithm.
+
+Make sure to think and return the final program between ```python and ```.'''
+
+
 def get_example_program_random_init(num_seconds: int) -> str:
     """Example program with random initialization."""
     return f'''
@@ -378,6 +411,30 @@ class InequalitiesEnv(BaseEnv):
         if self.problem_type == "ac1":
             return get_ac1_prompt(self.budget_s, value_ctx)
         else:
+            return get_ac2_prompt(self.budget_s, value_ctx, self.num_cpus)
+
+    def get_prompt_distill(self, state: InequalitiesState) -> str:
+        """Generate from-scratch prompt for distillation (no height_sequence_1 reference)."""
+        if self.problem_type == "ac1":
+            metric_name = "upper bound"
+            target = 1.5030
+            is_maximize = False
+        else:
+            metric_name = "lower bound"
+            target = 0.97
+            is_maximize = True
+
+        value_ctx = state.to_prompt(
+            target=target, metric_name=metric_name, maximize=is_maximize, language="python"
+        )
+
+        if state.construction:
+            value_ctx += f"\nLength of the construction: {len(state.construction)}"
+
+        if self.problem_type == "ac1":
+            return get_ac1_prompt_distill(self.budget_s, value_ctx)
+        else:
+            # Fall back to regular AC2 prompt for now
             return get_ac2_prompt(self.budget_s, value_ctx, self.num_cpus)
     
     def _execute_code(self, code: str, state: InequalitiesState) -> tuple[Any, str]:

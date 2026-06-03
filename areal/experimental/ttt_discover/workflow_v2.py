@@ -82,6 +82,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         dp_world_size: int = 1,
         hint_fn: Callable | None = None,
         hint_placement: str = "append",
+        distill_mode: bool = False,
     ):
         """
         Initialize TTT-Discover Workflow V2.
@@ -120,6 +121,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         self.env = env
         self.hint_fn = hint_fn  # Optional hint function: fn(state) -> str
         self.hint_placement = hint_placement  # 'append', 'replace_code', or 'replace_no_code'
+        self.distill_mode = distill_mode  # If True, use env.get_prompt_distill() instead of env.get_prompt()
         self.sampler = sampler  # PUCTSampler reference for lazy sampling
         self.auto_flush = auto_flush
         self.max_prompt_thinking_tokens = max_prompt_thinking_tokens
@@ -325,7 +327,10 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
 
     def _get_prompt(self, state, use_hint: bool = True) -> str:
         """Get prompt for state, optionally appending or replacing with hint."""
-        prompt = self.env.get_prompt(state)
+        if self.distill_mode and hasattr(self.env, 'get_prompt_distill'):
+            prompt = self.env.get_prompt_distill(state)
+        else:
+            prompt = self.env.get_prompt(state)
         if use_hint and self.hint_fn is not None and state is not None:
             try:
                 hint = self.hint_fn(state)

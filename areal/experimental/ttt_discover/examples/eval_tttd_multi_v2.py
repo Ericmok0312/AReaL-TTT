@@ -774,6 +774,54 @@ def main(args):
         execution_concurrency=config.sampler.execution_concurrency,
     )
 
+    # Load milestone hints for whole-path teacher distillation
+    milestone_hints = None
+    if getattr(config, 'milestone_hints', None):
+        hints_path = config.milestone_hints
+        if os.path.isfile(hints_path):
+            with open(hints_path, 'r') as f:
+                milestone_hints = json.load(f)
+            logger.info(f"[MultiEval] Loaded milestone hints from {hints_path}: "
+                       f"{len(milestone_hints.get('paths', []))} paths")
+        else:
+            logger.warning(f"[MultiEval] milestone_hints path not found: {hints_path}")
+
+    if milestone_hints:
+        # Build hint_fn that returns milestone sequence for a given state
+        def _build_milestone_hint_fn(hints_data):
+            paths = hints_data.get('paths', [])
+            if not paths:
+                return lambda state: None
+            # Use a deterministic round-robin based on state id
+            import hashlib
+            def hint_fn(state):
+                if state is None:
+                    return None
+                state_id = getattr(state, 'id', None) or str(id(state))
+                idx = int(hashlib.md5(state_id.encode()).hexdigest(), 16) % len(paths)
+                path = paths[idx]
+                milestones = path.get('milestones', [])
+                if not milestones:
+                    return None
+                # Build hint text showing strategy evolution across milestones
+                lines = ["\n=== Strategy Evolution Hints ==="]
+                lines.append("Below are key phases discovered during search. Use them as inspiration, but write your own independent search program.\n")
+                for i, ms in enumerate(milestones):
+                    phase_label = ["Baseline", "Phase 1", "Phase 2", "Phase 3"][i] if i < 4 else f"Phase {i}"
+                    lines.append(f"--- {phase_label} (value={ms.get('value', 'N/A'):.4f}) ---")
+                    code = ms.get('code', '')
+                    if code:
+                        lines.append(f"```python\n{code}\n```")
+                    lines.append("")
+                lines.append("=== End Hints ===\n")
+                return "\n".join(lines)
+            return hint_fn
+
+        workflow_kwargs['hint_fn'] = _build_milestone_hint_fn(milestone_hints)
+        workflow_kwargs['hint_placement'] = "append"
+        workflow_kwargs['distill_mode'] = True
+        logger.info("[MultiEval] Enabled milestone hint distillation mode")
+
     with TTTDMultiEvalTrainer(config) as trainer:
         trainer.run_eval(
             workflow_class=TTTDiscoverWorkflowV2,

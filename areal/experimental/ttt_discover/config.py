@@ -390,6 +390,11 @@ class TTTDDistillConfig(TTTDPPOConfig):
                          "If None, auto-discovers baseline/teacher/student. "
                          "If set, only evaluates the specified models."},
     )
+    milestone_hints: str = field(
+        default="",
+        metadata={"help": "Path to JSON file containing milestone hints for whole-path teacher distillation. "
+                         "If set, teacher eval uses milestone-based hints showing strategy evolution."},
+    )
     use_real_reward: bool = field(
         default=False,
         metadata={"help": "If True, use real environment reward (tttd_reward_fn) during "
