@@ -222,8 +222,9 @@ def analyze_tree(sampler_path: str, topk: int, max_path_length: int, output_dir:
     print(f"TOP {topk} BEST PATHS (by leaf value)")
     print("=" * 70)
     for rank, ps in enumerate(path_stats[:topk], 1):
+        root_score_str = f"{-ps['root_value']:.6f}" if ps['root_value'] is not None else 'N/A'
         print(f"\n[Rank {rank}] Leaf score: {-ps['leaf_value']:.6f} | "
-              f"Root score: {-ps['root_value']:.6f if ps['root_value'] is not None else 'N/A'} | "
+              f"Root score: {root_score_str} | "
               f"Improvement: {ps['value_improvement']:.6f} | "
               f"Length: {ps['length']} | "
               f"All use height_sequence_1: {ps['all_use_height_sequence']}")
@@ -238,7 +239,8 @@ def analyze_tree(sampler_path: str, topk: int, max_path_length: int, output_dir:
     if no_hs_paths:
         no_hs_paths.sort(key=lambda x: (x["leaf_value"] if x["leaf_value"] is not None else float("-inf")), reverse=True)
         for rank, ps in enumerate(no_hs_paths[:topk], 1):
-            print(f"\n[Rank {rank}] Leaf score: {-ps['leaf_value']:.6f} | "
+            leaf_score_str = f"{-ps['leaf_value']:.6f}" if ps['leaf_value'] is not None else 'N/A'
+            print(f"\n[Rank {rank}] Leaf score: {leaf_score_str} | "
                   f"Length: {ps['length']}")
             print_path_detail(ps["path_ids"], id_to_state, max_states_to_show=3)
     else:
