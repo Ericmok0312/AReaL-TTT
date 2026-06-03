@@ -1149,9 +1149,12 @@ class TTTDDistillTrainer(PPOTrainer):
         paths = self._milestone_hints_data.get('paths', [])
         if not paths:
             return ""
-        state_id = getattr(state, 'id', None) or str(id(state))
-        import hashlib
-        idx = int(hashlib.md5(state_id.encode()).hexdigest(), 16) % len(paths)
+        # Rotate through all paths to ensure every path is seen by teacher.
+        # Relying on state-id hashing is bad because teacher_sampler.sample_states()
+        # is deterministic and only covers a small subset of states, causing
+        # some paths to never be selected.
+        idx = getattr(self, '_milestone_hint_counter', 0) % len(paths)
+        self._milestone_hint_counter = idx + 1
         path = paths[idx]
         milestones = path.get('milestones', [])
         if not milestones:

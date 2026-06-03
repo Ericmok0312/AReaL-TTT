@@ -793,12 +793,13 @@ def main(args):
             if not paths:
                 return lambda state: None
             # Use a deterministic round-robin based on state id
-            import hashlib
             def hint_fn(state):
                 if state is None:
                     return None
-                state_id = getattr(state, 'id', None) or str(id(state))
-                idx = int(hashlib.md5(state_id.encode()).hexdigest(), 16) % len(paths)
+                # Rotate through all paths instead of hashing state id.
+                # Sampler states are deterministic, so hashing would miss paths.
+                idx = hint_fn._counter % len(paths)
+                hint_fn._counter += 1
                 path = paths[idx]
                 milestones = path.get('milestones', [])
                 if not milestones:
@@ -815,6 +816,7 @@ def main(args):
                     lines.append("")
                 lines.append("=== End Hints ===\n")
                 return "\n".join(lines)
+            hint_fn._counter = 0
             return hint_fn
 
         workflow_kwargs['hint_fn'] = _build_milestone_hint_fn(milestone_hints)
