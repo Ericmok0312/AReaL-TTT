@@ -121,7 +121,6 @@ def format_milestone(state: dict, phase_idx: int, prev_state: dict | None = None
         "code": code,
         "code_length": len(code),
         "has_height_sequence_1": "height_sequence_1" in code,
-        "construction": state.get("construction"),
     }
 
     if prev_state is not None:
