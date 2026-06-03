@@ -428,6 +428,13 @@ class InequalitiesEnv(BaseEnv):
             target=target, metric_name=metric_name, maximize=is_maximize, language="python"
         )
 
+        # Reframe baseline code as an example rather than "last code we ran"
+        # to encourage novel search strategies instead of incremental tweaking
+        value_ctx = value_ctx.replace(
+            "Here is the last code we ran:",
+            "Here is a simple example program you may use as a starting point:"
+        )
+
         if state.construction:
             value_ctx += f"\nLength of the construction: {len(state.construction)}"
 
