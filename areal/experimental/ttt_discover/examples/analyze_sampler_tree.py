@@ -144,9 +144,10 @@ def print_path_detail(path_ids: list[str], id_to_state: dict, max_states_to_show
     for idx in indices_to_show:
         s = states[idx]
         raw_score = -s.get("value", 0) if s.get("value") is not None else None
+        raw_score_str = f"{raw_score:.6f}" if raw_score is not None else 'N/A'
         code_preview = (s.get("code", "")[:200].replace("\n", " ") + "...") if s.get("code") else "N/A"
         uses_hs = "height_sequence_1" in s.get("code", "")
-        print(f"    Step {idx}: score={raw_score:.6f if raw_score else 'N/A'} "
+        print(f"    Step {idx}: score={raw_score_str} "
               f"timestep={s.get('timestep')} "
               f"uses_hs={uses_hs} "
               f"code_len={len(s.get('code', ''))} "
