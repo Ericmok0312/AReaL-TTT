@@ -395,6 +395,11 @@ class TTTDDistillConfig(TTTDPPOConfig):
         metadata={"help": "Path to JSON file containing milestone hints for whole-path teacher distillation. "
                          "If set, teacher eval uses milestone-based hints showing strategy evolution."},
     )
+    distill_from_scratch: bool = field(
+        default=False,
+        metadata={"help": "If True, student rollout uses from-scratch prompts (no height_sequence_1 reference). "
+                         "Requires env.get_prompt_distill() support. Typically used with milestone_hints."},
+    )
     use_real_reward: bool = field(
         default=False,
         metadata={"help": "If True, use real environment reward (tttd_reward_fn) during "

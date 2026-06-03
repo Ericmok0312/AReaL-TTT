@@ -219,6 +219,22 @@ class TTTDDistillTrainer(PPOTrainer):
         self.env = create_env_from_config(config)
 
         # =====================================================================
+        # Load milestone hints for whole-path teacher distillation (optional)
+        # =====================================================================
+        self._milestone_hints_data = None
+        if getattr(config, 'milestone_hints', None):
+            hints_path = config.milestone_hints
+            if os.path.isfile(hints_path):
+                with open(hints_path, 'r') as f:
+                    self._milestone_hints_data = json.load(f)
+                logger.info(
+                    f"[MilestoneHints] Loaded from {hints_path}: "
+                    f"{len(self._milestone_hints_data.get('paths', []))} paths"
+                )
+            else:
+                logger.warning(f"[MilestoneHints] Path not found: {hints_path}")
+
+        # =====================================================================
         # Create student actor (with LoRA)
         # =====================================================================
         # Propagate standard GRPO settings from top-level config to actor config
@@ -722,6 +738,10 @@ class TTTDDistillTrainer(PPOTrainer):
                 self._workflow_kwargs['sampler'] = self.sampler
                 self._workflow_kwargs['dp_rank'] = self.actor.dp_rank
                 self._workflow_kwargs['dp_world_size'] = self.actor.data_parallel_world_size
+            # Enable from-scratch prompt mode for student rollout if configured
+            if getattr(config, 'distill_from_scratch', False):
+                self._workflow_kwargs['distill_mode'] = True
+                logger.info("[Distill] Student rollout using from-scratch prompts (distill_mode=True)")
 
         is_dp_head = self.actor.rank == 0
         batch_size = config.sampler.batch_size
@@ -1116,6 +1136,41 @@ class TTTDDistillTrainer(PPOTrainer):
             f"the current construction.\n"
         )
 
+    def _build_milestone_hint(self, state) -> str:
+        """Build a whole-path milestone hint from pre-extracted PUCT tree paths.
+
+        Uses deterministic round-robin based on state id to select a path,
+        then returns the full milestone sequence (baseline → best leaf).
+        This gives the teacher privileged access to the *evolution* of search
+        strategies, not just a single good state.
+        """
+        if self._milestone_hints_data is None:
+            return ""
+        paths = self._milestone_hints_data.get('paths', [])
+        if not paths:
+            return ""
+        state_id = getattr(state, 'id', None) or str(id(state))
+        import hashlib
+        idx = int(hashlib.md5(state_id.encode()).hexdigest(), 16) % len(paths)
+        path = paths[idx]
+        milestones = path.get('milestones', [])
+        if not milestones:
+            return ""
+        lines = ["\n=== Strategy Evolution Hints ==="]
+        lines.append(
+            "Below are key phases discovered during search. "
+            "Use them as inspiration, but write your own independent search program.\n"
+        )
+        for i, ms in enumerate(milestones):
+            phase_label = ["Baseline", "Phase 1", "Phase 2", "Phase 3"][i] if i < 4 else f"Phase {i}"
+            lines.append(f"--- {phase_label} (value={ms.get('value', 'N/A'):.4f}) ---")
+            code = ms.get('code', '')
+            if code:
+                lines.append(f"```python\n{code}\n```")
+            lines.append("")
+        lines.append("=== End Hints ===\n")
+        return "\n".join(lines)
+
     def _compute_privileged_teacher_logp(
         self, rollout_batch: dict[str, Any]
     ) -> torch.Tensor:
@@ -1262,7 +1317,16 @@ class TTTDDistillTrainer(PPOTrainer):
                     student_prompt = student_prompts[i % len(student_prompts)] if student_prompts else ""
                     if not student_prompt:
                         logger.warning(f"[PrivilegedOPD] Empty student prompt for item {i}")
-                    hint = self._build_hint(priv_state)
+                    # Whole-path milestone hint takes precedence if available
+                    if self._milestone_hints_data is not None:
+                        hint = self._build_milestone_hint(priv_state)
+                        if hint:
+                            logger.info(
+                                f"[MilestoneHint] item {i}: using milestone hint for state "
+                                f"id={priv_state.id[:8] if hasattr(priv_state.id, '__len__') and len(priv_state.id) > 8 else priv_state.id}"
+                            )
+                    else:
+                        hint = self._build_hint(priv_state)
                     teacher_prompt = student_prompt + hint
                 else:
                     # Continuation mode (original Setup A behavior):
