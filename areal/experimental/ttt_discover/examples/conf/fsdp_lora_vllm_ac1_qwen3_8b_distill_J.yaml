@@ -263,13 +263,13 @@ eval_group_size: 64
 # loaded directly by eval_tttd_multi_v2. Uncomment the step you want to evaluate.
 # Saver path: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/
 eval_models:
-    teacher: ${teacher.path}
+    #teacher: ${teacher.path}
 #   #J-step10: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch9epochstep9globalstep9
 #   #J-step20: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch19epochstep19globalstep19
 #   J-step30: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch29epochstep29globalstep29
 #   #J-step40: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch39epochstep39globalstep39
 #   #J-step50: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch49epochstep49globalstep49
-#   #J-step60: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch59epochstep59globalstep59
+  J-step60: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch59epochstep59globalstep59
 #   J-step70: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch69epochstep69globalstep69
 #   #J-step80: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch79epochstep79globalstep79
 #   #J-step90: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch89epochstep89globalstep89
