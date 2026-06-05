@@ -1474,10 +1474,18 @@ class TTTDDistillTrainer(PPOTrainer):
             _lmask = lmask_full if lmask_full is not None else loss_mask
             _seqlen = input_ids_full.shape[1]
 
+            # Ensure input_ids_full is on the correct device for indexing
+            if input_ids_full.device != device:
+                input_ids_full = input_ids_full.to(device)
+            if _attn.device != device:
+                _attn = _attn.to(device)
+            if _lmask.device != device:
+                _lmask = _lmask.to(device)
+
             for i in range(n):
-                ids = input_ids_full[i : i + 1].to(device)
-                mask = _attn[i : i + 1].to(device)
-                lmask = _lmask[i : i + 1].to(device)
+                ids = input_ids_full[i : i + 1]
+                mask = _attn[i : i + 1]
+                lmask = _lmask[i : i + 1]
 
                 with torch.no_grad():
                     out = engine.model(input_ids=ids, attention_mask=mask)
@@ -1503,7 +1511,7 @@ class TTTDDistillTrainer(PPOTrainer):
                     )
 
                     # Extract per-token logp for actual tokens (reuse for compute_logp)
-                    chunk_input_ids = input_ids_full[i][active][j : j + seq_chunk_size].to(log_probs.device)
+                    chunk_input_ids = input_ids_full[i][active][j : j + seq_chunk_size]
                     chunk_token_logp = log_probs.gather(
                         dim=-1, index=chunk_input_ids.unsqueeze(-1)
                     ).squeeze(-1)
