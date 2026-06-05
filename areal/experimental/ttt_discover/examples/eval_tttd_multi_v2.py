@@ -725,8 +725,8 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             logger.info("="*90)
             for label in self._eval_models:
                 r = all_results[label]
-                dist = _reward_distribution(r['all_rewards'])
-                dist_str = f"z={dist['zero']} p25={dist['p25']} p50={dist['p50']} p75={dist['p75']} p90={dist['p90']}"
+                reward_dist = _reward_distribution(r['all_rewards'])
+                dist_str = f"z={reward_dist['zero']} p25={reward_dist['p25']} p50={reward_dist['p50']} p75={reward_dist['p75']} p90={reward_dist['p90']}"
                 logger.info(
                     f"{label:25s} | max={r['max_reward']:.4f} | mean={r['mean_reward']:.4f} | "
                     f"n={r['global_rollouts']} | {dist_str}"
