@@ -847,7 +847,9 @@ class TTTDDistillTrainer(PPOTrainer):
                 torch.cuda.empty_cache()
                 with torch.no_grad():
                     if config.use_privileged_teacher_logp:
-                        teacher_logps = self._compute_privileged_teacher_logp(rollout_batch)
+                        teacher_logps, teacher_input_ids, teacher_attention_mask = self._compute_privileged_teacher_logp(rollout_batch)
+                        rollout_batch["privileged_teacher_input_ids"] = teacher_input_ids
+                        rollout_batch["privileged_teacher_attention_mask"] = teacher_attention_mask
                     else:
                         # Teacher and student see the same prompts (no privileged OPD)
                         teacher_logps_list = self.teacher.compute_logp([rollout_batch])
@@ -954,6 +956,10 @@ class TTTDDistillTrainer(PPOTrainer):
                         f"Adv: {metrics.get('distill/overlap_token_advantage', 0.0):.4f}, "
                         f"EntGap: {metrics.get('distill/entropy_gap', 0.0):.4f}"
                     )
+                    if 'distill/entropy_gap_privileged' in metrics:
+                        log_msg += (
+                            f", EntGapP: {metrics.get('distill/entropy_gap_privileged', 0.0):.4f}"
+                        )
                 logger.info(log_msg)
 
             # Update weights and save
@@ -1427,7 +1433,7 @@ class TTTDDistillTrainer(PPOTrainer):
                 device=device, dtype=torch.float32
             )
 
-        return aligned_teacher_logp
+        return aligned_teacher_logp, teacher_input_ids, teacher_attention_mask
 
     def _compute_dynamic_metrics(
         self, rollout_batch: dict[str, Any], k: int = 16
@@ -1458,17 +1464,20 @@ class TTTDDistillTrainer(PPOTrainer):
         loss_mask = rollout_batch["loss_mask"]
         n, seqlen = input_ids.shape
 
-        def _get_topk_entropy_and_logp(engine, device, input_ids_full):
+        def _get_topk_entropy_and_logp(engine, device, input_ids_full, attn_mask_full=None, lmask_full=None):
             engine.model.eval()
             topk_indices = []
             topk_logps = []
             entropies = []
             all_token_logps = []
+            _attn = attn_mask_full if attn_mask_full is not None else attention_mask
+            _lmask = lmask_full if lmask_full is not None else loss_mask
+            _seqlen = input_ids_full.shape[1]
 
             for i in range(n):
-                ids = input_ids[i : i + 1].to(device)
-                mask = attention_mask[i : i + 1].to(device)
-                lmask = loss_mask[i : i + 1].to(device)
+                ids = input_ids_full[i : i + 1].to(device)
+                mask = _attn[i : i + 1].to(device)
+                lmask = _lmask[i : i + 1].to(device)
 
                 with torch.no_grad():
                     out = engine.model(input_ids=ids, attention_mask=mask)
@@ -1476,7 +1485,7 @@ class TTTDDistillTrainer(PPOTrainer):
 
                 active = lmask.squeeze(0) > 0
                 # Build token logps on CPU to avoid holding GPU memory across sequences
-                seq_token_logps = torch.zeros(seqlen, dtype=torch.float32)
+                seq_token_logps = torch.zeros(_seqlen, dtype=torch.float32)
 
                 if not active.any():
                     del out, logits
@@ -1532,6 +1541,19 @@ class TTTDDistillTrainer(PPOTrainer):
             self.teacher, self.teacher.device, input_ids
         )
 
+        # Privileged teacher entropy (with milestone hint) for fair entropy gap
+        tp_ent = None
+        if "privileged_teacher_input_ids" in rollout_batch:
+            priv_input_ids = rollout_batch["privileged_teacher_input_ids"]
+            priv_attn_mask = rollout_batch["privileged_teacher_attention_mask"]
+            # Build loss mask: all ones for teacher sequence (we care about full distribution)
+            priv_loss_mask = torch.ones_like(priv_input_ids, dtype=torch.int32)
+            _tp_idx, _tp_logp, tp_ent, _tp_token_logp = _get_topk_entropy_and_logp(
+                self.teacher, self.teacher.device, priv_input_ids,
+                attn_mask_full=priv_attn_mask, lmask_full=priv_loss_mask
+            )
+            torch.cuda.empty_cache()
+
         if s_idx is None or t_idx is None or s_token_logp is None or t_token_logp is None:
             return {}, None, None
 
@@ -1578,6 +1600,9 @@ class TTTDDistillTrainer(PPOTrainer):
             "distill/teacher_entropy": float(t_ent.sum()),
             "distill/_count": int(n_active),
         }
+        if tp_ent is not None:
+            metrics["distill/entropy_gap_privileged"] = float((tp_ent - s_ent).abs().sum())
+            metrics["distill/teacher_entropy_privileged"] = float(tp_ent.sum())
         return metrics, t_token_logp, s_token_logp
 
     def close(self):
