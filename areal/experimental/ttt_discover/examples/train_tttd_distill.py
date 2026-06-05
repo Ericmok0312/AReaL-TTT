@@ -847,9 +847,10 @@ class TTTDDistillTrainer(PPOTrainer):
                 torch.cuda.empty_cache()
                 with torch.no_grad():
                     if config.use_privileged_teacher_logp:
-                        teacher_logps, teacher_input_ids, teacher_attention_mask = self._compute_privileged_teacher_logp(rollout_batch)
+                        teacher_logps, teacher_input_ids, teacher_attention_mask, teacher_loss_mask = self._compute_privileged_teacher_logp(rollout_batch)
                         rollout_batch["privileged_teacher_input_ids"] = teacher_input_ids
                         rollout_batch["privileged_teacher_attention_mask"] = teacher_attention_mask
+                        rollout_batch["privileged_teacher_loss_mask"] = teacher_loss_mask
                     else:
                         # Teacher and student see the same prompts (no privileged OPD)
                         teacher_logps_list = self.teacher.compute_logp([rollout_batch])
@@ -1433,7 +1434,7 @@ class TTTDDistillTrainer(PPOTrainer):
                 device=device, dtype=torch.float32
             )
 
-        return aligned_teacher_logp, teacher_input_ids, teacher_attention_mask
+        return aligned_teacher_logp, teacher_input_ids, teacher_attention_mask, teacher_loss_mask
 
     def _compute_dynamic_metrics(
         self, rollout_batch: dict[str, Any], k: int = 16
@@ -1554,8 +1555,7 @@ class TTTDDistillTrainer(PPOTrainer):
         if "privileged_teacher_input_ids" in rollout_batch:
             priv_input_ids = rollout_batch["privileged_teacher_input_ids"]
             priv_attn_mask = rollout_batch["privileged_teacher_attention_mask"]
-            # Build loss mask: all ones for teacher sequence (we care about full distribution)
-            priv_loss_mask = torch.ones_like(priv_input_ids, dtype=torch.int32)
+            priv_loss_mask = rollout_batch["privileged_teacher_loss_mask"]
             _tp_idx, _tp_logp, tp_ent, _tp_token_logp = _get_topk_entropy_and_logp(
                 self.teacher, self.teacher.device, priv_input_ids,
                 attn_mask_full=priv_attn_mask, lmask_full=priv_loss_mask
