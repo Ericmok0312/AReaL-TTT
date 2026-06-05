@@ -538,45 +538,32 @@ class TTTDMultiEvalTrainer(PPOTrainer):
             "failed": [],
         }
 
-        # Save detailed children info
+        # Save lightweight children info (reward stats only, no code/construction)
         for child in eval_children:
             child_data = {
                 "id": getattr(child, 'id', None),
-                "timestep": getattr(child, 'timestep', None),
                 "value": getattr(child, 'value', None),
-                "code": getattr(child, 'code', None),
-                "construction": getattr(child, 'construction', None),
-                "parent_values": getattr(child, 'parent_values', None),
-                "parents": getattr(child, 'parents', None),
-                "observation": getattr(child, 'observation', None),
                 "exec_time_ms": getattr(child, 'exec_time_ms', None),
             }
             result["children"].append(child_data)
 
-        # Save parents info
+        # Save lightweight parents info
         for parent in eval_parents:
             parent_data = {
                 "id": getattr(parent, 'id', None),
-                "timestep": getattr(parent, 'timestep', None),
                 "value": getattr(parent, 'value', None),
-                "code": getattr(parent, 'code', None),
-                "construction": getattr(parent, 'construction', None),
             }
             result["parents"].append(parent_data)
 
-        # Save failed rollouts info
+        # Save lightweight failed rollouts info
         for failed in eval_failed:
             failed_data = {
                 "id": getattr(failed, 'id', None),
-                "timestep": getattr(failed, 'timestep', None),
                 "value": getattr(failed, 'value', None),
-                "code": getattr(failed, 'code', None),
-                "construction": getattr(failed, 'construction', None),
-                "observation": getattr(failed, 'observation', None),
             }
             result["failed"].append(failed_data)
 
-        # Save per-rank detailed data to disk (avoid NCCL hang with large objects)
+        # Save per-rank lightweight data to disk (avoid NCCL hang with large objects)
         eval_output_dir = os.path.join(
             self.config.saver.fileroot,
             self.config.experiment_name,
@@ -596,7 +583,7 @@ class TTTDMultiEvalTrainer(PPOTrainer):
                 "parents": result["parents"],
                 "failed": result["failed"],
             }, f, indent=2, default=str)
-        logger.info(f"[MultiEval-{label}] Saved detailed data to {detailed_path}")
+        logger.info(f"[MultiEval-{label}] Saved lightweight data to {detailed_path}")
 
         logger.info(
             f"[MultiEval-{label}] max={eval_max_reward:.4f}, mean={eval_mean_reward:.4f}, "
@@ -710,18 +697,41 @@ class TTTDMultiEvalTrainer(PPOTrainer):
                 json.dump(all_results, f, indent=2, default=str)
             logger.info(f"[MultiEval] Comparison results saved to {comparison_path}")
 
-            logger.info("\n" + "="*70)
+            def _reward_distribution(rewards):
+                """Compute reward distribution using percentiles (problem-agnostic)."""
+                import numpy as np
+                arr = np.array(rewards)
+                total = len(arr)
+                if total == 0:
+                    return {}
+                nonzero = arr[arr != 0.0]
+                buckets = {
+                    "zero": int(np.sum(arr == 0.0)),
+                    "p25": float(np.percentile(nonzero, 25)) if len(nonzero) > 0 else 0.0,
+                    "p50": float(np.percentile(nonzero, 50)) if len(nonzero) > 0 else 0.0,
+                    "p75": float(np.percentile(nonzero, 75)) if len(nonzero) > 0 else 0.0,
+                    "p90": float(np.percentile(nonzero, 90)) if len(nonzero) > 0 else 0.0,
+                }
+                return {
+                    "zero": f"{buckets['zero']/total*100:.1f}%",
+                    "p25": f"{buckets['p25']:.3f}",
+                    "p50": f"{buckets['p50']:.3f}",
+                    "p75": f"{buckets['p75']:.3f}",
+                    "p90": f"{buckets['p90']:.3f}",
+                }
+
+            logger.info("\n" + "="*90)
             logger.info("EVALUATION COMPARISON")
-            logger.info("="*70)
+            logger.info("="*90)
             for label in self._eval_models:
                 r = all_results[label]
+                dist = _reward_distribution(r['all_rewards'])
+                dist_str = f"z={dist['zero']} p25={dist['p25']} p50={dist['p50']} p75={dist['p75']} p90={dist['p90']}"
                 logger.info(
-                    f"{label:40s} | max_reward={r['max_reward']:.4f} | "
-                    f"mean_reward={r['mean_reward']:.4f} | "
-                    f"rollouts={r['global_rollouts']} | "
-                    f"children={r['n_children']} | failed={r['n_failed']}"
+                    f"{label:25s} | max={r['max_reward']:.4f} | mean={r['mean_reward']:.4f} | "
+                    f"n={r['global_rollouts']} | {dist_str}"
                 )
-            logger.info("="*70)
+            logger.info("="*90)
 
         if dist.is_initialized():
             dist.barrier()
@@ -823,6 +833,10 @@ def main(args):
         workflow_kwargs['hint_placement'] = "append"
         workflow_kwargs['distill_mode'] = True
         logger.info("[MultiEval] Enabled milestone hint distillation mode")
+    elif getattr(config, 'distill_from_scratch', False):
+        # From-scratch eval without milestone hints (e.g., evaluate student baseline)
+        workflow_kwargs['distill_mode'] = True
+        logger.info("[MultiEval] Enabled from-scratch prompt mode (no hints)")
 
     with TTTDMultiEvalTrainer(config) as trainer:
         trainer.run_eval(
