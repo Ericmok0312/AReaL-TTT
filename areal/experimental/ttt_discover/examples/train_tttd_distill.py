@@ -1503,7 +1503,7 @@ class TTTDDistillTrainer(PPOTrainer):
                     )
 
                     # Extract per-token logp for actual tokens (reuse for compute_logp)
-                    chunk_input_ids = input_ids_full[i][active][j : j + seq_chunk_size]
+                    chunk_input_ids = input_ids_full[i][active][j : j + seq_chunk_size].to(log_probs.device)
                     chunk_token_logp = log_probs.gather(
                         dim=-1, index=chunk_input_ids.unsqueeze(-1)
                     ).squeeze(-1)
