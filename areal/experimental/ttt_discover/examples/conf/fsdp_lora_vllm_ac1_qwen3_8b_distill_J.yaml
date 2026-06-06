@@ -3,8 +3,8 @@ trial_name: trial0
 is_tttd_config: true
 seed: 1
 enable_offload: false
-max_steps: 200
-total_train_epochs: 200
+max_steps: 300
+total_train_epochs: 300
 enable_thinking: true
 reset_puct_stats_on_resume: false
 student_sampler_inherit_teacher_pool: false
@@ -216,7 +216,7 @@ saver:
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
   freq_epochs: 1
-  freq_steps: 1
+  freq_steps: 5
   freq_secs: null
 
 recover:
@@ -225,7 +225,7 @@ recover:
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
   freq_epochs: 1
-  freq_steps: 1
+  freq_steps: 5
   freq_secs: 3600
 
 evaluator:
