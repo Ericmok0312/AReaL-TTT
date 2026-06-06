@@ -279,6 +279,10 @@ eval_models:
 #   #J-step130: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch129epochstep129globalstep129
   #J-step140: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch139epochstep139globalstep139
   #J-step150: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch149epochstep149globalstep149
-  J-step160: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch159epochstep159globalstep159
+  #J-step160: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch159epochstep159globalstep159
+  J-step170: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch169epochstep169globalstep169
+  J-step180: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch179epochstep179globalstep179
+  J-step190: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch189epochstep189globalstep189
+  J-step200: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch199epochstep199globalstep199
 # # eval_models:
 # #   J-student: ${cluster.fileroot}/${experiment_name}/${trial_name}/eval_checkpoints/student
