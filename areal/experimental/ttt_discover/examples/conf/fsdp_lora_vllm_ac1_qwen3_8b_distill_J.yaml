@@ -280,9 +280,14 @@ eval_models:
   #J-step140: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch139epochstep139globalstep139
   #J-step150: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch149epochstep149globalstep149
   #J-step160: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch159epochstep159globalstep159
-  J-step170: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch169epochstep169globalstep169
-  J-step180: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch179epochstep179globalstep179
-  J-step190: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch189epochstep189globalstep189
+  #J-step170: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch169epochstep169globalstep169
+  #J-step180: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch179epochstep179globalstep179
+  #J-step190: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch189epochstep189globalstep189
   J-step200: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch199epochstep199globalstep199
+  J-step220: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch219epochstep219globalstep219
+  J-step240: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch239epochstep239globalstep239
+  J-step260: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch259epochstep259globalstep259
+  J-step280: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch279epochstep279globalstep279
+  J-step300: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch299epochstep299globalstep299
 # # eval_models:
 # #   J-student: ${cluster.fileroot}/${experiment_name}/${trial_name}/eval_checkpoints/student
