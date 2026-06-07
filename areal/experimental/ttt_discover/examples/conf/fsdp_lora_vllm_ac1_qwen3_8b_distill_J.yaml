@@ -283,7 +283,7 @@ eval_models:
   #J-step170: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch169epochstep169globalstep169
   #J-step180: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch179epochstep179globalstep179
   #J-step190: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch189epochstep189globalstep189
-  J-step200: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch199epochstep199globalstep199
+  #J-step200: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch199epochstep199globalstep199
   J-step220: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch219epochstep219globalstep219
   J-step240: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch239epochstep239globalstep239
   J-step260: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch259epochstep259globalstep259
