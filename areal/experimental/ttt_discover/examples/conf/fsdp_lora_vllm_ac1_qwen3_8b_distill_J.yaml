@@ -263,7 +263,8 @@ eval_group_size: 64
 # loaded directly by eval_tttd_multi_v2. Uncomment the step you want to evaluate.
 # Saver path: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/
 eval_models:
-    #teacher: ${teacher.path}
+  teacher: ${teacher.path}
+  baseline: ${cluster.fileroot}/${experiment_name}/${trial_name}/eval_checkpoints/baseline
   #J-step10: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch9epochstep9globalstep9
   #J-step20: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch19epochstep19globalstep19
   #J-step30: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch29epochstep29globalstep29
@@ -284,10 +285,10 @@ eval_models:
   #J-step180: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch179epochstep179globalstep179
   #J-step190: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch189epochstep189globalstep189
   #J-step200: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch199epochstep199globalstep199
-  J-step220: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch219epochstep219globalstep219
-  J-step240: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch239epochstep239globalstep239
-  J-step260: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch259epochstep259globalstep259
-  J-step280: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch279epochstep279globalstep279
-  J-step300: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch299epochstep299globalstep299
+  #J-step220: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch219epochstep219globalstep219
+  #J-step240: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch239epochstep239globalstep239
+  #J-step260: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch259epochstep259globalstep259
+  #J-step280: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch279epochstep279globalstep279
+  #J-step300: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch299epochstep299globalstep299
 # # eval_models:
 # #   J-student: ${cluster.fileroot}/${experiment_name}/${trial_name}/eval_checkpoints/student
