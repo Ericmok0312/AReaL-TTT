@@ -272,22 +272,23 @@ eval_models:
   #baseline-hint: ${cluster.fileroot}/${experiment_name}/${trial_name}/eval_checkpoints/base
   #teacher-hint: ${teacher.path}
   #K-step10: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch9epochstep9globalstep9
-  K-step20: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch19epochstep19globalstep19
+  #K-step20: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch19epochstep19globalstep19
   #K-step30: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch29epochstep29globalstep29
-  K-step40: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch39epochstep39globalstep39
+  #K-step40: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch39epochstep39globalstep39
   #K-step50: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch49epochstep49globalstep49
-  K-step60: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch59epochstep59globalstep59
+  #K-step60: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch59epochstep59globalstep59
   #K-step70: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch69epochstep69globalstep69
   #K-step75: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch74epochstep74globalstep74
-  K-step80: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch79epochstep79globalstep79
+  #K-step80: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch79epochstep79globalstep79
   #K-step85: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch84epochstep84globalstep84
   #K-step90: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch89epochstep89globalstep89
   #K-step95: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch94epochstep94globalstep94
-  K-step100: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch99epochstep99globalstep99
+  #K-step100: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch99epochstep99globalstep99
   #K-step110: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch109epochstep109globalstep109
-  K-step120: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch119epochstep119globalstep119
+  #K-step120: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch119epochstep119globalstep119
   #K-step130: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch129epochstep129globalstep129
   #K-step140: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch139epochstep139globalstep139
-  K-step150: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch149epochstep149globalstep149
+  #K-step150: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch149epochstep149globalstep149
+  K-step155: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch154epochstep154globalstep154
 # # eval_models:
 # #   K-student: ${cluster.fileroot}/${experiment_name}/${trial_name}/eval_checkpoints/student
