@@ -302,6 +302,7 @@ class AleBenchState(State):
         timestep: int,
         code: str,
         value: float = None,
+        raw_score: float | None = None,
         parent_values: list[float] = None,
         parents: list[dict] = None,
         id: str = None,
@@ -309,6 +310,7 @@ class AleBenchState(State):
     ):
         super().__init__(timestep, value, parent_values, parents, id, observation)
         self.code = code
+        self.raw_score = raw_score
 
     def to_dict(self) -> dict:
         return {
@@ -316,6 +318,7 @@ class AleBenchState(State):
             "id": self.id,
             "timestep": self.timestep,
             "value": self.value,
+            "raw_score": self.raw_score,
             "parent_values": self.parent_values,
             "parents": self.parents,
             "exec_time_ms": self.exec_time_ms,
