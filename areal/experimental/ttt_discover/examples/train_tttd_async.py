@@ -27,6 +27,7 @@ import torch.distributed as dist
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal import PPOTrainer
+from areal.api.alloc_mode import ModelAllocation
 from areal.api.alloc_mode import _AllocationMode as AllocationMode
 from areal.api.cli_args import (
     load_expr_config,
@@ -88,6 +89,21 @@ class TTTDPPOTrainer(PPOTrainer):
 
         # Parse allocation mode
         self.allocation_mode = AllocationMode.from_str(config.allocation_mode)
+
+        # Per-engine allocations required by PPOTrainer helper methods
+        # (_init_rollout, _initialize_engines, _setup_weight_update_meta, etc.).
+        self.actor_alloc = ModelAllocation.from_str(config.actor.backend, name="actor")
+        self.rollout_alloc = ModelAllocation.from_str(
+            config.rollout.backend, name="rollout"
+        )
+        self._should_offload_rollout = self._is_actor_rollout_colocated(config)
+        self._should_offload_actor = (
+            self._should_offload_rollout or config.actor.offload
+        )
+        self._should_offload_critic = False
+        self._should_offload_ref = config.ref is not None and config.ref.offload
+        self._should_offload_teacher = False
+
         self._amend_xccl_weight_update_envvar()
 
         # Create sampler first (needed for dataloader)
