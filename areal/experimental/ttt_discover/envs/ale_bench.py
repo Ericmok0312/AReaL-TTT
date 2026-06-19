@@ -165,6 +165,14 @@ class AleBenchEnv(BaseEnv):
             language=self.code_language,
         )
 
+        # Show the unscaled raw score in the prompt so the model sees the actual
+        # problem-scale metric alongside the normalized reward.
+        raw_score = getattr(state, "raw_score", None)
+        if raw_score is not None:
+            value_context += (
+                f"\nUnscaled avg raw score (before reward scaling): {raw_score:.4f}"
+            )
+
         example_section = ""
         if example_input.strip() or example_output.strip():
             example_section = "\n--- Example Input/Output ---\n"
@@ -331,6 +339,7 @@ Rules:
             timestep=timestep,
             code=code,
             value=float(reward),
+            raw_score=result.metadata.get("avg_raw_score") if result.metadata else None,
             observation=result.observation,
             parent_values=[parent_state.value]
             if parent_state.value is not None
@@ -388,5 +397,6 @@ def create_initial_state_ale_bench(problem_id: str) -> AleBenchState:
         timestep=-1,
         code="",
         value=None,
+        raw_score=None,
         observation=f"Initial state for ALE-Bench problem {problem_id}",
     )

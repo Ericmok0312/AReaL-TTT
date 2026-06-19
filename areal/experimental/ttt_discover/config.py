@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # areal/experimental/ttt_discover/config.py
 from dataclasses import dataclass, field
 
@@ -59,25 +61,33 @@ class SamplerConfig:
     # Sampling strategy
     sampling_strategy: str = field(
         default="puct",
-        metadata={"help": "Sampling strategy: 'puct' (UCB-based) or 'parent_pool' (random from visited parents)"},
+        metadata={
+            "help": "Sampling strategy: 'puct' (UCB-based) or 'parent_pool' (random from visited parents)"
+        },
     )
 
     # Initial state
     initial_exp_type: str = field(
         default="best_available",
-        metadata={"help": "Initial experience type: 'best_available', 'none', 'random', 'random_no_code'"},
+        metadata={
+            "help": "Initial experience type: 'best_available', 'none', 'random', 'random_no_code'"
+        },
     )
 
     # Environment type for initial state creation
     env_type: str = field(
         default="cp",
-        metadata={"help": "Environment type: 'cp', 'ac1', 'ac2', 'mla_decode_nvidia', 'trimul', 'erdos', 'denoising', 'ahc039', 'ahc058', 'ale_bench'"},
+        metadata={
+            "help": "Environment type: 'cp', 'ac1', 'ac2', 'mla_decode_nvidia', 'trimul', 'erdos', 'denoising', 'ahc039', 'ahc058', 'ale_bench'"
+        },
     )
 
     # ALE-Bench specific parameters
     problem_id: str = field(
         default="",
-        metadata={"help": "ALE-Bench problem ID (e.g. 'ahc039'). Required when env_type='ale_bench'."},
+        metadata={
+            "help": "ALE-Bench problem ID (e.g. 'ahc039'). Required when env_type='ale_bench'."
+        },
     )
     ale_bench_lite_version: bool = field(
         default=True,
@@ -85,7 +95,9 @@ class SamplerConfig:
     )
     reward_scale: float | None = field(
         default=None,
-        metadata={"help": "Per-problem reward normalization divisor. If None, auto-computed from standings."},
+        metadata={
+            "help": "Per-problem reward normalization divisor. If None, auto-computed from standings."
+        },
     )
 
     # Environment-specific parameters
@@ -122,7 +134,9 @@ class SamplerConfig:
     )
     memory_threshold: float = field(
         default=0.60,
-        metadata={"help": "Pause execution when system memory usage exceeds this ratio"},
+        metadata={
+            "help": "Pause execution when system memory usage exceeds this ratio"
+        },
     )
     max_memory_mb: int = field(
         default=8192,
@@ -132,20 +146,26 @@ class SamplerConfig:
     # Lazy PUCT Sampling configuration
     lazy_puct_sampling: bool = field(
         default=True,
-        metadata={"help": "Enable lazy PUCT sampling: defer sampling until VLLM has capacity"},
+        metadata={
+            "help": "Enable lazy PUCT sampling: defer sampling until VLLM has capacity"
+        },
     )
     vllm_concurrency: int | None = field(
         default=None,
-        metadata={"help": "Per-rank VLLM concurrency limit for lazy sampling. "
-                         "If None, auto-computed as batch_size * group_size. "
-                         "Each rank (VLLM instance) can have this many concurrent generations. "
-                         "Should match or be less than vllm.max_num_seqs."},
+        metadata={
+            "help": "Per-rank VLLM concurrency limit for lazy sampling. "
+            "If None, auto-computed as batch_size * group_size. "
+            "Each rank (VLLM instance) can have this many concurrent generations. "
+            "Should match or be less than vllm.max_num_seqs."
+        },
     )
     execution_concurrency: int = field(
         default=64,
-        metadata={"help": "Per-rank solution execution concurrency limit. "
-                         "Each rank can have this many concurrent code executions. "
-                         "Should match AsyncRewardWrapper max_workers (default 64)."},
+        metadata={
+            "help": "Per-rank solution execution concurrency limit. "
+            "Each rank can have this many concurrent code executions. "
+            "Should match AsyncRewardWrapper max_workers (default 64)."
+        },
     )
     max_puct_version_history: int = field(
         default=5,
@@ -167,17 +187,19 @@ class TTTDPPOActorConfig(PPOActorConfig):
         default="gae",
         metadata={
             "help": "Advantage estimation method. "
-                    "'gae': standard GAE, "
-                    "'entropic': TTT-Discover with fixed beta, "
-                    "'entropic_adaptive_beta': TTT-Discover with adaptive beta, "
-                    "'mean_baseline': simple mean subtraction"
+            "'gae': standard GAE, "
+            "'entropic': TTT-Discover with fixed beta, "
+            "'entropic_adaptive_beta': TTT-Discover with adaptive beta, "
+            "'mean_baseline': simple mean subtraction"
         },
     )
 
     # Entropic parameters
     adv_estimator_beta: float = field(
         default=1.0,
-        metadata={"help": "Beta (temperature) for entropic advantage. Higher = more exploration"},
+        metadata={
+            "help": "Beta (temperature) for entropic advantage. Higher = more exploration"
+        },
     )
 
     # Adaptive beta parameters
@@ -199,26 +221,37 @@ class TTTDPPOActorConfig(PPOActorConfig):
     # Standard GRPO option (for hybrid RL+distillation)
     use_standard_grpo: bool = field(
         default=False,
-        metadata={"help": "If True, use standard GRPO advantage (reward - group_mean) / group_std "
-                         "instead of TTT-Discover entropic objective (w_beta - 1)."},
+        metadata={
+            "help": "If True, use standard GRPO advantage (reward - group_mean) / group_std "
+            "instead of TTT-Discover entropic objective (w_beta - 1)."
+        },
     )
     best_reward_anchor: bool = field(
         default=False,
-        metadata={"help": "If True, add a small Gaussian bonus to GRPO advantages for rollouts "
-                         "close to the sampler's best known reward. Stabilizes training "
-                         "with small group sizes by anchoring to a global reference."},
+        metadata={
+            "help": "If True, add a small Gaussian bonus to GRPO advantages for rollouts "
+            "close to the sampler's best known reward. Stabilizes training "
+            "with small group sizes by anchoring to a global reference."
+        },
     )
 
     # Grouping strategy
     group_size: int | None = field(
         default=None,
-        metadata={"help": "Number of samples per group for advantage calculation. "
-                         "If None, infer from batch structure or treat whole batch as one group"},
+        metadata={
+            "help": "Number of samples per group for advantage calculation. "
+            "If None, infer from batch structure or treat whole batch as one group"
+        },
     )
 
     def __post_init__(self):
         super().__post_init__()
-        valid_estimators = ["gae", "mean_baseline", "entropic", "entropic_adaptive_beta"]
+        valid_estimators = [
+            "gae",
+            "mean_baseline",
+            "entropic",
+            "entropic_adaptive_beta",
+        ]
         if self.adv_estimator not in valid_estimators:
             raise ValueError(
                 f"adv_estimator must be one of {valid_estimators}, got {self.adv_estimator}"
@@ -248,36 +281,56 @@ class TTTDPPOConfig(PPOConfig):
     )
     enable_thinking: bool = field(
         default=False,
-        metadata={"help": "Enable thinking mode for Qwen3 models (adds enable_thinking=True to chat_template)"},
+        metadata={
+            "help": "Enable thinking mode for Qwen3 models (adds enable_thinking=True to chat_template)"
+        },
     )
     max_prompt_thinking_tokens: int = field(
         default=26000,
-        metadata={"help": "Maximum tokens for prompt + thinking phase. Paper: 26000 to leave room for final response. "
-                         "If model exceeds this without producing valid code, teacher forcing is applied."},
+        metadata={
+            "help": "Maximum tokens for prompt + thinking phase. Paper: 26000 to leave room for final response. "
+            "If model exceeds this without producing valid code, teacher forcing is applied."
+        },
     )
     save_steps: list[int] = field(
-        default_factory=lambda: [0, 9, 24, 49],
-        metadata={"help": "Steps to save training history snapshots for visualization"},
+        default_factory=list,
+        metadata={
+            "help": "Explicit steps to save training history snapshots for visualization. "
+            "If empty and history_save_freq is set, steps are generated automatically."
+        },
+    )
+    history_save_freq: int | None = field(
+        default=None,
+        metadata={
+            "help": "Save training history snapshot every N steps (e.g. 1=every step, 5=every 5 steps). "
+            "If None, fall back to save_steps."
+        },
     )
     skip_lora_check: bool = field(
         default=False,
-        metadata={"help": "Skip LoRA adapter existence check at training start. "
-                         "Use only if you are certain the adapter exists at the configured path. "
-                         "Note: The LoRA adapter must be created BEFORE training using prepare_lora_init.py "
-                         "because vLLM loads it at startup before the training script runs."},
+        metadata={
+            "help": "Skip LoRA adapter existence check at training start. "
+            "Use only if you are certain the adapter exists at the configured path. "
+            "Note: The LoRA adapter must be created BEFORE training using prepare_lora_init.py "
+            "because vLLM loads it at startup before the training script runs."
+        },
     )
     reset_puct_stats_on_resume: bool = field(
         default=True,
-        metadata={"help": "Reset PUCT statistics (_T, _n, _m) when resuming from checkpoint. "
-                         "If True, exploration stats start from 0 (recommended for new experiments). "
-                         "If False, stats continue from saved values (for continuing same experiment). "
-                         "Default is True to avoid _T inflation across different training runs."},
+        metadata={
+            "help": "Reset PUCT statistics (_T, _n, _m) when resuming from checkpoint. "
+            "If True, exploration stats start from 0 (recommended for new experiments). "
+            "If False, stats continue from saved values (for continuing same experiment). "
+            "Default is True to avoid _T inflation across different training runs."
+        },
     )
     use_scheme_1: bool = field(
         default=False,
-        metadata={"help": "Enable Scheme 1 (sync-like) mode: wait for complete batch before PUCT update. "
-                         "This ensures complete batch updates like sync mode but allows async rollout. "
-                         "Default is False (Scheme 2: streaming/async mode)"},
+        metadata={
+            "help": "Enable Scheme 1 (sync-like) mode: wait for complete batch before PUCT update. "
+            "This ensures complete batch updates like sync mode but allows async rollout. "
+            "Default is False (Scheme 2: streaming/async mode)"
+        },
     )
 
     # Compatibility flag (for type checking)
@@ -335,7 +388,9 @@ class TTTDDistillConfig(TTTDPPOConfig):
     )
     teacher_lora_path: str = field(
         default="",
-        metadata={"help": "Path to teacher LoRA adapter for eval (defaults to teacher.path if empty)"},
+        metadata={
+            "help": "Path to teacher LoRA adapter for eval (defaults to teacher.path if empty)"
+        },
     )
     student_lora_path: str = field(
         default="",
@@ -343,93 +398,125 @@ class TTTDDistillConfig(TTTDPPOConfig):
     )
     eval_batch_size: int = field(
         default=8,
-        metadata={"help": "Batch size for evaluation (number of initial states to sample). Defaults to 8."},
+        metadata={
+            "help": "Batch size for evaluation (number of initial states to sample). Defaults to 8."
+        },
     )
     eval_group_size: int = field(
         default=64,
-        metadata={"help": "Group size for evaluation (number of samples per initial state). Defaults to 64."},
+        metadata={
+            "help": "Group size for evaluation (number of samples per initial state). Defaults to 64."
+        },
     )
     eval_prompt_mode: str = field(
         default="hint",
-        metadata={"help": "Prompt mode for teacher eval: 'hint' (initial state + hint appended) or "
-                         "'continuation' (directly use PUCT sampler's privileged state as prompt base)."},
+        metadata={
+            "help": "Prompt mode for teacher eval: 'hint' (initial state + hint appended) or "
+            "'continuation' (directly use PUCT sampler's privileged state as prompt base)."
+        },
     )
     test_construction_match: bool = field(
         default=False,
-        metadata={"help": "TEST ONLY: If True, replace initial state's construction with hint state's construction "
-                         "to verify if construction quality is the bottleneck."},
+        metadata={
+            "help": "TEST ONLY: If True, replace initial state's construction with hint state's construction "
+            "to verify if construction quality is the bottleneck."
+        },
     )
 
     # Distillation behavior controls
     use_privileged_teacher_logp: bool = field(
         default=True,
-        metadata={"help": "If True, teacher sees privileged prompts sampled from teacher PUCTSampler (OPD). "
-                         "If False, teacher and student see the same prompts (no privileged information)."},
+        metadata={
+            "help": "If True, teacher sees privileged prompts sampled from teacher PUCTSampler (OPD). "
+            "If False, teacher and student see the same prompts (no privileged information)."
+        },
     )
     student_sampler_inherit_teacher_pool: bool = field(
         default=False,
-        metadata={"help": "If True, copy teacher sampler's state pool (_states, _n, _m, _T) into student sampler "
-                         "so the student starts from the same parent pool as the teacher. "
-                         "If False, student sampler starts fresh with only initial states."},
+        metadata={
+            "help": "If True, copy teacher sampler's state pool (_states, _n, _m, _T) into student sampler "
+            "so the student starts from the same parent pool as the teacher. "
+            "If False, student sampler starts fresh with only initial states."
+        },
     )
     teacher_sampler_strategy: str = field(
         default="puct",
-        metadata={"help": "Teacher sampler strategy for privileged OPD: 'puct' (top-scoring) or "
-                         "'parent_pool' (random from visited states). Only used when use_privileged_teacher_logp=True."},
+        metadata={
+            "help": "Teacher sampler strategy for privileged OPD: 'puct' (top-scoring) or "
+            "'parent_pool' (random from visited states). Only used when use_privileged_teacher_logp=True."
+        },
     )
     privileged_prompt_mode: str = field(
         default="continuation",
-        metadata={"help": "How to build the privileged prompt for teacher evaluation. "
-                         "'continuation': use env.get_prompt(state) with continuation bias (default, original behavior). "
-                         "'evaluation': use a neutral evaluation prompt that presents the state's code/value as a 'known good solution' "
-                         "and asks the teacher to evaluate the candidate code, removing continuation bias."},
+        metadata={
+            "help": "How to build the privileged prompt for teacher evaluation. "
+            "'continuation': use env.get_prompt(state) with continuation bias (default, original behavior). "
+            "'evaluation': use a neutral evaluation prompt that presents the state's code/value as a 'known good solution' "
+            "and asks the teacher to evaluate the candidate code, removing continuation bias."
+        },
     )
     use_breakthrough_opd: bool = field(
         default=False,
-        metadata={"help": "If True, teacher privileged prompts are built from breakthrough transitions "
-                         "(parent→child pairs with large reward improvement) instead of random high-value states. "
-                         "The teacher hint shows the student how a previous state was dramatically improved, "
-                         "not just what a good final state looks like."},
+        metadata={
+            "help": "If True, teacher privileged prompts are built from breakthrough transitions "
+            "(parent→child pairs with large reward improvement) instead of random high-value states. "
+            "The teacher hint shows the student how a previous state was dramatically improved, "
+            "not just what a good final state looks like."
+        },
     )
     breakthrough_min_improvement: float = field(
         default=0.001,
-        metadata={"help": "Minimum absolute value improvement (child.value - parent.value) for a transition "
-                         "to be considered a breakthrough when use_breakthrough_opd=True. "
-                         "Larger values select only the most dramatic breakthroughs (exploration); "
-                         "smaller values include refinement transitions as well."},
+        metadata={
+            "help": "Minimum absolute value improvement (child.value - parent.value) for a transition "
+            "to be considered a breakthrough when use_breakthrough_opd=True. "
+            "Larger values select only the most dramatic breakthroughs (exploration); "
+            "smaller values include refinement transitions as well."
+        },
     )
     eval_models: dict[str, str] | None = field(
         default=None,
-        metadata={"help": "Explicit dict of {label: lora_path} for eval_tttd_multi_v2. "
-                         "If None, auto-discovers baseline/teacher/student. "
-                         "If set, only evaluates the specified models."},
+        metadata={
+            "help": "Explicit dict of {label: lora_path} for eval_tttd_multi_v2. "
+            "If None, auto-discovers baseline/teacher/student. "
+            "If set, only evaluates the specified models."
+        },
     )
     milestone_hints: str = field(
         default="",
-        metadata={"help": "Path to JSON file containing milestone hints for whole-path teacher distillation. "
-                         "If set, teacher eval uses milestone-based hints showing strategy evolution."},
+        metadata={
+            "help": "Path to JSON file containing milestone hints for whole-path teacher distillation. "
+            "If set, teacher eval uses milestone-based hints showing strategy evolution."
+        },
     )
     distill_from_scratch: bool = field(
         default=False,
-        metadata={"help": "If True, student rollout uses from-scratch prompts (no height_sequence_1 reference). "
-                         "Requires env.get_prompt_distill() support. Typically used with milestone_hints."},
+        metadata={
+            "help": "If True, student rollout uses from-scratch prompts (no height_sequence_1 reference). "
+            "Requires env.get_prompt_distill() support. Typically used with milestone_hints."
+        },
     )
     use_real_reward: bool = field(
         default=False,
-        metadata={"help": "If True, use real environment reward (tttd_reward_fn) during "
-                         "distillation rollouts instead of dummy_reward_fn. Enables "
-                         "joint RL + OPD distillation (KDRL)."},
+        metadata={
+            "help": "If True, use real environment reward (tttd_reward_fn) during "
+            "distillation rollouts instead of dummy_reward_fn. Enables "
+            "joint RL + OPD distillation (KDRL)."
+        },
     )
     use_standard_grpo: bool = field(
         default=False,
-        metadata={"help": "If True, use standard GRPO advantage (reward - group_mean) / group_std "
-                         "instead of TTT-Discover entropic objective (w_beta - 1)."},
+        metadata={
+            "help": "If True, use standard GRPO advantage (reward - group_mean) / group_std "
+            "instead of TTT-Discover entropic objective (w_beta - 1)."
+        },
     )
     best_reward_anchor: bool = field(
         default=False,
-        metadata={"help": "If True, add a small bonus to GRPO advantages for rollouts "
-                         "close to the sampler's best known reward. Stabilizes training "
-                         "with small group sizes by anchoring to a global reference."},
+        metadata={
+            "help": "If True, add a small bonus to GRPO advantages for rollouts "
+            "close to the sampler's best known reward. Stabilizes training "
+            "with small group sizes by anchoring to a global reference."
+        },
     )
 
 
@@ -449,52 +536,58 @@ def create_env_from_config(config):
         Environment instance
     """
     # Import here to avoid circular imports
-    from .envs import AleBenchEnv, CirclePackingEnv, DenoisingEnv, ErdosEnv, InequalitiesEnv
+    from .envs import (
+        AleBenchEnv,
+        CirclePackingEnv,
+        DenoisingEnv,
+        ErdosEnv,
+        InequalitiesEnv,
+    )
 
-    env_type = getattr(config.sampler, 'env_type', 'ac1')
-    eval_timeout = getattr(config.sampler, 'eval_timeout', 600)
+    env_type = getattr(config.sampler, "env_type", "ac1")
+    eval_timeout = getattr(config.sampler, "eval_timeout", 600)
 
-    if env_type == 'cp':
+    if env_type == "cp":
         return CirclePackingEnv(
-            n_item=getattr(config.sampler, 'n_item', 26),
+            n_item=getattr(config.sampler, "n_item", 26),
             eval_timeout=eval_timeout,
             log_dir=config.saver.fileroot,
         )
-    elif env_type in ('ac1', 'ac2'):
+    elif env_type in ("ac1", "ac2"):
         return InequalitiesEnv(
             problem_type=env_type,
-            budget_s=getattr(config.sampler, 'budget_s', 1000),
+            budget_s=getattr(config.sampler, "budget_s", 1000),
             eval_timeout=eval_timeout,
             log_dir=config.saver.fileroot,
-            num_cpus=getattr(config.sampler, 'num_cpus', 2),
-            memory_threshold=getattr(config.sampler, 'memory_threshold', 0.60),
-            max_memory_mb=getattr(config.sampler, 'max_memory_mb', 8192),
+            num_cpus=getattr(config.sampler, "num_cpus", 2),
+            memory_threshold=getattr(config.sampler, "memory_threshold", 0.60),
+            max_memory_mb=getattr(config.sampler, "max_memory_mb", 8192),
         )
-    elif env_type == 'erdos':
+    elif env_type == "erdos":
         return ErdosEnv(
-            n=getattr(config.sampler, 'n', 200),
-            budget_s=getattr(config.sampler, 'budget_s', 1000),
+            n=getattr(config.sampler, "n", 200),
+            budget_s=getattr(config.sampler, "budget_s", 1000),
             eval_timeout=eval_timeout,
             log_dir=config.saver.fileroot,
-            num_cpus=getattr(config.sampler, 'num_cpus', 2),
+            num_cpus=getattr(config.sampler, "num_cpus", 2),
         )
-    elif env_type == 'denoising':
+    elif env_type == "denoising":
         return DenoisingEnv(
             eval_timeout=eval_timeout,
             log_dir=config.saver.fileroot,
-            num_cpus=getattr(config.sampler, 'num_cpus', 2),
+            num_cpus=getattr(config.sampler, "num_cpus", 2),
         )
-    elif env_type == 'ale_bench':
-        problem_id = getattr(config.sampler, 'problem_id', '')
+    elif env_type == "ale_bench":
+        problem_id = getattr(config.sampler, "problem_id", "")
         if not problem_id:
             raise ValueError("sampler.problem_id must be set when env_type='ale_bench'")
         return AleBenchEnv(
             problem_id=problem_id,
-            lite_version=getattr(config.sampler, 'ale_bench_lite_version', True),
+            lite_version=getattr(config.sampler, "ale_bench_lite_version", True),
             eval_timeout=eval_timeout,
             log_dir=config.saver.fileroot,
-            num_cpus=getattr(config.sampler, 'num_cpus', 2),
-            reward_scale=getattr(config.sampler, 'reward_scale', None),
+            num_cpus=getattr(config.sampler, "num_cpus", 2),
+            reward_scale=getattr(config.sampler, "reward_scale", None),
         )
     else:
         raise ValueError(f"Unknown env_type: {env_type}")

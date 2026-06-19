@@ -17,6 +17,7 @@ Usage:
         areal/experimental/ttt_discover/examples/conf/fsdp_lora_vllm_ac1_qwen3_8b_async.yaml
 """
 
+import os
 import queue as queue_module
 import sys
 import time
@@ -553,8 +554,15 @@ class TTTDPPOTrainer(PPOTrainer):
         )
         max_steps = getattr(config, "max_steps", config.total_train_epochs)
 
-        # Generate save_steps
-        all_save_steps = getattr(config, "save_steps", list(range(0, max_steps)))
+        # Generate save_steps. Prefer history_save_freq if set; otherwise fall back
+        # to the explicit save_steps list. If neither is set, default to every step.
+        history_save_freq = getattr(config, "history_save_freq", None)
+        if history_save_freq is not None and history_save_freq > 0:
+            all_save_steps = list(range(0, max_steps, history_save_freq))
+        else:
+            all_save_steps = getattr(config, "save_steps", None) or list(
+                range(0, max_steps)
+            )
         future_save_steps = [s for s in all_save_steps if start_step <= s < max_steps]
 
         is_dp_head = (
@@ -568,9 +576,17 @@ class TTTDPPOTrainer(PPOTrainer):
             if self.actor.data_parallel_world_size > 1
             else ""
         )
+        # Save training history under the same experiment/trial tree as the
+        # sampler checkpoints and config logs, not directly at the fileroot root.
+        history_output_dir = os.path.join(
+            config.cluster.fileroot, config.experiment_name, config.trial_name
+        )
+        os.makedirs(history_output_dir, exist_ok=True)
+        self.history_output_dir = history_output_dir
+
         self.history_logger = TTTTrainingLogger(
             save_steps=future_save_steps,
-            output_dir=config.saver.fileroot,
+            output_dir=history_output_dir,
             is_dp_head=True,  # Every rank is its own "head" for saving
             filename=f"training_history{rank_suffix}.pkl",
             checkpoint_filename=f"training_history_checkpoint{rank_suffix}.pkl",
@@ -586,7 +602,7 @@ class TTTDPPOTrainer(PPOTrainer):
             logger.info(
                 f"[TTTLogger] Existing snapshots from checkpoint: {existing_snapshots}"
             )
-            logger.info(f"[TTTLogger] Output directory: {config.saver.fileroot}")
+            logger.info(f"[TTTLogger] Output directory: {history_output_dir}")
 
         # DEBUG: Print PUCTSampler state after recovery (all ranks)
         if hasattr(self.sampler, "_states"):
@@ -1421,7 +1437,7 @@ class TTTDPPOTrainer(PPOTrainer):
                     f"    --history_path {history_path} \\\n"
                     f"    --benchmark_value {benchmark_value}\n"
                     f"\n[TTTLogger] Note: For multi-rank analysis, process each rank's file separately:\n"
-                    f"  for f in {self.config.saver.fileroot}/training_history_rank*.pkl; do\n"
+                    f"  for f in {self.history_output_dir}/training_history_rank*.pkl; do\n"
                     f"    python areal/experimental/ttt_discover/generate_plot.py \\\n"
                     f"      --history_path $f --benchmark_value {benchmark_value}\n"
                     f"  done"

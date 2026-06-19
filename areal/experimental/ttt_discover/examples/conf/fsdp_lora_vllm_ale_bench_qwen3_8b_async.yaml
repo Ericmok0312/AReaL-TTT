@@ -4,59 +4,9 @@ is_tttd_config: true
 use_scheme_1: false
 seed: 1
 enable_offload: false
-max_steps: 50
-save_steps:
-- 0
-- 1
-- 2
-- 3
-- 4
-- 5
-- 6
-- 7
-- 8
-- 9
-- 10
-- 11
-- 12
-- 13
-- 14
-- 15
-- 16
-- 17
-- 18
-- 19
-- 20
-- 21
-- 22
-- 23
-- 24
-- 25
-- 26
-- 27
-- 28
-- 29
-- 30
-- 31
-- 32
-- 33
-- 34
-- 35
-- 36
-- 37
-- 38
-- 39
-- 40
-- 41
-- 42
-- 43
-- 44
-- 45
-- 46
-- 47
-- 48
-- 49
-total_train_epochs: 50
+max_steps: 30
+total_train_epochs: 30
+history_save_freq: 1
 enable_thinking: true
 reset_puct_stats_on_resume: false
 actor:
@@ -199,7 +149,7 @@ sampler:
   max_states: 100000
   top_k: 1000
   temperature: 1.0
-  save_freq: 100
+  save_freq: 5
   checkpoint_dir: ${cluster.fileroot}/${experiment_name}/${trial_name}/sampler
   initial_exp_type: random
   env_type: ale_bench
@@ -223,16 +173,16 @@ saver:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
-  freq_epochs: 1
-  freq_steps: 1
+  freq_epochs: null
+  freq_steps: 5
   freq_secs: null
 recover:
   mode: 'on'
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
-  freq_epochs: 1
-  freq_steps: 1
+  freq_epochs: null
+  freq_steps: 5
   freq_secs: 3600
 evaluator:
   experiment_name: ${experiment_name}

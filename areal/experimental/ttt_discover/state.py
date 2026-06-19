@@ -252,6 +252,7 @@ class GpuModeState(State):
         timestep: int,
         code: str,
         value: float = None,
+        raw_score: float | None = None,
         parent_values: list[float] = None,
         parents: list[dict] = None,
         id: str = None,
@@ -259,6 +260,7 @@ class GpuModeState(State):
     ):
         super().__init__(timestep, value, parent_values, parents, id, observation)
         self.code = code
+        self.raw_score = raw_score
 
     def to_dict(self) -> dict:
         return {
@@ -266,6 +268,7 @@ class GpuModeState(State):
             "id": self.id,
             "timestep": self.timestep,
             "value": self.value,
+            "raw_score": self.raw_score,
             "parent_values": self.parent_values,
             "parents": self.parents,
             "observation": self.observation,
@@ -289,9 +292,10 @@ class GpuModeState(State):
 
 
 class AleBenchState(State):
-    """State for ALE Bench - holds code."""
+    """State for ALE Bench - holds code and raw score."""
 
     code: str  # the code that generated the result
+    raw_score: float | None  # average raw score before scaling/negation
 
     def __init__(
         self,
@@ -324,6 +328,7 @@ class AleBenchState(State):
             timestep=d["timestep"],
             code=d["code"],
             value=d.get("value"),
+            raw_score=d.get("raw_score"),
             parent_values=d.get("parent_values", []),
             parents=d.get("parents", []),
             id=d.get("id"),
