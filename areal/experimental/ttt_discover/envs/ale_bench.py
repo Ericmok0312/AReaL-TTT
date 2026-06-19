@@ -92,6 +92,23 @@ class AleBenchEnv(BaseEnv):
         self.problem = self.session.problem
         self.standings = self.session._standings
 
+        # DEBUG: log the directories ALE-Bench actually uses for compilation/running.
+        import os as _os
+
+        for attr in ("tool_dir", "work_dir", "_tool_dir", "_work_dir", "log_dir"):
+            val = getattr(self.session, attr, None)
+            if val:
+                try:
+                    st = _os.stat(val)
+                    logger.info(
+                        f"[AleBenchEnv][DEBUG] session.{attr}={val} "
+                        f"mode={oct(st.st_mode)} uid={st.st_uid} gid={st.st_gid}"
+                    )
+                except Exception as e:
+                    logger.info(
+                        f"[AleBenchEnv][DEBUG] session.{attr}={val} stat failed: {e}"
+                    )
+
         # Infer optimization direction from problem metadata.
         if maximize is None:
             self.maximize = self.problem.metadata.score_type.value == "maximize"
