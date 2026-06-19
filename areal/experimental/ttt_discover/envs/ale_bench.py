@@ -182,6 +182,7 @@ Rules:
             )
         except Exception as e:
             logger.warning(f"[AleBenchEnv] case_eval failed: {e}", exc_info=True)
+            self._log_failed_code(code, fail_type="execution_error", error_msg=str(e))
             return self.get_failure_result(
                 state=state,
                 fail_type="execution_error",
@@ -235,6 +236,15 @@ Rules:
 
         observation = "\n".join(lines)
 
+        if num_accepted < num_cases:
+            self._log_failed_code(
+                code,
+                fail_type="case_failed",
+                error_msg=observation,
+                num_accepted=num_accepted,
+                num_cases=num_cases,
+            )
+
         return EnvResult(
             reward=float(reward),
             observation=observation,
@@ -249,6 +259,31 @@ Rules:
                 "overall_judge_result": getattr(result, "overall_judge_result", None),
             },
         )
+
+    def _log_failed_code(
+        self,
+        code: str,
+        fail_type: str,
+        error_msg: str,
+        num_accepted: int | None = None,
+        num_cases: int | None = None,
+    ) -> None:
+        """Log a failed rollout's code and diagnostic info for debugging."""
+        header = f"[AleBenchEnv][FAILED ROLLOUT][{self.problem_id}] type={fail_type}"
+        if num_accepted is not None and num_cases is not None:
+            header += f" passed={num_accepted}/{num_cases}"
+        logger.warning(header)
+
+        # Print the extracted code (truncated if extremely long).
+        code_lines = code.splitlines()
+        preview_lines = code_lines[:80]
+        preview = "\n".join(preview_lines)
+        if len(code_lines) > 80:
+            preview += "\n...(truncated)..."
+        logger.warning(f"Extracted code:\n```cpp\n{preview}\n```")
+
+        # Print the diagnostic message.
+        logger.warning(f"Diagnostic:\n{error_msg}")
 
     def create_state(
         self,
