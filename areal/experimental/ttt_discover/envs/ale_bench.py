@@ -162,8 +162,8 @@ Below is the full problem statement. Read it carefully and write a complete C++2
 
 Rules:
 - You must use C++20 (GNU++17/C++20 compatible) to solve the problem.
+- You may reason step by step before writing the final code.
 - Define all of your code in one final ```cpp ... ``` block.
-- In your final response, you should only output the code of your program. Do not include any other text, explanations, or markdown outside the code block.
 - Your program must read from stdin and write to stdout exactly as described in the statement.
 - Make efficient use of the allowed time limit. Think outside the box and try diverse approaches.
 """
