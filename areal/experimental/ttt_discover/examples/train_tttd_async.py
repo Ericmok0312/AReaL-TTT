@@ -1172,7 +1172,9 @@ class TTTDPPOTrainer(PPOTrainer):
             }
 
             if config.actor.should_compute_prox_logp():
-                rollout_batch["prox_logp"] = self.actor.compute_logp(rollout_batch)
+                prox_logp_list = self.actor.compute_logp([rollout_batch])
+                if prox_logp_list is not None and len(prox_logp_list) > 0:
+                    rollout_batch["prox_logp"] = prox_logp_list[0]
                 logger.info(
                     f"[Rank {self.actor.dp_rank}][Step {global_step}] compute_logp done, prox_logp shape: {rollout_batch['prox_logp'].shape}, dtype: {rollout_batch['prox_logp'].dtype}"
                 )
@@ -1182,7 +1184,9 @@ class TTTDPPOTrainer(PPOTrainer):
                 )
 
             if self.ref is not None:
-                rollout_batch["ref_logp"] = self.ref.compute_logp(rollout_batch)
+                ref_logp_list = self.ref.compute_logp([rollout_batch])
+                if ref_logp_list is not None and len(ref_logp_list) > 0:
+                    rollout_batch["ref_logp"] = ref_logp_list[0]
 
             # Use rollout_batch directly (compute_advantages modifies in-place)
             # This matches train_tttd_vllm_v2.py behavior
@@ -1212,8 +1216,8 @@ class TTTDPPOTrainer(PPOTrainer):
                     }
                 )
 
-            # PPO update
-            self.actor.ppo_update(rollout_batch)
+            # PPO update (AReaL upstream expects list[dict])
+            self.actor.ppo_update([rollout_batch])
             self.actor.step_lr_scheduler()
 
             # Add training stats
