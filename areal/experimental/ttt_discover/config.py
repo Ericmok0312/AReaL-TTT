@@ -71,7 +71,21 @@ class SamplerConfig:
     # Environment type for initial state creation
     env_type: str = field(
         default="cp",
-        metadata={"help": "Environment type: 'cp', 'ac1', 'ac2', 'mla_decode_nvidia', 'trimul', 'erdos', 'denoising', 'ahc039', 'ahc058'"},
+        metadata={"help": "Environment type: 'cp', 'ac1', 'ac2', 'mla_decode_nvidia', 'trimul', 'erdos', 'denoising', 'ahc039', 'ahc058', 'ale_bench'"},
+    )
+
+    # ALE-Bench specific parameters
+    problem_id: str = field(
+        default="",
+        metadata={"help": "ALE-Bench problem ID (e.g. 'ahc039'). Required when env_type='ale_bench'."},
+    )
+    ale_bench_lite_version: bool = field(
+        default=True,
+        metadata={"help": "Use ALE-Bench lite seeds (fewer public/private cases)."},
+    )
+    reward_scale: float | None = field(
+        default=None,
+        metadata={"help": "Per-problem reward normalization divisor. If None, auto-computed from standings."},
     )
 
     # Environment-specific parameters
@@ -435,7 +449,7 @@ def create_env_from_config(config):
         Environment instance
     """
     # Import here to avoid circular imports
-    from .envs import CirclePackingEnv, DenoisingEnv, ErdosEnv, InequalitiesEnv
+    from .envs import AleBenchEnv, CirclePackingEnv, DenoisingEnv, ErdosEnv, InequalitiesEnv
 
     env_type = getattr(config.sampler, 'env_type', 'ac1')
     eval_timeout = getattr(config.sampler, 'eval_timeout', 600)
@@ -469,6 +483,18 @@ def create_env_from_config(config):
             eval_timeout=eval_timeout,
             log_dir=config.saver.fileroot,
             num_cpus=getattr(config.sampler, 'num_cpus', 2),
+        )
+    elif env_type == 'ale_bench':
+        problem_id = getattr(config.sampler, 'problem_id', '')
+        if not problem_id:
+            raise ValueError("sampler.problem_id must be set when env_type='ale_bench'")
+        return AleBenchEnv(
+            problem_id=problem_id,
+            lite_version=getattr(config.sampler, 'ale_bench_lite_version', True),
+            eval_timeout=eval_timeout,
+            log_dir=config.saver.fileroot,
+            num_cpus=getattr(config.sampler, 'num_cpus', 2),
+            reward_scale=getattr(config.sampler, 'reward_scale', None),
         )
     else:
         raise ValueError(f"Unknown env_type: {env_type}")

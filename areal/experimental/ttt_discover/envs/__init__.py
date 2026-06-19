@@ -46,6 +46,11 @@ from areal.experimental.ttt_discover.envs.denoising import (
     create_initial_state_denoising,
 )
 
+from areal.experimental.ttt_discover.envs.ale_bench import (
+    AleBenchEnv,
+    create_initial_state_ale_bench,
+)
+
 # GpuModeEnv is optional and requires additional dependencies
 try:
     from areal.experimental.ttt_discover.envs.gpu_mode import (
@@ -73,6 +78,9 @@ __all__ = [
     # Denoising
     "DenoisingEnv",
     "create_initial_state_denoising",
+    # ALE-Bench
+    "AleBenchEnv",
+    "create_initial_state_ale_bench",
     # GPU Mode (optional)
     "GpuModeEnv",
     "create_initial_state_gpu_mode",

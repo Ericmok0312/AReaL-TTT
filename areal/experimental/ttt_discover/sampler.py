@@ -174,7 +174,7 @@ def _sampler_file_for_step(base_path: str, step: int) -> str:
     return f"{base_name}_step_{step:06d}.json"
 
 
-def create_initial_state(env_type: str, initial_exp_type: str, budget_s: int = 1000) -> State:
+def create_initial_state(env_type: str, initial_exp_type: str, budget_s: int = 1000, problem_id: str = "") -> State:
     """
     Create an initial state for a given env type.
     
@@ -224,6 +224,11 @@ def mla_decode_kernel(...):
         import inspect
         _MAGIC_FUNC = inspect.getsource(magic_denoise)
         return DenoisingState(timestep=-1, code=_MAGIC_FUNC, value=-0.2316, mse=0.2316, poisson=0.0370)
+    elif env_type == "ale_bench":
+        from areal.experimental.ttt_discover.envs.ale_bench import create_initial_state_ale_bench
+        if not problem_id:
+            raise ValueError("problem_id must be provided when env_type='ale_bench'")
+        return create_initial_state_ale_bench(problem_id=problem_id)
     else:
         raise ValueError(f"Unknown env_type: {env_type}")
 
@@ -234,9 +239,10 @@ class GreedySampler(StateSampler):
     def __init__(self, file_path: str, env_type: str = "ac1", budget_s: int = 1000, 
                  initial_exp_type: str = "random", batch_size: int = 1, 
                  resume_step: int | None = None, topk_children: int = 1,
-                 epsilon: float = 0.125):
+                 epsilon: float = 0.125, problem_id: str = ""):
         self.file_path = file_path
         self.env_type = env_type
+        self.problem_id = problem_id
         self.budget_s = budget_s
         self.initial_exp_type = initial_exp_type
         self.batch_size = batch_size
@@ -279,7 +285,7 @@ class GreedySampler(StateSampler):
             self._last_sampled_step = current_sample_step
         
         if not self._top_states:
-            return [create_initial_state(self.env_type, self.initial_exp_type, self.budget_s) 
+            return [create_initial_state(self.env_type, self.initial_exp_type, self.budget_s, self.problem_id) 
                     for _ in range(num_states)]
         # Epsilon-greedy: with prob epsilon, sample random; otherwise sample best
         result = []
@@ -367,7 +373,7 @@ class FixedSampler(StateSampler):
         self.env_type = env_type
         self.budget_s = budget_s
         self.initial_exp_type = initial_exp_type
-        self._fixed_state = create_initial_state(env_type, initial_exp_type, budget_s)
+        self._fixed_state = create_initial_state(env_type, initial_exp_type, budget_s, kwargs.get('problem_id', ''))
 
     def sample_states(self, num_states: int) -> list[State]:
         return [self._fixed_state] * num_states
@@ -412,10 +418,12 @@ class PUCTSampler(StateSampler):
         topk_children: int = 2,
         group_size: int = 64,
         max_version_history: int = 5,
+        problem_id: str = "",
         **kwargs,
     ):
         self.file_path = file_path
         self.env_type = env_type
+        self.problem_id = problem_id
         self.budget_s = budget_s
         self.initial_exp_type = initial_exp_type
         self.max_buffer_size = max_buffer_size
@@ -459,7 +467,7 @@ class PUCTSampler(StateSampler):
             self._load(resume_step)
         if not self._states:
             for _ in range(batch_size):
-                state = create_initial_state(self.env_type, self.initial_exp_type, self.budget_s)
+                state = create_initial_state(self.env_type, self.initial_exp_type, self.budget_s, self.problem_id)
                 self._initial_states.append(state)
                 self._states.append(state)
             self._save(self._current_step)
@@ -481,11 +489,25 @@ class PUCTSampler(StateSampler):
         self._m = store.get("puct_m", {}) or {}
         self._T = int(store.get("puct_T", 0) or 0)
         
-        # Restore version snapshots (meta only, states will be rebuilt from current _states)
+        # Restore version snapshots. Prefer full snapshots if available; otherwise fall
+        # back to metadata-only snapshots (reconstructed from current _states).
         self._version_snapshots = {}
-        for v_str, snap_meta in store.get("version_snapshots_meta", {}).items():
+        full_snapshots = store.get("version_snapshots_full", {})
+        meta_snapshots = store.get("version_snapshots_meta", {})
+        for v_str, snap in full_snapshots.items():
             v = int(v_str)
-            # For resumed snapshots, we use current states but with old statistics
+            self._version_snapshots[v] = {
+                '_n': snap['_n'],
+                '_m': snap['_m'],
+                '_T': snap['_T'],
+                '_states': [state_from_dict(s) for s in snap.get('_states', [])],
+                'timestamp': snap.get('timestamp', 0),
+            }
+        for v_str, snap_meta in meta_snapshots.items():
+            v = int(v_str)
+            if v in self._version_snapshots:
+                continue
+            # For resumed metadata-only snapshots, we use current states but with old statistics
             # This is an approximation - the states list may have changed
             self._version_snapshots[v] = {
                 '_n': snap_meta['_n'],
@@ -506,6 +528,7 @@ class PUCTSampler(StateSampler):
                    f"version_mappings={len(self._version_mapping)}")
 
     def _save(self, step: int):
+        """Lightweight checkpoint: states and PUCT stats, metadata-only snapshots."""
         save_path = _sampler_file_for_step(self.file_path, step)
         store = {
             "step": step,
@@ -514,6 +537,8 @@ class PUCTSampler(StateSampler):
             "puct_n": self._n,
             "puct_m": self._m,
             "puct_T": self._T,
+            "problem_id": getattr(self, 'problem_id', ''),
+            "env_type": getattr(self, 'env_type', ''),
             # Save version snapshots (lightweight: only statistics, not full states)
             "version_snapshots_meta": {
                 str(v): {
@@ -530,6 +555,58 @@ class PUCTSampler(StateSampler):
         }
         with _file_lock(f"{save_path}.lock"):
             _atomic_write_json(save_path, store)
+
+    def save_full(self, step: int | None = None, output_path: str | None = None):
+        """Save a complete PUCT sampler checkpoint including full version snapshots.
+
+        This is intended for final checkpoints where the exact historical PUCT state
+        must be preserved (e.g. for evaluation or continued training). Unlike
+        `_save`, this serializes the full deep-copied state lists inside version
+        snapshots, so the checkpoint can be resumed without approximation.
+
+        Args:
+            step: Training step to record in the checkpoint. If None, uses
+                ``self._current_step``.
+            output_path: File path to write. If None, uses ``self.file_path`` with
+                the given step.
+        """
+        if step is None:
+            step = self._current_step
+        if output_path is None:
+            output_path = _sampler_file_for_step(self.file_path, step)
+
+        store = {
+            "step": step,
+            "states": [s.to_dict() for s in self._states],
+            "initial_states": [s.to_dict() for s in self._initial_states],
+            "puct_n": self._n,
+            "puct_m": self._m,
+            "puct_T": self._T,
+            "problem_id": getattr(self, 'problem_id', ''),
+            "env_type": getattr(self, 'env_type', ''),
+            "version_snapshots_full": {
+                str(v): {
+                    '_n': snap['_n'],
+                    '_m': snap['_m'],
+                    '_T': snap['_T'],
+                    '_states': [s.to_dict() for s in snap['_states']],
+                    'timestamp': snap.get('timestamp', 0),
+                }
+                for v, snap in self._version_snapshots.items()
+            },
+            "version_mapping": {str(k): v for k, v in self._version_mapping.items()},
+        }
+        with _file_lock(f"{output_path}.lock"):
+            _atomic_write_json(output_path, store)
+
+        import logging
+        logger = logging.getLogger("PUCTSampler")
+        logger.info(
+            f"[FULL SAVE] Saved complete PUCT checkpoint to {output_path} "
+            f"(step={step}, states={len(self._states)}, "
+            f"snapshots={len(self._version_snapshots)})"
+        )
+        return output_path
 
     def _refresh_random_construction(self, state: State) -> None:
         """Regenerate construction for initial states when initial_exp_type='random'."""
@@ -609,7 +686,7 @@ class PUCTSampler(StateSampler):
         candidates = list(self._states)
 
         if not candidates:
-            picked = [create_initial_state(self.env_type, self.initial_exp_type, self.budget_s)
+            picked = [create_initial_state(self.env_type, self.initial_exp_type, self.budget_s, self.problem_id)
                       for _ in range(num_states)]
             self._last_sampled_states = picked
             self._last_sampled_indices = []
@@ -670,7 +747,7 @@ class PUCTSampler(StateSampler):
             
             if not parent_pool:
                 # Fallback: create fresh initial states if no parents exist
-                picked = [create_initial_state(self.env_type, self.initial_exp_type, self.budget_s)
+                picked = [create_initial_state(self.env_type, self.initial_exp_type, self.budget_s, self.problem_id)
                           for _ in range(num_states)]
                 self._last_sampled_states = picked
                 self._last_sampled_indices = []
@@ -854,7 +931,7 @@ class PUCTSampler(StateSampler):
                    f"states={len(states)}")
         
         if not states:
-            return [create_initial_state(self.env_type, self.initial_exp_type, self.budget_s)
+            return [create_initial_state(self.env_type, self.initial_exp_type, self.budget_s, self.problem_id)
                     for _ in range(num_states)]
         
         # Reconstruct sampling logic using snapshot's statistics
@@ -1059,7 +1136,7 @@ class PUCTSampler(StateSampler):
             self._load(step)
             if not self._states:
                 for _ in range(self.batch_size):
-                    state = create_initial_state(self.env_type, self.initial_exp_type, self.budget_s)
+                    state = create_initial_state(self.env_type, self.initial_exp_type, self.budget_s, self.problem_id)
                     self._initial_states.append(state)
                     self._states.append(state)
 
@@ -1333,6 +1410,7 @@ def create_sampler(
     if initial_exp_type not in INITIAL_EXP_TYPES:
         raise ValueError(f"Unknown initial_exp_type: {initial_exp_type}. Supported: {INITIAL_EXP_TYPES}")
     
+    problem_id = kwargs.get('problem_id', '')
     if sampler_type == "greedy":
         if not log_path:
             raise ValueError(f"log_path is required when using sampler_type={sampler_type}")
@@ -1340,6 +1418,7 @@ def create_sampler(
         return GreedySampler(sampler_path, env_type=env_type, budget_s=budget_s, 
                              initial_exp_type=initial_exp_type, batch_size=batch_size, 
                              resume_step=resume_step, epsilon=epsilon,
+                             problem_id=problem_id,
                              )
     elif sampler_type == "fixed":
         return FixedSampler(env_type=env_type, budget_s=budget_s, initial_exp_type=initial_exp_type)
@@ -1449,6 +1528,8 @@ def create_sampler_from_config(
     if max_version_history is None:
         max_version_history = getattr(config, 'max_version_history', 5)
     
+    problem_id = getattr(config, 'problem_id', '')
+
     return create_sampler(
         sampler_type=sampler_type,
         log_path=log_path,
@@ -1466,6 +1547,7 @@ def create_sampler_from_config(
         temperature=temperature,
         max_version_history=max_version_history,
         sampling_strategy=sampling_strategy,
+        problem_id=problem_id,
     )
 
 
