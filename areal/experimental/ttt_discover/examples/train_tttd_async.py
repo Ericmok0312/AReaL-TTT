@@ -160,11 +160,21 @@ class TTTDPPOTrainer(PPOTrainer):
         self.valid_dataloader = None
         self.valid_dataset = None
 
-        # Initialize inference engines
-        self.rollout = self._init_rollout(config.rollout, is_eval=False)
-
-        # Initialize models
+        # Initialize models first so that actor LoRA weights are ready.
+        # AReaL's native RLTrainer then saves the initial LoRA weights and
+        # passes them to _init_rollout, which registers the adapter as
+        # <lora_name>-v0 in vLLM/SGLang (matching the versioned names used by
+        # WeightUpdateMeta later).
         self._initialize_engines()
+
+        initial_lora_path = None
+        if config.actor.use_lora:
+            initial_lora_path = self._save_initial_lora_weights()
+
+        # Initialize inference engines
+        self.rollout = self._init_rollout(
+            config.rollout, is_eval=False, lora_path=initial_lora_path
+        )
 
         # Connect sampler to actor for distributed synchronization
         # Must be after _initialize_engines() because it uses self.cpu_group

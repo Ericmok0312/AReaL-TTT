@@ -1,46 +1,52 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Centralized sampler creation for all environments."""
+
 from __future__ import annotations
-from abc import ABC, abstractmethod
+
 import copy
+import fcntl
+import json as _json
 import os
+import random
 import threading
 import time
+from abc import ABC, abstractmethod
 
 import numpy as np
-import random
 
 from areal.experimental.ttt_discover.state import (
-    InequalitiesState,
-    CirclePackingState,
-    GpuModeState,
     AleBenchState,
-    ErdosState,
     DenoisingState,
+    ErdosState,
+    GpuModeState,
+    InequalitiesState,
     State,
     state_from_dict,
 )
 
-import fcntl
-import json as _json
-
 
 def _file_lock(path: str):
     """Context manager for advisory file lock."""
+
     class _LockCtx:
         def __enter__(self):
             self.fd = open(path, "w")
             fcntl.flock(self.fd, fcntl.LOCK_EX)
             return self.fd
+
         def __exit__(self, *args):
             fcntl.flock(self.fd, fcntl.LOCK_UN)
             self.fd.close()
+
     return _LockCtx()
 
 
 def _atomic_write_json(path: str, data: dict):
     """Atomically write JSON data to file."""
-    import tempfile
     import os
+    import tempfile
+
     dir_name = os.path.dirname(path) or "."
     fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".json.tmp")
     try:
@@ -60,13 +66,18 @@ def _read_json_or_default(path: str, default=None):
     if not os.path.exists(path):
         return default
     try:
-        with open(path, "r") as f:
+        with open(path) as f:
             return _json.load(f)
     except Exception:
         return default
 
 
-SAMPLER_TYPES = {"greedy", "fixed", "puct", "puct_backprop"}  # puct_backprop is alias for puct
+SAMPLER_TYPES = {
+    "greedy",
+    "fixed",
+    "puct",
+    "puct_backprop",
+}  # puct_backprop is alias for puct
 INITIAL_EXP_TYPES = {"best_available", "none", "random", "random_no_code"}
 
 # Construction length limits for AC environments
@@ -86,7 +97,13 @@ class StateSampler(ABC):
         pass
 
     @abstractmethod
-    def update_states(self, states: list[State], parent_states: list[State], save: bool = True, step: int | None = None):
+    def update_states(
+        self,
+        states: list[State],
+        parent_states: list[State],
+        save: bool = True,
+        step: int | None = None,
+    ):
         """Update internal storage with new states. Sets parent info automatically."""
         pass
 
@@ -98,9 +115,9 @@ class StateSampler(ABC):
     @abstractmethod
     def get_best_solution(self) -> dict | None:
         """Return the best state (highest value) in the sampler as a dictionary.
-        
+
         Returns:
-            Dictionary containing the best state's information (code, value, 
+            Dictionary containing the best state's information (code, value,
             observation, construction, etc.), or None if no states available.
         """
         pass
@@ -108,44 +125,50 @@ class StateSampler(ABC):
     @staticmethod
     def _state_to_dict(state: State) -> dict | None:
         """Convert a State object to a dictionary for serialization.
-        
+
         Args:
             state: The State object to convert.
-            
+
         Returns:
             Dictionary containing state's attributes, or None if state is None.
         """
         if state is None:
             return None
-        
+
         result = {
-            "id": getattr(state, 'id', None),
-            "timestep": getattr(state, 'timestep', None),
-            "value": getattr(state, 'value', None),
-            "code": getattr(state, 'code', None),
-            "observation": getattr(state, 'observation', None),
+            "id": getattr(state, "id", None),
+            "timestep": getattr(state, "timestep", None),
+            "value": getattr(state, "value", None),
+            "code": getattr(state, "code", None),
+            "observation": getattr(state, "observation", None),
         }
-        
+
         # Include construction if available (CirclePackingState, InequalitiesState, etc.)
-        if hasattr(state, 'construction'):
+        if hasattr(state, "construction"):
             result["construction"] = state.construction
-        
+
         # Include parents info for tracking lineage
-        if hasattr(state, 'parents'):
+        if hasattr(state, "parents"):
             result["parents"] = state.parents
-        if hasattr(state, 'parent_values'):
+        if hasattr(state, "parent_values"):
             result["parent_values"] = state.parent_values
-            
+
         return result
-    
+
     @staticmethod
     def _set_parent_info(child: State, parent: State):
         """Set parent_values and parents on child state from parent."""
-        child.parent_values = [parent.value] + parent.parent_values if parent.value is not None else []
-        child.parents = [{"id": parent.id, "timestep": parent.timestep}] + parent.parents
+        child.parent_values = (
+            [parent.value] + parent.parent_values if parent.value is not None else []
+        )
+        child.parents = [
+            {"id": parent.id, "timestep": parent.timestep}
+        ] + parent.parents
 
     @staticmethod
-    def _filter_topk_per_parent(states: list[State], parent_states: list[State], k: int) -> tuple[list[State], list[State]]:
+    def _filter_topk_per_parent(
+        states: list[State], parent_states: list[State], k: int
+    ) -> tuple[list[State], list[State]]:
         """Keep top-k children (by value) per parent. If k=0, return all."""
         if not states:
             return [], []
@@ -161,7 +184,11 @@ class StateSampler(ABC):
         # Keep top-k children per parent (highest value)
         topk_children, topk_parents = [], []
         for children_and_parents in parent_to_children.values():
-            sorted_pairs = sorted(children_and_parents, key=lambda x: x[0].value if x[0].value is not None else float('-inf'), reverse=True)
+            sorted_pairs = sorted(
+                children_and_parents,
+                key=lambda x: x[0].value if x[0].value is not None else float("-inf"),
+                reverse=True,
+            )
             for child, parent in sorted_pairs[:k]:
                 topk_children.append(child)
                 topk_parents.append(parent)
@@ -174,58 +201,85 @@ def _sampler_file_for_step(base_path: str, step: int) -> str:
     return f"{base_name}_step_{step:06d}.json"
 
 
-def create_initial_state(env_type: str, initial_exp_type: str, budget_s: int = 1000, problem_id: str = "") -> State:
+def create_initial_state(
+    env_type: str, initial_exp_type: str, budget_s: int = 1000, problem_id: str = ""
+) -> State:
     """
     Create an initial state for a given env type.
-    
+
     This function delegates to environment-specific create_initial_state_* functions
     defined in each env module for better modularity.
     """
     if env_type == "ac1":
-        from areal.experimental.ttt_discover.envs.inequalities import create_initial_state_ac1
-        return create_initial_state_ac1(initial_exp_type=initial_exp_type, budget_s=budget_s)
+        from areal.experimental.ttt_discover.envs.inequalities import (
+            create_initial_state_ac1,
+        )
+
+        return create_initial_state_ac1(
+            initial_exp_type=initial_exp_type, budget_s=budget_s
+        )
     elif env_type == "ac2":
         # AC2: maximize lower bound (value = bound directly)
-        from areal.experimental.ttt_discover.envs.inequalities import create_initial_state_ac2
-        return create_initial_state_ac2(initial_exp_type=initial_exp_type, budget_s=budget_s)
+        from areal.experimental.ttt_discover.envs.inequalities import (
+            create_initial_state_ac2,
+        )
+
+        return create_initial_state_ac2(
+            initial_exp_type=initial_exp_type, budget_s=budget_s
+        )
     elif env_type == "cp":
-        from areal.experimental.ttt_discover.envs.circle_packing import create_initial_state_cp
+        from areal.experimental.ttt_discover.envs.circle_packing import (
+            create_initial_state_cp,
+        )
+
         # Determine n_item from config or use default
         return create_initial_state_cp(n=26, initial_exp_type=initial_exp_type)
     elif env_type == "erdos":
-        from areal.experimental.ttt_discover.envs.erdos import create_initial_state_erdos
+        from areal.experimental.ttt_discover.envs.erdos import (
+            create_initial_state_erdos,
+        )
+
         return create_initial_state_erdos(budget_s=budget_s)
     elif env_type == "mla_decode_nvidia":
         # Embedded initial program for MLA decode (from original tasks/gpu_mode)
-        _MLA_DECODE_INITIAL_CODE = '''import torch
+        _MLA_DECODE_INITIAL_CODE = """import torch
 import triton
 import triton.language as tl
 
 @triton.jit
 def mla_decode_kernel(...):
     pass
-'''
+"""
         return GpuModeState(timestep=-1, code=_MLA_DECODE_INITIAL_CODE, value=-1000.0)
     elif env_type == "trimul":
         return GpuModeState(timestep=-1, code="", value=-1_000_000)
     elif env_type == "ahc039":
         if initial_exp_type == "best_available":
             # Embedded best available code for AHC039
-            _AHC039_BEST_CODE = '''#include <bits/stdc++.h>\nusing namespace std;\nint main(){return 0;}\n'''
+            _AHC039_BEST_CODE = """#include <bits/stdc++.h>\nusing namespace std;\nint main(){return 0;}\n"""
             _AHC039_BEST_CODE_VALUE = 3755.4
-            return AleBenchState(timestep=-1, code=_AHC039_BEST_CODE, value=_AHC039_BEST_CODE_VALUE)
+            return AleBenchState(
+                timestep=-1, code=_AHC039_BEST_CODE, value=_AHC039_BEST_CODE_VALUE
+            )
         return AleBenchState(timestep=-1, code="", value=0.0)
     elif env_type == "ahc058":
         if initial_exp_type == "best_available":
             raise ValueError("AHC058 has no best code available.")
         return AleBenchState(timestep=-1, code="", value=0.0)
     elif env_type == "denoising":
-        from areal.experimental.ttt_discover.envs.denoising import magic_denoise
         import inspect
+
+        from areal.experimental.ttt_discover.envs.denoising import magic_denoise
+
         _MAGIC_FUNC = inspect.getsource(magic_denoise)
-        return DenoisingState(timestep=-1, code=_MAGIC_FUNC, value=-0.2316, mse=0.2316, poisson=0.0370)
+        return DenoisingState(
+            timestep=-1, code=_MAGIC_FUNC, value=-0.2316, mse=0.2316, poisson=0.0370
+        )
     elif env_type == "ale_bench":
-        from areal.experimental.ttt_discover.envs.ale_bench import create_initial_state_ale_bench
+        from areal.experimental.ttt_discover.envs.ale_bench import (
+            create_initial_state_ale_bench,
+        )
+
         if not problem_id:
             raise ValueError("problem_id must be provided when env_type='ale_bench'")
         return create_initial_state_ale_bench(problem_id=problem_id)
@@ -235,11 +289,19 @@ def mla_decode_kernel(...):
 
 class GreedySampler(StateSampler):
     """Epsilon-greedy sampler that keeps top-k best states by value."""
-    
-    def __init__(self, file_path: str, env_type: str = "ac1", budget_s: int = 1000, 
-                 initial_exp_type: str = "random", batch_size: int = 1, 
-                 resume_step: int | None = None, topk_children: int = 1,
-                 epsilon: float = 0.125, problem_id: str = ""):
+
+    def __init__(
+        self,
+        file_path: str,
+        env_type: str = "ac1",
+        budget_s: int = 1000,
+        initial_exp_type: str = "random",
+        batch_size: int = 1,
+        resume_step: int | None = None,
+        topk_children: int = 1,
+        epsilon: float = 0.125,
+        problem_id: str = "",
+    ):
         self.file_path = file_path
         self.env_type = env_type
         self.problem_id = problem_id
@@ -261,7 +323,9 @@ class GreedySampler(StateSampler):
     def _load(self, step: int):
         file_path = _sampler_file_for_step(self.file_path, step)
         if not os.path.exists(file_path):
-            raise FileNotFoundError(f"Cannot resume from step {step}: sampler file not found: {file_path}")
+            raise FileNotFoundError(
+                f"Cannot resume from step {step}: sampler file not found: {file_path}"
+            )
         with _file_lock(f"{file_path}.lock"):
             store = _read_json_or_default(file_path, default=None)
         if store is None:
@@ -283,36 +347,56 @@ class GreedySampler(StateSampler):
             current_sample_step = self._sample_counter
             self._sample_counter += 1
             self._last_sampled_step = current_sample_step
-        
+
         if not self._top_states:
-            return [create_initial_state(self.env_type, self.initial_exp_type, self.budget_s, self.problem_id) 
-                    for _ in range(num_states)]
+            return [
+                create_initial_state(
+                    self.env_type, self.initial_exp_type, self.budget_s, self.problem_id
+                )
+                for _ in range(num_states)
+            ]
         # Epsilon-greedy: with prob epsilon, sample random; otherwise sample best
         result = []
         for i in range(num_states):
-            if self.epsilon > 0 and np.random.random() < self.epsilon and len(self._top_states) > 1:
+            if (
+                self.epsilon > 0
+                and np.random.random() < self.epsilon
+                and len(self._top_states) > 1
+            ):
                 result.append(np.random.choice(self._top_states))
             else:
                 result.append(self._top_states[i % len(self._top_states)])
         return result
 
     def _get_construction_key(self, state: State) -> tuple | str | None:
-        if hasattr(state, 'construction') and state.construction:
+        if hasattr(state, "construction") and state.construction:
             return tuple(state.construction)
-        if hasattr(state, 'code') and state.code:
+        if hasattr(state, "code") and state.code:
             return state.code
         return None
 
-    def update_states(self, states: list[State], parent_states: list[State], save: bool = True, step: int | None = None):
+    def update_states(
+        self,
+        states: list[State],
+        parent_states: list[State],
+        save: bool = True,
+        step: int | None = None,
+    ):
         if not states:
             return
-        states, parent_states = self._filter_topk_per_parent(states, parent_states, self.topk_children)
+        states, parent_states = self._filter_topk_per_parent(
+            states, parent_states, self.topk_children
+        )
         existing = {self._get_construction_key(s) for s in self._top_states}
         existing.discard(None)
         new_states = []
         for child, parent in zip(states, parent_states):
             if isinstance(child, InequalitiesState) and child.construction:
-                if not (MIN_CONSTRUCTION_LEN <= len(child.construction) <= MAX_CONSTRUCTION_LEN):
+                if not (
+                    MIN_CONSTRUCTION_LEN
+                    <= len(child.construction)
+                    <= MAX_CONSTRUCTION_LEN
+                ):
                     continue
             if isinstance(child, ErdosState) and child.construction:
                 if len(child.construction) > MAX_ERDOS_CONSTRUCTION_LEN:
@@ -333,7 +417,7 @@ class GreedySampler(StateSampler):
 
     def _finalize_and_save(self, step: int | None = None):
         self._top_states.sort(key=lambda s: s.value if s.value else 0, reverse=True)
-        self._top_states = self._top_states[:self.batch_size]
+        self._top_states = self._top_states[: self.batch_size]
         if step is not None:
             self._current_step = step
         self._save(self._current_step)
@@ -353,9 +437,9 @@ class GreedySampler(StateSampler):
 
     def get_best_solution(self) -> dict | None:
         """Return the best state (highest value) as a dictionary.
-        
+
         GreedySampler keeps states sorted by value, so the first state is the best.
-        
+
         Returns:
             Dictionary containing the best state's information, or None if no states.
         """
@@ -368,17 +452,31 @@ class GreedySampler(StateSampler):
 
 class FixedSampler(StateSampler):
     """Fixed distribution sampler - always returns same state, never updates."""
-    
-    def __init__(self, env_type: str = "cp", budget_s: int = 1000, initial_exp_type: str = "none"):
+
+    def __init__(
+        self,
+        env_type: str = "cp",
+        budget_s: int = 1000,
+        initial_exp_type: str = "none",
+        problem_id: str = "",
+    ):
         self.env_type = env_type
         self.budget_s = budget_s
         self.initial_exp_type = initial_exp_type
-        self._fixed_state = create_initial_state(env_type, initial_exp_type, budget_s, kwargs.get('problem_id', ''))
+        self._fixed_state = create_initial_state(
+            env_type, initial_exp_type, budget_s, problem_id
+        )
 
     def sample_states(self, num_states: int) -> list[State]:
         return [self._fixed_state] * num_states
 
-    def update_states(self, states: list[State], parent_states: list[State], save: bool = True, step: int | None = None):
+    def update_states(
+        self,
+        states: list[State],
+        parent_states: list[State],
+        save: bool = True,
+        step: int | None = None,
+    ):
         pass
 
     def flush(self, step: int | None = None):
@@ -397,7 +495,7 @@ class PUCTSampler(StateSampler):
     PUCT-style sampler with state archive.
 
     score(i) = Q(i) + c * scale * P(i) * sqrt(1 + T/G) / (1 + n[i]/G)
-    
+
     where:
       Q(i) = m[i] if n[i]>0 else R(i)  (best reachable value or current reward)
       P(i) = rank-based prior
@@ -432,7 +530,7 @@ class PUCTSampler(StateSampler):
         self.puct_c = float(puct_c)
         self.group_size = int(group_size)
         self._max_version_history = max_version_history
-    
+
         self._states: list[State] = []
         self._initial_states: list[State] = []
         self._last_sampled_states: list[State] = []
@@ -443,15 +541,21 @@ class PUCTSampler(StateSampler):
         # This ensures unique sampling steps for staleness tracking
         self._sample_counter = 0
         self._last_sampled_step = 0  # Last sampled step (for dataloader to read)
-        
+
         # PUCT stats
-        self._n: dict[str, int] = {} # Number of times state (or its descendants) has been expanded
-        self._m: dict[str, float] = {} # Maximum reward among states generated when the initial state was s
-        self._T: int = 0 # Total number of expansions across all states
+        self._n: dict[
+            str, int
+        ] = {}  # Number of times state (or its descendants) has been expanded
+        self._m: dict[
+            str, float
+        ] = {}  # Maximum reward among states generated when the initial state was s
+        self._T: int = 0  # Total number of expansions across all states
         self._last_scale: float = 1.0
-        self._last_puct_stats: list[tuple[int, float, float, float, float]] = [] # n, Q, P, bonus, score
-        self.sampling_strategy: str = kwargs.get('sampling_strategy', 'puct')
-        
+        self._last_puct_stats: list[
+            tuple[int, float, float, float, float]
+        ] = []  # n, Q, P, bonus, score
+        self.sampling_strategy: str = kwargs.get("sampling_strategy", "puct")
+
         # Versioned sampling support for lazy PUCT
         # version -> snapshot of PUCT state at that version
         self._version_snapshots: dict[int, dict] = {}
@@ -467,7 +571,9 @@ class PUCTSampler(StateSampler):
             self._load(resume_step)
         if not self._states:
             for _ in range(batch_size):
-                state = create_initial_state(self.env_type, self.initial_exp_type, self.budget_s, self.problem_id)
+                state = create_initial_state(
+                    self.env_type, self.initial_exp_type, self.budget_s, self.problem_id
+                )
                 self._initial_states.append(state)
                 self._states.append(state)
             self._save(self._current_step)
@@ -475,20 +581,25 @@ class PUCTSampler(StateSampler):
     def _load(self, step: int):
         file_path = _sampler_file_for_step(self.file_path, step)
         import logging
+
         logger = logging.getLogger("PUCTSampler")
         logger.info(f"[RESUME] Loading sampler state from {file_path}")
         if not os.path.exists(file_path):
-            raise FileNotFoundError(f"Cannot resume from step {step}: sampler file not found: {file_path}")
+            raise FileNotFoundError(
+                f"Cannot resume from step {step}: sampler file not found: {file_path}"
+            )
         with _file_lock(f"{file_path}.lock"):
             store = _read_json_or_default(file_path, default=None)
         if store is None:
             raise ValueError(f"Failed to load sampler state from {file_path}")
         self._states = [state_from_dict(s) for s in store.get("states", [])]
-        self._initial_states = [state_from_dict(s) for s in store.get("initial_states", [])]
+        self._initial_states = [
+            state_from_dict(s) for s in store.get("initial_states", [])
+        ]
         self._n = store.get("puct_n", {}) or {}
         self._m = store.get("puct_m", {}) or {}
         self._T = int(store.get("puct_T", 0) or 0)
-        
+
         # Restore version snapshots. Prefer full snapshots if available; otherwise fall
         # back to metadata-only snapshots (reconstructed from current _states).
         self._version_snapshots = {}
@@ -497,11 +608,11 @@ class PUCTSampler(StateSampler):
         for v_str, snap in full_snapshots.items():
             v = int(v_str)
             self._version_snapshots[v] = {
-                '_n': snap['_n'],
-                '_m': snap['_m'],
-                '_T': snap['_T'],
-                '_states': [state_from_dict(s) for s in snap.get('_states', [])],
-                'timestamp': snap.get('timestamp', 0),
+                "_n": snap["_n"],
+                "_m": snap["_m"],
+                "_T": snap["_T"],
+                "_states": [state_from_dict(s) for s in snap.get("_states", [])],
+                "timestamp": snap.get("timestamp", 0),
             }
         for v_str, snap_meta in meta_snapshots.items():
             v = int(v_str)
@@ -510,22 +621,24 @@ class PUCTSampler(StateSampler):
             # For resumed metadata-only snapshots, we use current states but with old statistics
             # This is an approximation - the states list may have changed
             self._version_snapshots[v] = {
-                '_n': snap_meta['_n'],
-                '_m': snap_meta['_m'],
-                '_T': snap_meta['_T'],
-                '_states': list(self._states),  # Use current states as approximation
-                'timestamp': snap_meta.get('timestamp', 0),
+                "_n": snap_meta["_n"],
+                "_m": snap_meta["_m"],
+                "_T": snap_meta["_T"],
+                "_states": list(self._states),  # Use current states as approximation
+                "timestamp": snap_meta.get("timestamp", 0),
             }
-        
+
         # Restore version mapping
         self._version_mapping = {}
         for k_str, v in store.get("version_mapping", {}).items():
             self._version_mapping[int(k_str)] = v
-        
-        logger.info(f"[RESUME] Loaded: {len(self._states)} states, T={self._T}, "
-                   f"n_entries={len(self._n)}, m_entries={len(self._m)}, "
-                   f"version_snapshots={len(self._version_snapshots)}, "
-                   f"version_mappings={len(self._version_mapping)}")
+
+        logger.info(
+            f"[RESUME] Loaded: {len(self._states)} states, T={self._T}, "
+            f"n_entries={len(self._n)}, m_entries={len(self._m)}, "
+            f"version_snapshots={len(self._version_snapshots)}, "
+            f"version_mappings={len(self._version_mapping)}"
+        )
 
     def _save(self, step: int):
         """Lightweight checkpoint: states and PUCT stats, metadata-only snapshots."""
@@ -537,16 +650,16 @@ class PUCTSampler(StateSampler):
             "puct_n": self._n,
             "puct_m": self._m,
             "puct_T": self._T,
-            "problem_id": getattr(self, 'problem_id', ''),
-            "env_type": getattr(self, 'env_type', ''),
+            "problem_id": getattr(self, "problem_id", ""),
+            "env_type": getattr(self, "env_type", ""),
             # Save version snapshots (lightweight: only statistics, not full states)
             "version_snapshots_meta": {
                 str(v): {
-                    '_n': snap['_n'],
-                    '_m': snap['_m'],
-                    '_T': snap['_T'],
-                    'num_states': len(snap['_states']),
-                    'timestamp': snap.get('timestamp', 0),
+                    "_n": snap["_n"],
+                    "_m": snap["_m"],
+                    "_T": snap["_T"],
+                    "num_states": len(snap["_states"]),
+                    "timestamp": snap.get("timestamp", 0),
                 }
                 for v, snap in self._version_snapshots.items()
             },
@@ -582,15 +695,15 @@ class PUCTSampler(StateSampler):
             "puct_n": self._n,
             "puct_m": self._m,
             "puct_T": self._T,
-            "problem_id": getattr(self, 'problem_id', ''),
-            "env_type": getattr(self, 'env_type', ''),
+            "problem_id": getattr(self, "problem_id", ""),
+            "env_type": getattr(self, "env_type", ""),
             "version_snapshots_full": {
                 str(v): {
-                    '_n': snap['_n'],
-                    '_m': snap['_m'],
-                    '_T': snap['_T'],
-                    '_states': [s.to_dict() for s in snap['_states']],
-                    'timestamp': snap.get('timestamp', 0),
+                    "_n": snap["_n"],
+                    "_m": snap["_m"],
+                    "_T": snap["_T"],
+                    "_states": [s.to_dict() for s in snap["_states"]],
+                    "timestamp": snap.get("timestamp", 0),
                 }
                 for v, snap in self._version_snapshots.items()
             },
@@ -600,6 +713,7 @@ class PUCTSampler(StateSampler):
             _atomic_write_json(output_path, store)
 
         import logging
+
         logger = logging.getLogger("PUCTSampler")
         logger.info(
             f"[FULL SAVE] Saved complete PUCT checkpoint to {output_path} "
@@ -615,24 +729,38 @@ class PUCTSampler(StateSampler):
         rng = np.random.default_rng()
         state.construction = [rng.random()] * rng.integers(1000, 8000)
         if self.env_type == "ac1":
-            from areal.experimental.ttt_discover.envs.inequalities import evaluate_sequence_ac1
+            from areal.experimental.ttt_discover.envs.inequalities import (
+                evaluate_sequence_ac1,
+            )
+
             state.value = -evaluate_sequence_ac1(state.construction)
         else:
-            from areal.experimental.ttt_discover.envs.inequalities import evaluate_sequence_ac2
+            from areal.experimental.ttt_discover.envs.inequalities import (
+                evaluate_sequence_ac2,
+            )
+
             state.value = evaluate_sequence_ac2(state.construction)
 
     def _get_construction_key(self, state: State) -> tuple | str | None:
-        if hasattr(state, 'construction') and state.construction:
+        if hasattr(state, "construction") and state.construction:
             return tuple(state.construction)
-        if hasattr(state, 'code') and state.code:
+        if hasattr(state, "code") and state.code:
             return state.code
         return None
 
-    def _compute_scale(self, values: np.ndarray, mask: np.ndarray | None = None) -> float:
+    def _compute_scale(
+        self, values: np.ndarray, mask: np.ndarray | None = None
+    ) -> float:
         if values.size == 0:
             return 1.0
         v = values[mask] if mask is not None else values
-        return float(max(np.max(v) - np.min(v), 1e-6)) if v.size > 0 else 1.0
+        if v.size == 0:
+            return 1.0
+        # Ignore NaN/inf to avoid invalid value warnings and NaN propagation.
+        finite = v[np.isfinite(v)]
+        if finite.size == 0:
+            return 1.0
+        return float(max(finite.max() - finite.min(), 1e-6))
 
     def _compute_prior(self, values: np.ndarray, scale: float) -> np.ndarray:
         if values.size == 0:
@@ -644,7 +772,7 @@ class PUCTSampler(StateSampler):
 
     def _get_lineage(self, state: State) -> set[str]:
         lineage = {state.id}
-        for p in (state.parents or []):
+        for p in state.parents or []:
             if p.get("id"):
                 lineage.add(str(p["id"]))
         return lineage
@@ -652,13 +780,15 @@ class PUCTSampler(StateSampler):
     def _build_children_map(self) -> dict[str, set[str]]:
         children: dict[str, set[str]] = {}
         for s in self._states:
-            for p in (s.parents or []):
+            for p in s.parents or []:
                 pid = p.get("id")
                 if pid:
                     children.setdefault(str(pid), set()).add(s.id)
         return children
 
-    def _get_full_lineage(self, state: State, children_map: dict[str, set[str]]) -> set[str]:
+    def _get_full_lineage(
+        self, state: State, children_map: dict[str, set[str]]
+    ) -> set[str]:
         lineage = self._get_lineage(state)
         queue = [state.id]
         visited = {state.id}
@@ -678,24 +808,35 @@ class PUCTSampler(StateSampler):
             current_sample_step = self._sample_counter
             self._sample_counter += 1
             self._last_sampled_step = current_sample_step
-        
+
         if self.sampling_strategy == "parent_pool":
             return self._sample_parent_pool(num_states)
-        
+
         initial_ids = {s.id for s in self._initial_states}
         candidates = list(self._states)
 
         if not candidates:
-            picked = [create_initial_state(self.env_type, self.initial_exp_type, self.budget_s, self.problem_id)
-                      for _ in range(num_states)]
+            picked = [
+                create_initial_state(
+                    self.env_type, self.initial_exp_type, self.budget_s, self.problem_id
+                )
+                for _ in range(num_states)
+            ]
             self._last_sampled_states = picked
             self._last_sampled_indices = []
             self._last_puct_stats = [(0, 0.0, 0.0, 0.0, 0.0) for _ in picked]
             return picked
 
-        vals = np.array([float(s.value if s.value is not None else float("-inf")) for s in candidates])
+        vals = np.array(
+            [
+                float(s.value if s.value is not None else float("-inf"))
+                for s in candidates
+            ]
+        )
         non_initial_mask = np.array([s.id not in initial_ids for s in candidates])
-        scale = self._compute_scale(vals, non_initial_mask if non_initial_mask.any() else None)
+        scale = self._compute_scale(
+            vals, non_initial_mask if non_initial_mask.any() else None
+        )
         self._last_scale = scale
         P = self._compute_prior(vals, scale)
         G = self.group_size
@@ -710,7 +851,9 @@ class PUCTSampler(StateSampler):
             score = Q + bonus
             scores.append((score, vals[i], s, n, Q, P[i], bonus))
 
-        scores.sort(key=lambda x: (x[0], x[1]), reverse=True) # Rank by score,then expected value of starting from this state as tiebreaker
+        scores.sort(
+            key=lambda x: (x[0], x[1]), reverse=True
+        )  # Rank by score,then expected value of starting from this state as tiebreaker
 
         if num_states > 1:
             children_map = self._build_children_map()
@@ -744,98 +887,112 @@ class PUCTSampler(StateSampler):
         with self._lock:
             # Filter states that have been expanded (n > 0)
             parent_pool = [s for s in self._states if self._n.get(s.id, 0) > 0]
-            
+
             if not parent_pool:
                 # Fallback: create fresh initial states if no parents exist
-                picked = [create_initial_state(self.env_type, self.initial_exp_type, self.budget_s, self.problem_id)
-                          for _ in range(num_states)]
+                picked = [
+                    create_initial_state(
+                        self.env_type,
+                        self.initial_exp_type,
+                        self.budget_s,
+                        self.problem_id,
+                    )
+                    for _ in range(num_states)
+                ]
                 self._last_sampled_states = picked
                 self._last_sampled_indices = []
                 self._last_puct_stats = [(0, 0.0, 0.0, 0.0, 0.0) for _ in picked]
                 return picked
-            
+
             # Pure random sampling with replacement
             picked = random.choices(parent_pool, k=num_states)
-            
+
             state_id_to_idx = {s.id: i for i, s in enumerate(self._states)}
             self._last_sampled_states = picked
             self._last_sampled_indices = [state_id_to_idx.get(s.id, -1) for s in picked]
             self._last_puct_stats = [(0, 0.0, 0.0, 0.0, 0.0) for _ in picked]
-            
+
             return picked
 
     def save_version_snapshot(self, version: int):
         """
         Save current PUCT state as a snapshot for the given version.
         Called after sync_sampler to create a versioned checkpoint.
-        
+
         Args:
             version: The training step/version to associate with this snapshot
         """
         with self._snapshot_lock:
             # Deep copy states to ensure snapshot is immutable
             self._version_snapshots[version] = {
-                '_n': self._n.copy(),
-                '_m': self._m.copy(),
-                '_T': self._T,
-                '_states': [copy.deepcopy(s) for s in self._states],
-                'timestamp': time.time(),
+                "_n": self._n.copy(),
+                "_m": self._m.copy(),
+                "_T": self._T,
+                "_states": [copy.deepcopy(s) for s in self._states],
+                "timestamp": time.time(),
             }
             self._cleanup_old_snapshots(version)
-            
+
         import logging
+
         logger = logging.getLogger("PUCTSampler")
-        logger.info(f"[SNAPSHOT] Saved PUCT snapshot version={version} "
-                   f"(T={self._T}, n_entries={len(self._n)}, states={len(self._states)})")
-    
+        logger.info(
+            f"[SNAPSHOT] Saved PUCT snapshot version={version} "
+            f"(T={self._T}, n_entries={len(self._n)}, states={len(self._states)})"
+        )
+
     def _cleanup_old_snapshots(self, current_version: int):
         """Clean up old version snapshots to manage memory."""
         versions = sorted(self._version_snapshots.keys())
         if len(versions) > self._max_version_history:
             # Keep the most recent max_version_history versions
-            to_remove = versions[:-self._max_version_history]
+            to_remove = versions[: -self._max_version_history]
             for v in to_remove:
                 del self._version_snapshots[v]
                 # Also clean up mappings that point to this version
-                targets_to_remove = [t for t, av in self._version_mapping.items() if av == v]
+                targets_to_remove = [
+                    t for t, av in self._version_mapping.items() if av == v
+                ]
                 for t in targets_to_remove:
                     del self._version_mapping[t]
-    
+
     def get_batch_version(self, batch_id: int) -> int | None:
         """Get the fixed version for a batch_id.
-        
+
         Returns:
             The version to use for this batch, or None if not assigned yet.
         """
         with self._snapshot_lock:
             return self._batch_version_mappings.get(batch_id)
-    
+
     def assign_batch_version(self, batch_id: int, version: int):
         """Assign version for a batch_id.
-        
+
         Called when this batch's first rollout starts processing.
         The mapping will be synchronized across all ranks in next sync.
-        
+
         Args:
             batch_id: The batch identifier
             version: The PUCT snapshot version to use
         """
         with self._snapshot_lock:
             self._batch_version_mappings[batch_id] = version
-    
-    def sample_states_for_version(self, num_states: int, target_version: int) -> list[State]:
+
+    def sample_states_for_version(
+        self, num_states: int, target_version: int
+    ) -> list[State]:
         """
         Sample states using the PUCT state at the specified target version.
         If target_version snapshot doesn't exist, falls back to the most recent available version.
-        
+
         The actual version used is recorded in _version_mapping to ensure consistency:
         - First call for a target_version determines the actual_version
         - Subsequent calls for the same target_version reuse the same actual_version
-        
+
         Args:
             num_states: Number of states to sample
             target_version: The desired PUCT version to use for sampling
-            
+
         Returns:
             List of sampled states
         """
@@ -848,12 +1005,15 @@ class PUCTSampler(StateSampler):
                     return self.sample_states(num_states)
                 else:
                     snapshot = self._version_snapshots[actual_version]
-                    return self._sample_from_snapshot(num_states, snapshot, actual_version)
-            
+                    return self._sample_from_snapshot(
+                        num_states, snapshot, actual_version
+                    )
+
             # First time: determine actual_version and record mapping
             import logging
+
             logger = logging.getLogger("PUCTSampler")
-            
+
             if target_version in self._version_snapshots:
                 # Perfect match
                 actual_version = target_version
@@ -865,84 +1025,105 @@ class PUCTSampler(StateSampler):
                     if v < target_version:
                         fallback_version = v
                         break
-                
+
                 if fallback_version is not None:
                     actual_version = fallback_version
-                    logger.warning(f"[VERSION_FALLBACK] target={target_version} -> actual={actual_version}")
+                    logger.warning(
+                        f"[VERSION_FALLBACK] target={target_version} -> actual={actual_version}"
+                    )
                 else:
                     # No snapshots available, use current state
                     actual_version = -1
-                    logger.warning(f"[VERSION_FALLBACK] target={target_version} -> current (no snapshots)")
-            
+                    logger.warning(
+                        f"[VERSION_FALLBACK] target={target_version} -> current (no snapshots)"
+                    )
+
             # Log decoupling verification: current PUCT state vs snapshot state
             current_T = self._T
             current_n_entries = len(self._n)
             current_states = len(self._states)
-            
+
             if actual_version == -1:
-                logger.info(f"[DECOUPLE] target={target_version} using CURRENT "
-                           f"current_T={current_T} current_n={current_n_entries} current_states={current_states}")
+                logger.info(
+                    f"[DECOUPLE] target={target_version} using CURRENT "
+                    f"current_T={current_T} current_n={current_n_entries} current_states={current_states}"
+                )
             else:
                 snapshot = self._version_snapshots[actual_version]
-                snap_T = snapshot['_T']
-                snap_n_entries = len(snapshot['_n'])
-                snap_states = len(snapshot['_states'])
-                logger.info(f"[DECOUPLE] target={target_version} actual={actual_version} "
-                           f"current_T={current_T} snap_T={snap_T} "
-                           f"current_n={current_n_entries} snap_n={snap_n_entries} "
-                           f"current_states={current_states} snap_states={snap_states}")
-            
+                snap_T = snapshot["_T"]
+                snap_n_entries = len(snapshot["_n"])
+                snap_states = len(snapshot["_states"])
+                logger.info(
+                    f"[DECOUPLE] target={target_version} actual={actual_version} "
+                    f"current_T={current_T} snap_T={snap_T} "
+                    f"current_n={current_n_entries} snap_n={snap_n_entries} "
+                    f"current_states={current_states} snap_states={snap_states}"
+                )
+
             # Record the mapping for future consistency
             self._version_mapping[target_version] = actual_version
-            
+
             # Sample from the determined version
             if actual_version == -1:
                 return self.sample_states(num_states)
             else:
                 snapshot = self._version_snapshots[actual_version]
                 return self._sample_from_snapshot(num_states, snapshot, actual_version)
-    
-    def _sample_from_snapshot(self, num_states: int, snapshot: dict, actual_version: int = None) -> list[State]:
+
+    def _sample_from_snapshot(
+        self, num_states: int, snapshot: dict, actual_version: int = None
+    ) -> list[State]:
         """
         Sample states using a saved PUCT snapshot.
         This is deterministic: same snapshot + same num_states = same result.
-        
+
         Args:
             num_states: Number of states to sample
             snapshot: Dictionary containing _n, _m, _T, _states from a specific version
             actual_version: The version of the snapshot (for logging)
-            
+
         Returns:
             List of sampled states
         """
         import logging
+
         logger = logging.getLogger("PUCTSampler")
-        
-        states = snapshot['_states']
-        n = snapshot['_n']
-        m = snapshot['_m']
-        T = snapshot['_T']
-        
+
+        states = snapshot["_states"]
+        n = snapshot["_n"]
+        m = snapshot["_m"]
+        T = snapshot["_T"]
+
         # Log PUCT state at sampling time for staleness decoupling verification
         n_nonzero = sum(1 for v in n.values() if v > 0)
         avg_m = sum(m.values()) / len(m) if m else 0.0
-        logger.info(f"[SNAPSHOT_SAMPLE] version={actual_version} T={T} "
-                   f"n_entries={len(n)} n_nonzero={n_nonzero} m_entries={len(m)} avg_m={avg_m:.4f} "
-                   f"states={len(states)}")
-        
+        logger.info(
+            f"[SNAPSHOT_SAMPLE] version={actual_version} T={T} "
+            f"n_entries={len(n)} n_nonzero={n_nonzero} m_entries={len(m)} avg_m={avg_m:.4f} "
+            f"states={len(states)}"
+        )
+
         if not states:
-            return [create_initial_state(self.env_type, self.initial_exp_type, self.budget_s, self.problem_id)
-                    for _ in range(num_states)]
-        
+            return [
+                create_initial_state(
+                    self.env_type, self.initial_exp_type, self.budget_s, self.problem_id
+                )
+                for _ in range(num_states)
+            ]
+
         # Reconstruct sampling logic using snapshot's statistics
         initial_ids = {s.id for s in self._initial_states}
-        vals = np.array([float(s.value if s.value is not None else float("-inf")) for s in states])
+        vals = np.array(
+            [float(s.value if s.value is not None else float("-inf")) for s in states]
+        )
         non_initial_mask = np.array([s.id not in initial_ids for s in states])
-        scale = self._compute_scale(vals, non_initial_mask if non_initial_mask.any() else None)
+        scale = self._compute_scale(
+            vals, non_initial_mask if non_initial_mask.any() else None
+        )
         P = self._compute_prior(vals, scale)
         G = self.group_size
         sqrtT = np.sqrt(1.0 + T / G)
-        
+
         scores = []
         for i, s in enumerate(states):
             n_visits = n.get(s.id, 0)
@@ -951,9 +1132,9 @@ class PUCTSampler(StateSampler):
             bonus = self.puct_c * scale * P[i] * sqrtT / (1.0 + n_visits / G)
             score = Q + bonus
             scores.append((score, vals[i], s, n_visits, Q, P[i], bonus))
-        
+
         scores.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        
+
         if num_states > 1:
             children_map = self._build_children_map_from_states(states)
             picked, top_scores, blocked_ids = [], [], set()
@@ -969,25 +1150,29 @@ class PUCTSampler(StateSampler):
         else:
             top_scores = scores[:num_states]
             picked = [t[2] for t in top_scores]
-        
+
         # Refresh random construction for initial states
         for s in picked:
             if s.id in initial_ids:
                 self._refresh_random_construction(s)
-        
+
         return picked
-    
-    def _build_children_map_from_states(self, states: list[State]) -> dict[str, set[str]]:
+
+    def _build_children_map_from_states(
+        self, states: list[State]
+    ) -> dict[str, set[str]]:
         """Build children map from a specific list of states (for snapshot sampling)."""
         children: dict[str, set[str]] = {}
         for s in states:
-            for p in (s.parents or []):
+            for p in s.parents or []:
                 pid = p.get("id")
                 if pid:
                     children.setdefault(str(pid), set()).add(s.id)
         return children
-    
-    def _get_full_lineage_from_states(self, state: State, children_map: dict[str, set[str]]) -> set[str]:
+
+    def _get_full_lineage_from_states(
+        self, state: State, children_map: dict[str, set[str]]
+    ) -> set[str]:
         """Get full lineage using a pre-built children map."""
         lineage = self._get_lineage(state)
         queue = [state.id]
@@ -1001,10 +1186,16 @@ class PUCTSampler(StateSampler):
                     queue.append(child_id)
         return lineage
 
-    def update_states(self, states: list[State], parent_states: list[State], save: bool = True, step: int | None = None):
+    def update_states(
+        self,
+        states: list[State],
+        parent_states: list[State],
+        save: bool = True,
+        step: int | None = None,
+    ):
         """
         Update sampler with new states from rollouts.
-        
+
         NOTE: This method handles both individual and batched updates.
         For each successful rollout:
         - _T += 1 (total rollout counter)
@@ -1018,26 +1209,30 @@ class PUCTSampler(StateSampler):
         # Track unique parents for _m update
         parent_max: dict[str, float] = {}
         parent_obj: dict[str, State] = {}
-        
+
         # Process each rollout individually (matching paper's implementation)
         for child, parent in zip(states, parent_states):
             if child.value is None:
                 continue
-            
+
             pid = parent.id
             parent_obj[pid] = parent
-            
+
             # Update _m tracking (max per parent)
-            parent_max[pid] = max(parent_max.get(pid, float("-inf")), float(child.value))
-            
+            parent_max[pid] = max(
+                parent_max.get(pid, float("-inf")), float(child.value)
+            )
+
             # Update _n for parent and ancestors (each rollout counts separately)
-            anc_ids = [pid] + [str(p["id"]) for p in (parent.parents or []) if p.get("id")]
+            anc_ids = [pid] + [
+                str(p["id"]) for p in (parent.parents or []) if p.get("id")
+            ]
             for aid in anc_ids:
                 self._n[aid] = self._n.get(aid, 0) + 1
-            
+
             # Update _T (total rollout counter)
             self._T += 1
-        
+
         # Update _m with max values for each parent
         for pid, y in parent_max.items():
             self._m[pid] = max(self._m.get(pid, y), y)
@@ -1046,16 +1241,22 @@ class PUCTSampler(StateSampler):
             return
 
         # Apply topk filter and dedup
-        states, parent_states = self._filter_topk_per_parent(states, parent_states, self.topk_children)
+        states, parent_states = self._filter_topk_per_parent(
+            states, parent_states, self.topk_children
+        )
         existing = {self._get_construction_key(s) for s in self._states}
         existing.discard(None)
-        
+
         new_states = []
         for child, parent in zip(states, parent_states):
             if child.value is None:
                 continue
             if isinstance(child, InequalitiesState) and child.construction:
-                if not (MIN_CONSTRUCTION_LEN <= len(child.construction) <= MAX_CONSTRUCTION_LEN):
+                if not (
+                    MIN_CONSTRUCTION_LEN
+                    <= len(child.construction)
+                    <= MAX_CONSTRUCTION_LEN
+                ):
                     continue
             if isinstance(child, ErdosState) and child.construction:
                 if len(child.construction) > MAX_ERDOS_CONSTRUCTION_LEN:
@@ -1077,10 +1278,14 @@ class PUCTSampler(StateSampler):
 
     def _finalize_and_save(self, step: int | None = None):
         if len(self._states) > self.max_buffer_size:
-            actual_values = [s.value if s.value is not None else float('-inf') for s in self._states]
+            actual_values = [
+                s.value if s.value is not None else float("-inf") for s in self._states
+            ]
             by_actual = list(np.argsort(actual_values)[::-1])
             initial_ids = {s.id for s in self._initial_states}
-            initial_indices = {i for i, s in enumerate(self._states) if s.id in initial_ids}
+            initial_indices = {
+                i for i, s in enumerate(self._states) if s.id in initial_ids
+            }
             keep = set(initial_indices)
             for i in by_actual:
                 if len(keep) >= self.max_buffer_size:
@@ -1104,22 +1309,27 @@ class PUCTSampler(StateSampler):
                         no_parent.append(s)
                 filtered = []
                 for children in by_parent.values():
-                    children.sort(key=lambda x: x.value if x.value is not None else float('-inf'), reverse=True)
-                    filtered.extend(children[:self.topk_children])
+                    children.sort(
+                        key=lambda x: x.value if x.value is not None else float("-inf"),
+                        reverse=True,
+                    )
+                    filtered.extend(children[: self.topk_children])
                 self._states = no_parent + filtered
             self._finalize_and_save(step)
 
     def record_failed_rollout(self, parent: State):
         """
         Record a failed rollout attempt.
-        
+
         Each failed rollout counts as one expansion attempt:
         - _T += 1 (total rollout counter)
         - _n[parent] += 1 and _n[ancestors] += 1 (visit counts)
-        
+
         Note: _m is NOT updated for failed rollouts (no valid reward)
         """
-        anc_ids = [parent.id] + [str(p["id"]) for p in (parent.parents or []) if p.get("id")]
+        anc_ids = [parent.id] + [
+            str(p["id"]) for p in (parent.parents or []) if p.get("id")
+        ]
         for aid in anc_ids:
             self._n[aid] = self._n.get(aid, 0) + 1
         self._T += 1
@@ -1136,13 +1346,18 @@ class PUCTSampler(StateSampler):
             self._load(step)
             if not self._states:
                 for _ in range(self.batch_size):
-                    state = create_initial_state(self.env_type, self.initial_exp_type, self.budget_s, self.problem_id)
+                    state = create_initial_state(
+                        self.env_type,
+                        self.initial_exp_type,
+                        self.budget_s,
+                        self.problem_id,
+                    )
                     self._initial_states.append(state)
                     self._states.append(state)
 
     def get_best_solution(self) -> dict | None:
         """Return the best state (highest value) in the buffer as a dictionary.
-        
+
         Returns:
             Dictionary containing the best state's information, or None if no states.
         """
@@ -1151,7 +1366,7 @@ class PUCTSampler(StateSampler):
                 return None
             best_state = max(
                 self._states,
-                key=lambda s: s.value if s.value is not None else float('-inf')
+                key=lambda s: s.value if s.value is not None else float("-inf"),
             )
             return self._state_to_dict(best_state)
 
@@ -1166,12 +1381,19 @@ class PUCTSampler(StateSampler):
                 f"{prefix}/min": float(np.min(arr)),
                 f"{prefix}/max": float(np.max(arr)),
             }
+
         buffer_values = [s.value for s in self._states]
         buffer_timesteps = [s.timestep for s in self._states]
-        buffer_constr_lens = [len(s.construction) if hasattr(s, 'construction') and s.construction else 0 for s in self._states]
+        buffer_constr_lens = [
+            len(s.construction) if hasattr(s, "construction") and s.construction else 0
+            for s in self._states
+        ]
         sampled_values = [s.value for s in self._last_sampled_states]
         sampled_timesteps = [s.timestep for s in self._last_sampled_states]
-        sampled_constr_lens = [len(s.construction) if hasattr(s, 'construction') and s.construction else 0 for s in self._last_sampled_states]
+        sampled_constr_lens = [
+            len(s.construction) if hasattr(s, "construction") and s.construction else 0
+            for s in self._last_sampled_states
+        ]
         stats = {
             "puct/buffer_size": len(self._states),
             "puct/sampled_size": len(self._last_sampled_states),
@@ -1187,20 +1409,58 @@ class PUCTSampler(StateSampler):
         return stats
 
     def get_sample_table(self) -> tuple[list[str], list[tuple]]:
-        columns = ["buffer_idx", "timestep", "value", "terminal_value", "parent_value", "construction_len", "observation_len", "n", "Q", "P", "bonus", "score"]
+        columns = [
+            "buffer_idx",
+            "timestep",
+            "value",
+            "terminal_value",
+            "parent_value",
+            "construction_len",
+            "observation_len",
+            "n",
+            "Q",
+            "P",
+            "bonus",
+            "score",
+        ]
         rows = []
         if not self._last_sampled_states:
             return columns, rows
-        indices = self._last_sampled_indices if len(self._last_sampled_indices) == len(self._last_sampled_states) else [-1] * len(self._last_sampled_states)
-        stats = self._last_puct_stats if len(self._last_puct_stats) == len(self._last_sampled_states) else [(0, 0.0, 0.0, 0.0, 0.0)] * len(self._last_sampled_states)
-        for idx, state, (n, Q, P, bonus, score) in zip(indices, self._last_sampled_states, stats):
+        indices = (
+            self._last_sampled_indices
+            if len(self._last_sampled_indices) == len(self._last_sampled_states)
+            else [-1] * len(self._last_sampled_states)
+        )
+        stats = (
+            self._last_puct_stats
+            if len(self._last_puct_stats) == len(self._last_sampled_states)
+            else [(0, 0.0, 0.0, 0.0, 0.0)] * len(self._last_sampled_states)
+        )
+        for idx, state, (n, Q, P, bonus, score) in zip(
+            indices, self._last_sampled_states, stats
+        ):
             parent_val = state.parent_values[0] if state.parent_values else None
-            constr = getattr(state, 'construction', None)
+            constr = getattr(state, "construction", None)
             constr_len = len(constr) if constr is not None else 0
             obs_len = len(state.observation) if state.observation else 0
-            rows.append((idx, state.timestep, state.value, 0, parent_val, constr_len, obs_len, n, Q, P, bonus, score))
+            rows.append(
+                (
+                    idx,
+                    state.timestep,
+                    state.value,
+                    0,
+                    parent_val,
+                    constr_len,
+                    obs_len,
+                    n,
+                    Q,
+                    P,
+                    bonus,
+                    score,
+                )
+            )
         return columns, rows
-    
+
     def sample_breakthrough_transitions(
         self,
         num_transitions: int,
@@ -1227,6 +1487,7 @@ class PUCTSampler(StateSampler):
             List of (parent_state, child_state) pairs.
         """
         import logging
+
         logger = logging.getLogger("PUCTSampler")
 
         with self._lock:
@@ -1244,9 +1505,9 @@ class PUCTSampler(StateSampler):
                 parent = state_by_id.get(str(parent_id))
                 if parent is None:
                     continue
-                improvement = (child.value if child.value is not None else float("-inf")) - (
-                    parent.value if parent.value is not None else float("-inf")
-                )
+                improvement = (
+                    child.value if child.value is not None else float("-inf")
+                ) - (parent.value if parent.value is not None else float("-inf"))
                 # Only include transitions with positive improvement
                 if improvement > 0:
                     transitions.append((improvement, parent, child))
@@ -1254,7 +1515,7 @@ class PUCTSampler(StateSampler):
             if not transitions:
                 # Fallback: return random parent->child pairs (any improvement)
                 logger.warning(
-                    f"[Breakthrough] No transitions found, returning empty list"
+                    "[Breakthrough] No transitions found, returning empty list"
                 )
                 return []
 
@@ -1265,7 +1526,9 @@ class PUCTSampler(StateSampler):
             breakthroughs = [t for t in transitions if t[0] >= min_improvement]
 
             # If not enough breakthroughs, fall back to all positive transitions
-            pool = breakthroughs if len(breakthroughs) >= num_transitions else transitions
+            pool = (
+                breakthroughs if len(breakthroughs) >= num_transitions else transitions
+            )
 
             if len(pool) >= num_transitions:
                 # Weighted sampling by improvement
@@ -1308,6 +1571,7 @@ class PUCTSampler(StateSampler):
             List of (parent, best_child) pairs.
         """
         import logging
+
         logger = logging.getLogger("PUCTSampler")
 
         with self._lock:
@@ -1326,19 +1590,23 @@ class PUCTSampler(StateSampler):
                 if parent is None:
                     continue
 
-                improvement = (child.value if child.value is not None else float("-inf")) - (
-                    parent.value if parent.value is not None else float("-inf")
-                )
+                improvement = (
+                    child.value if child.value is not None else float("-inf")
+                ) - (parent.value if parent.value is not None else float("-inf"))
                 if improvement <= 0:
                     continue
 
                 # Keep best child per parent
-                if parent_id not in parent_best or improvement > parent_best[parent_id][0]:
+                if (
+                    parent_id not in parent_best
+                    or improvement > parent_best[parent_id][0]
+                ):
                     parent_best[parent_id] = (improvement, parent, child)
 
             # Filter by min_improvement and sort descending
             breakthroughs = [
-                (imp, p, c) for _pid, (imp, p, c) in parent_best.items()
+                (imp, p, c)
+                for _pid, (imp, p, c) in parent_best.items()
                 if imp >= min_improvement
             ]
             breakthroughs.sort(key=lambda x: x[0], reverse=True)
@@ -1358,8 +1626,12 @@ class PUCTSampler(StateSampler):
             # Deterministic: cycle through sorted breakthroughs
             result = []
             for i in range(num_states):
-                result.append((breakthroughs[i % len(breakthroughs)][1],
-                               breakthroughs[i % len(breakthroughs)][2]))
+                result.append(
+                    (
+                        breakthroughs[i % len(breakthroughs)][1],
+                        breakthroughs[i % len(breakthroughs)][2],
+                    )
+                )
 
             logger.info(
                 f"[BreakthroughParents] Sampled {num_states} parents from "
@@ -1374,23 +1646,26 @@ class PUCTSampler(StateSampler):
         """
         with self._lock:
             from areal.experimental.ttt_discover.state import state_from_dict
-            
-            self._states = [state_from_dict(d) for d in state_data['states']]
-            self._initial_states = [state_from_dict(d) for d in state_data['initial_states']]
-            self._T = state_data['T']
-            self._n = state_data['n']
-            self._m = state_data['m']
-            self._current_step = state_data['current_step']
-            self._last_sampled_states = [state_from_dict(d) for d in state_data['last_sampled_states']]
-            self._last_sampled_indices = state_data['last_sampled_indices']
-            self._last_puct_stats = state_data['last_puct_stats']
-            self._last_scale = state_data['last_scale']
-            
-            # Sync batch version mappings for distributed consistency
-            if 'batch_version_mappings' in state_data:
-                with self._snapshot_lock:
-                    self._batch_version_mappings = state_data['batch_version_mappings']
 
+            self._states = [state_from_dict(d) for d in state_data["states"]]
+            self._initial_states = [
+                state_from_dict(d) for d in state_data["initial_states"]
+            ]
+            self._T = state_data["T"]
+            self._n = state_data["n"]
+            self._m = state_data["m"]
+            self._current_step = state_data["current_step"]
+            self._last_sampled_states = [
+                state_from_dict(d) for d in state_data["last_sampled_states"]
+            ]
+            self._last_sampled_indices = state_data["last_sampled_indices"]
+            self._last_puct_stats = state_data["last_puct_stats"]
+            self._last_scale = state_data["last_scale"]
+
+            # Sync batch version mappings for distributed consistency
+            if "batch_version_mappings" in state_data:
+                with self._snapshot_lock:
+                    self._batch_version_mappings = state_data["batch_version_mappings"]
 
 
 def create_sampler(
@@ -1406,63 +1681,84 @@ def create_sampler(
 ) -> StateSampler:
     """Factory function to create samplers by type."""
     if sampler_type not in SAMPLER_TYPES:
-        raise ValueError(f"Unknown sampler_type: {sampler_type}. Supported: {SAMPLER_TYPES}")
+        raise ValueError(
+            f"Unknown sampler_type: {sampler_type}. Supported: {SAMPLER_TYPES}"
+        )
     if initial_exp_type not in INITIAL_EXP_TYPES:
-        raise ValueError(f"Unknown initial_exp_type: {initial_exp_type}. Supported: {INITIAL_EXP_TYPES}")
-    
-    problem_id = kwargs.get('problem_id', '')
+        raise ValueError(
+            f"Unknown initial_exp_type: {initial_exp_type}. Supported: {INITIAL_EXP_TYPES}"
+        )
+
+    problem_id = kwargs.get("problem_id", "")
     if sampler_type == "greedy":
         if not log_path:
-            raise ValueError(f"log_path is required when using sampler_type={sampler_type}")
+            raise ValueError(
+                f"log_path is required when using sampler_type={sampler_type}"
+            )
         sampler_path = os.path.join(log_path, "experience_sampler.json")
-        return GreedySampler(sampler_path, env_type=env_type, budget_s=budget_s, 
-                             initial_exp_type=initial_exp_type, batch_size=batch_size, 
-                             resume_step=resume_step, epsilon=epsilon,
-                             problem_id=problem_id,
-                             )
+        return GreedySampler(
+            sampler_path,
+            env_type=env_type,
+            budget_s=budget_s,
+            initial_exp_type=initial_exp_type,
+            batch_size=batch_size,
+            resume_step=resume_step,
+            epsilon=epsilon,
+            problem_id=problem_id,
+        )
     elif sampler_type == "fixed":
-        return FixedSampler(env_type=env_type, budget_s=budget_s, initial_exp_type=initial_exp_type)
+        return FixedSampler(
+            env_type=env_type, budget_s=budget_s, initial_exp_type=initial_exp_type
+        )
     elif sampler_type in ("puct", "puct_backprop"):
         if not log_path:
-            raise ValueError(f"log_path is required when using sampler_type={sampler_type}")
+            raise ValueError(
+                f"log_path is required when using sampler_type={sampler_type}"
+            )
         sampler_path = os.path.join(log_path, f"{sampler_type}_sampler.json")
-        return PUCTSampler(sampler_path, env_type=env_type, budget_s=budget_s, 
-                          initial_exp_type=initial_exp_type, batch_size=batch_size, 
-                          resume_step=resume_step, **kwargs)
+        return PUCTSampler(
+            sampler_path,
+            env_type=env_type,
+            budget_s=budget_s,
+            initial_exp_type=initial_exp_type,
+            batch_size=batch_size,
+            resume_step=resume_step,
+            **kwargs,
+        )
 
     raise ValueError(f"Unknown sampler_type: {sampler_type}")
 
 
 def _find_latest_sampler_step(log_path: str, sampler_type: str = "puct") -> int | None:
     """Find the latest sampler checkpoint step in the log directory.
-    
+
     Args:
         log_path: Directory containing sampler checkpoint files
         sampler_type: Type of sampler (puct, greedy, etc.)
-        
+
     Returns:
         Latest step number, or None if no checkpoint found
     """
     import glob
     import re
-    
+
     if not os.path.exists(log_path):
         return None
-    
+
     # Pattern: {sampler_type}_sampler_step_{step:06d}.json
     pattern = os.path.join(log_path, f"{sampler_type}_sampler_step_*.json")
     files = glob.glob(pattern)
-    
+
     if not files:
         return None
-    
+
     # Extract step numbers from filenames
     steps = []
     for f in files:
-        match = re.search(r'step_(\d{6})\.json$', f)
+        match = re.search(r"step_(\d{6})\.json$", f)
         if match:
             steps.append(int(match.group(1)))
-    
+
     return max(steps) if steps else None
 
 
@@ -1474,11 +1770,11 @@ def create_sampler_from_config(
 ) -> StateSampler:
     """
     Create sampler from TTTDPPOConfig.sampler configuration.
-    
+
     TTT-Discover does not require a traditional dataset as PUCTSampler
     manages states internally. Initial states are created based on
     config.initial_exp_type and config.env_type.
-    
+
     Args:
         config: SamplerConfig dataclass from TTTDPPOConfig
         log_path: Optional override for log path (defaults to config.checkpoint_dir)
@@ -1486,49 +1782,54 @@ def create_sampler_from_config(
         max_version_history: Maximum number of PUCT version snapshots to keep.
             Should be >= max_head_offpolicyness + 1 for lazy sampling.
             If None, uses config.max_version_history or defaults to 5.
-    
+
     Returns:
         Configured StateSampler instance
     """
     # Determine log path
     if log_path is None:
-        log_path = getattr(config, 'checkpoint_dir', None)
+        log_path = getattr(config, "checkpoint_dir", None)
     if log_path is None:
         raise ValueError(
             "log_path must be provided either as argument or via config.checkpoint_dir"
         )
-    
+
     # Create directory if needed
     os.makedirs(log_path, exist_ok=True)
-    
+
     # Extract parameters from config
-    sampler_type = getattr(config, 'type', 'puct')
-    batch_size = getattr(config, 'batch_size', 8)
-    initial_exp_type = getattr(config, 'initial_exp_type', 'best_available')
-    config_env_type = getattr(config, 'env_type', env_type)  # Use config value if available
-    
+    sampler_type = getattr(config, "type", "puct")
+    batch_size = getattr(config, "batch_size", 8)
+    initial_exp_type = getattr(config, "initial_exp_type", "best_available")
+    config_env_type = getattr(
+        config, "env_type", env_type
+    )  # Use config value if available
+
     # PUCT-specific parameters
-    c_puct = getattr(config, 'c_puct', 1.5)
-    gamma = getattr(config, 'gamma', 0.95)
-    max_children = getattr(config, 'max_children', 100)
-    max_states = getattr(config, 'max_states', 10000)
-    top_k = getattr(config, 'top_k', 1000)
-    temperature = getattr(config, 'temperature', 1.0)
-    save_freq = getattr(config, 'save_freq', 100)
-    sampling_strategy = getattr(config, 'sampling_strategy', 'puct')
-    
+    c_puct = getattr(config, "c_puct", 1.5)
+    gamma = getattr(config, "gamma", 0.95)
+    max_children = getattr(config, "max_children", 100)
+    max_states = getattr(config, "max_states", 10000)
+    top_k = getattr(config, "top_k", 1000)
+    temperature = getattr(config, "temperature", 1.0)
+    save_freq = getattr(config, "save_freq", 100)
+    sampling_strategy = getattr(config, "sampling_strategy", "puct")
+
     # Auto-detect latest sampler checkpoint step
     resume_step = _find_latest_sampler_step(log_path, sampler_type)
     if resume_step is not None:
         import logging
+
         logger = logging.getLogger("Sampler")
-        logger.info(f"[Auto-Resume] Found latest sampler checkpoint at step {resume_step}")
-    
+        logger.info(
+            f"[Auto-Resume] Found latest sampler checkpoint at step {resume_step}"
+        )
+
     # max_version_history: use argument if provided, else from config, else default
     if max_version_history is None:
-        max_version_history = getattr(config, 'max_version_history', 5)
-    
-    problem_id = getattr(config, 'problem_id', '')
+        max_version_history = getattr(config, "max_version_history", 5)
+
+    problem_id = getattr(config, "problem_id", "")
 
     return create_sampler(
         sampler_type=sampler_type,
@@ -1562,6 +1863,13 @@ def get_or_create_sampler_with_default(
     **kwargs,
 ) -> StateSampler:
     """Get sampler. Initial experience is created automatically if needed."""
-    return create_sampler(sampler_type, log_path, env_type=env_type, budget_s=budget_s, 
-                          initial_exp_type=initial_exp_type, batch_size=batch_size,
-                          resume_step=resume_step, **kwargs)
+    return create_sampler(
+        sampler_type,
+        log_path,
+        env_type=env_type,
+        budget_s=budget_s,
+        initial_exp_type=initial_exp_type,
+        batch_size=batch_size,
+        resume_step=resume_step,
+        **kwargs,
+    )
