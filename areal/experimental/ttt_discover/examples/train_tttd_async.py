@@ -1268,9 +1268,11 @@ class TTTDPPOTrainer(PPOTrainer):
             logger.info(f"[DEBUG][Step {global_step}] Before rollout.pause")
             self.rollout.pause()
             logger.info(f"[DEBUG][Step {global_step}] After rollout.pause")
-            self.actor.update_weights(self.weight_update_meta)
-            self.actor.set_version(global_step + 1)
-            self.rollout.set_version(global_step + 1)
+            new_version = global_step + 1
+            versioned_meta = self.weight_update_meta.with_version(new_version)
+            self.actor.update_weights(versioned_meta)
+            self.actor.set_version(new_version)
+            self.rollout.set_version(new_version)
 
             logger.info(f"[DEBUG][Step {global_step}] Before _save_hf")
             self._save_hf(epoch=epoch, epoch_step=step, global_step=global_step)
