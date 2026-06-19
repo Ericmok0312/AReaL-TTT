@@ -187,18 +187,26 @@ Rules:
 
     def execute(self, code: str, state: State) -> EnvResult:
         """Evaluate the generated C++ code on the ALE-Bench public cases."""
+        # ALE-Bench's official API is session.public_eval(code, code_language=...).
+        # Fallback to the lower-level case_eval if public_eval is unavailable.
         try:
-            result = self.session.case_eval(
-                input_str=self.session._public_inputs,
-                code=code,
-                code_language=CodeLanguage.CPP20,
-                judge_version=JudgeVersion.V202301,
-                time_limit=self.problem.constraints.time_limit,
-                memory_limit=self.problem.constraints.memory_limit,
-                skip_local_visualization=True,
-            )
+            if hasattr(self.session, "public_eval"):
+                result = self.session.public_eval(
+                    code=code,
+                    code_language=CodeLanguage.CPP20,
+                )
+            else:
+                result = self.session.case_eval(
+                    input_str=self.session._public_inputs,
+                    code=code,
+                    code_language=CodeLanguage.CPP20,
+                    judge_version=JudgeVersion.V202301,
+                    time_limit=self.problem.constraints.time_limit,
+                    memory_limit=self.problem.constraints.memory_limit,
+                    skip_local_visualization=True,
+                )
         except Exception as e:
-            logger.warning(f"[AleBenchEnv] case_eval failed: {e}", exc_info=True)
+            logger.warning(f"[AleBenchEnv] evaluation failed: {e}", exc_info=True)
             self._log_failed_code(code, fail_type="execution_error", error_msg=str(e))
             return self.get_failure_result(
                 state=state,
