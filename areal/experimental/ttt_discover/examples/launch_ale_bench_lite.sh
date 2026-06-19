@@ -36,8 +36,9 @@ for PROBLEM_ID in "${PROBLEM_IDS[@]}"; do
     echo "============================================================"
 
     python -m areal.infra.launcher.local \
-        "${CONFIG}" \
-        "+sampler.problem_id=${PROBLEM_ID}" \
+        "${SCRIPT_DIR}/train_tttd_async.py" \
+        --config "${CONFIG}" \
+        "sampler.problem_id=${PROBLEM_ID}" \
         ${EXTRA_ARGS}
 
     echo "Finished training for ${PROBLEM_ID}"

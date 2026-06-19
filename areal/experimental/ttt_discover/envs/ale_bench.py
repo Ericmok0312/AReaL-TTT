@@ -205,12 +205,35 @@ Rules:
             # Negate so higher reward always means better performance.
             reward = -avg_raw_score / self.reward_scale
 
-        observation = (
-            f"Evaluated on {num_cases} public cases. "
-            f"Passed: {num_accepted}/{num_cases}. "
-            f"Avg raw score: {avg_raw_score:.4f}. "
-            f"Overall judge: {result.overall_judge_result.value if hasattr(result, 'overall_judge_result') else 'N/A'}."
-        )
+        # Build a detailed observation for the LLM. Include per-case results and
+        # the first few failure messages so the model can iterate on bugs.
+        lines = [
+            f"Evaluated on {num_cases} public cases.",
+            f"Passed: {num_accepted}/{num_cases}.",
+            f"Avg raw score: {avg_raw_score:.4f}.",
+            f"Overall judge: {getattr(result, 'overall_judge_result', None) and result.overall_judge_result.value or 'N/A'}.",
+        ]
+
+        non_ac_cases = [
+            (i, c)
+            for i, c in enumerate(case_results)
+            if getattr(c, "judge_result", None) != JudgeResult.ACCEPTED
+        ]
+        if non_ac_cases:
+            lines.append("Failed cases (showing up to 3):")
+            for case_idx, case in non_ac_cases[:3]:
+                judge_value = getattr(
+                    case.judge_result, "value", str(case.judge_result)
+                )
+                message = getattr(case, "message", "") or ""
+                lines.append(f"  Case {case_idx}: {judge_value} - {message}")
+                error_str = (getattr(case, "error_str", "") or "").strip()
+                if error_str:
+                    if len(error_str) > 500:
+                        error_str = error_str[:500] + "\n...(truncated)..."
+                    lines.append(f"    stderr:\n{error_str}")
+
+        observation = "\n".join(lines)
 
         return EnvResult(
             reward=float(reward),
