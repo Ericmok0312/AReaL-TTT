@@ -84,6 +84,8 @@ class AleBenchEnv(BaseEnv):
         self.eval_timeout = eval_timeout
         self.log_dir = log_dir
         self.num_cpus = num_cpus
+        self.code_language = code_language
+
         # Map string code_language to ale_bench CodeLanguage enum.
         self._code_language_enum = getattr(CodeLanguage, code_language.upper(), None)
         if self._code_language_enum is None:
