@@ -129,6 +129,7 @@ class TTTDPPOTrainer(PPOTrainer):
         # Pass actor config for entropic advantage computation with adv_estimator settings
         self.actor = self._create_tttd_actor(config.actor)
         # No critic - TTT-Discover uses entropic objective without value function
+        self.critic = None
         self.ref = None
         # Use actor-level kl_ctl
         if config.actor.kl_ctl > 0 and config.ref is not None:
