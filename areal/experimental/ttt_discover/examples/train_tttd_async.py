@@ -185,6 +185,10 @@ class TTTDPPOTrainer(PPOTrainer):
         # Store workflow kwargs for later use (updated in train method)
         self._workflow_kwargs = {}
 
+        # TTT-Discover does not use eval_rollout, but the parent RLTrainer.close()
+        # checks it; initialize to None to avoid AttributeError during teardown.
+        self.eval_rollout = None
+
     def _create_tttd_actor(self, actor_config: TTTDPPOActorConfig):
         """Create TTTDActor with custom compute_advantages."""
         # Always create TTTDActor directly (not as_controller) to avoid RPC issues
