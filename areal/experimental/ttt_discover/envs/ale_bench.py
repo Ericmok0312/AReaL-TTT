@@ -84,7 +84,13 @@ class AleBenchEnv(BaseEnv):
         self.eval_timeout = eval_timeout
         self.log_dir = log_dir
         self.num_cpus = num_cpus
-        self.code_language = code_language
+        # Map string code_language to ale_bench CodeLanguage enum.
+        self._code_language_enum = getattr(CodeLanguage, code_language.upper(), None)
+        if self._code_language_enum is None:
+            raise ValueError(
+                f"Unsupported code_language={code_language} for ALE-Bench. "
+                f"Available: {[x.lower() for x in dir(CodeLanguage) if not x.startswith('_')]}."
+            )
 
         self.session = _get_session(
             problem_id, lite_version, log_dir, num_workers=num_cpus
@@ -179,7 +185,7 @@ Below is the full problem statement. Read it carefully and write a complete C++2
 
 Rules:
 - You must use C++20 (GNU++17/C++20 compatible) to solve the problem.
-- You may reason step by step before writing the final code.
+- You must reason step by step before writing the final code.
 - Define all of your code in one final ```cpp ... ``` block.
 - Your program must read from stdin and write to stdout exactly as described in the statement.
 - Make efficient use of the allowed time limit. Think outside the box and try diverse approaches.
@@ -193,13 +199,13 @@ Rules:
             if hasattr(self.session, "public_eval"):
                 result = self.session.public_eval(
                     code=code,
-                    code_language=CodeLanguage.CPP20,
+                    code_language=self._code_language_enum,
                 )
             else:
                 result = self.session.case_eval(
                     input_str=self.session._public_inputs,
                     code=code,
-                    code_language=CodeLanguage.CPP20,
+                    code_language=self._code_language_enum,
                     judge_version=JudgeVersion.V202301,
                     time_limit=self.problem.constraints.time_limit,
                     memory_limit=self.problem.constraints.memory_limit,
