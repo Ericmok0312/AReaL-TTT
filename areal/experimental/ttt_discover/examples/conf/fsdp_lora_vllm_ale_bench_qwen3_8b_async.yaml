@@ -130,10 +130,10 @@ vllm:
   seed: ${seed}
   skip_tokenizer_init: false
   max_num_seqs: 128
-  no_enable_prefix_caching: false
+  no_enable_prefix_caching: true
   dtype: ${actor.dtype}
   max_model_len: 32768
-  gpu_memory_utilization: 0.9
+  gpu_memory_utilization: 0.8
   enforce_eager: false
   enable_lora: ${actor.use_lora}
   max_lora_rank: 32
