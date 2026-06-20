@@ -132,22 +132,21 @@ class AleBenchEnv(BaseEnv):
             if self.reward_scale <= 0:
                 self.reward_scale = 1.0
 
-        # Target for prompt construction (normalized raw-score units).
-        # State.to_prompt negates self.value when maximize=False, so target_score
-        # stays in the raw-score domain for both directions.
+        # Target for prompt construction and failure-reward scaling.
+        # Standings are ordered best-to-worst, so positive_scores[0] is the best
+        # raw score regardless of optimization direction.
         positive_scores = [s for _, s in self.standings.standings_scores if s > 0]
         best_raw_score = positive_scores[0] if positive_scores else 0.0
         worst_raw_score = positive_scores[-1] if positive_scores else 0.0
-        self.target_score = (
-            best_raw_score / self.reward_scale
-            if self.maximize
-            else worst_raw_score / self.reward_scale
-        )
+        self.target_raw_score = best_raw_score
+        self.target_score = best_raw_score / self.reward_scale
 
         logger.info(
             f"[AleBenchEnv] problem_id={problem_id} lite_version={lite_version} "
             f"score_type={self.problem.metadata.score_type.value} "
             f"maximize={self.maximize} reward_scale={self.reward_scale:.4f} "
+            f"target_raw_score={self.target_raw_score:.4f} "
+            f"worst_raw_score={worst_raw_score:.4f} "
             f"target_score={self.target_score:.4f}"
         )
 
@@ -159,19 +158,11 @@ class AleBenchEnv(BaseEnv):
         example_output = getattr(self.problem, "example_output", "")
 
         value_context = state.to_prompt(
-            target=self.target_score,
+            target=self.target_raw_score,
             metric_name="score",
             maximize=self.maximize,
             language=self.code_language,
         )
-
-        # Show the unscaled raw score in the prompt so the model sees the actual
-        # problem-scale metric alongside the normalized reward.
-        raw_score = getattr(state, "raw_score", None)
-        if raw_score is not None:
-            value_context += (
-                f"\nUnscaled avg raw score (before reward scaling): {raw_score:.4f}"
-            )
 
         example_section = ""
         if example_input.strip() or example_output.strip():
@@ -195,10 +186,11 @@ Below is the full problem statement. Read it carefully and write a complete C++2
 
 Rules:
 - You must use C++20 (GNU++17/C++20 compatible) to solve the problem.
-- You must reason step by step before writing the final code.
+- Reason about your approach before writing code, and write clean, well-structured code with comments.
 - Define all of your code in one final ```cpp ... ``` block.
 - Your program must read from stdin and write to stdout exactly as described in the statement.
 - Make efficient use of the allowed time limit. Think outside the box and try diverse approaches.
+- Make sure you /think carefully before coding by learning from previous code and feedback.
 """
 
     def execute(self, code: str, state: State) -> EnvResult:

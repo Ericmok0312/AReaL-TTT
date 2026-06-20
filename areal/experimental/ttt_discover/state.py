@@ -325,6 +325,59 @@ class AleBenchState(State):
             "code": self.code,
         }
 
+    def to_prompt(
+        self,
+        target,
+        metric_name: str = "score",
+        maximize: bool = True,
+        language: str = "",
+    ) -> str:
+        """Generate prompt value context using the unscaled raw score.
+
+        Overrides the base class to display ``raw_score`` (the original ALE-Bench
+        contest metric) instead of ``value`` (which is kept scaled for RL/sampler
+        advantage computation).
+        """
+        value_ctx = f"You are iteratively optimizing {metric_name}."
+        improvement_direction = "higher" if maximize else "lower"
+
+        has_code = self.code and self.code.strip()
+        if has_code:
+            value_ctx += "\nHere is the last code we ran:\n"
+            if language:
+                value_ctx += f"```{language}\n{self.code}\n```"
+            else:
+                value_ctx += f"{self.code}"
+        else:
+            value_ctx += "\nNo previous code available."
+
+        current_raw = self.raw_score
+        if current_raw is not None:
+            # raw_score is already in the original problem metric domain, so we
+            # do not negate it for minimize problems; the direction text tells the
+            # model whether lower or higher is better.
+            current_gap = target - current_raw if maximize else current_raw - target
+            value_ctx += (
+                f"\nCurrent {metric_name} ({improvement_direction} is better): "
+                f"{current_raw:.6f}"
+            )
+            value_ctx += (
+                f"\nTarget: {target}. Current gap: {current_gap:.6f}. "
+                f"Further improvements will also be generously rewarded."
+            )
+        else:
+            value_ctx += f"\nTarget {metric_name}: {target}"
+
+        if self.observation and self.observation.strip():
+            stdout = self.observation.strip()
+            if len(stdout) > 500:
+                stdout = "\n\n\t\t ...(TRUNCATED)...\n" + stdout[-500:]
+            value_ctx += (
+                f"\n\n--- Previous Program Output ---\n{stdout}\n--- End Output ---"
+            )
+
+        return value_ctx
+
     @classmethod
     def from_dict(cls, d: dict) -> AleBenchState:
         state = cls(
