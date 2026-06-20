@@ -581,16 +581,19 @@ def create_env_from_config(config):
         problem_id = getattr(config.sampler, "problem_id", "")
         if not problem_id:
             raise ValueError("sampler.problem_id must be set when env_type='ale_bench'")
-        return AleBenchEnv(
+        env_kwargs = dict(
             problem_id=problem_id,
             lite_version=getattr(config.sampler, "ale_bench_lite_version", True),
             eval_timeout=eval_timeout,
             log_dir=config.saver.fileroot,
             num_cpus=getattr(config.sampler, "num_cpus", 2),
             reward_scale=getattr(config.sampler, "reward_scale", None),
-            session_duration_seconds=getattr(
-                config.sampler, "ale_bench_session_duration_seconds", None
-            ),
         )
+        session_duration_seconds = getattr(
+            config.sampler, "ale_bench_session_duration_seconds", None
+        )
+        if session_duration_seconds is not None:
+            env_kwargs["session_duration_seconds"] = session_duration_seconds
+        return AleBenchEnv(**env_kwargs)
     else:
         raise ValueError(f"Unknown env_type: {env_type}")

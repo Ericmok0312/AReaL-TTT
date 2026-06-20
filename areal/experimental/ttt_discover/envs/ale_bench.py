@@ -52,6 +52,8 @@ def _get_session(
     session_duration_seconds: float = _DEFAULT_SESSION_DURATION_SECONDS,
 ):
     """Get or create an ALE-Bench session for the problem."""
+    if session_duration_seconds is None:
+        session_duration_seconds = _DEFAULT_SESSION_DURATION_SECONDS
     key = (problem_id, lite_version, log_dir, num_workers, session_duration_seconds)
     with _ALE_SESSIONS_LOCK:
         session = _ALE_SESSIONS.get(key)
@@ -114,7 +116,11 @@ class AleBenchEnv(BaseEnv):
         self.log_dir = log_dir
         self.num_cpus = num_cpus
         self.code_language = code_language
-        self.session_duration_seconds = session_duration_seconds
+        self.session_duration_seconds = (
+            session_duration_seconds
+            if session_duration_seconds is not None
+            else _DEFAULT_SESSION_DURATION_SECONDS
+        )
 
         # Map string code_language to ale_bench CodeLanguage enum.
         self._code_language_enum = getattr(CodeLanguage, code_language.upper(), None)
