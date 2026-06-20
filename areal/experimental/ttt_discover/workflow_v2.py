@@ -993,8 +993,14 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
 
             # Paper: limit prompt + thinking tokens to 26000, leave room for final response
             prompt_length = len(input_ids)
-            max_context = 32768
+            # Respect the configured total token budget instead of hard-coding 32768.
+            max_context = getattr(self.gconfig, "max_tokens", None) or 32768
             max_thinking_tokens = self.max_prompt_thinking_tokens - prompt_length
+            logger.info(
+                f"[PROMPT_LEN] prompt_length={prompt_length} "
+                f"max_context={max_context} "
+                f"max_prompt_thinking_tokens={self.max_prompt_thinking_tokens}"
+            )
             max_new_tokens_phase1 = min(
                 self.gconfig.max_new_tokens,
                 max_context - prompt_length,
@@ -1024,6 +1030,13 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             # Check if generation was truncated or no valid code
             completion_str = self.tokenizer.decode(resp.output_tokens)
             code = self.env.extract_code(completion_str)
+
+            logger.info(
+                f"[OUTPUT] input_len={resp.input_len} output_len={resp.output_len} "
+                f"output_tokens={len(resp.output_tokens)} "
+                f"has_code={code is not None} "
+                f"max_context={max_context}"
+            )
 
             # Phase 2: Teacher forcing if no valid code extracted
             if code is None:

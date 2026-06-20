@@ -15,7 +15,7 @@ actor:
   path: Qwen/Qwen3-8B
   dtype: bfloat16
   mb_spec:
-    max_tokens_per_mb: 32768
+    max_tokens_per_mb: 16000
     n_mbs: 1
     granularity: 1
   scheduling_spec:
@@ -101,13 +101,13 @@ rollout:
 gconfig:
   n_samples: 64
   min_new_tokens: 0
-  max_new_tokens: 32768
-  max_tokens: 32768
+  max_new_tokens: 16000
+  max_tokens: 16000
   greedy: false
   temperature: 1.0
   top_p: 0.95
   lora_name: tttd_lora_adapter
-max_prompt_thinking_tokens: 25000
+max_prompt_thinking_tokens: 10000
 ref:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
@@ -117,7 +117,7 @@ ref:
   gradient_checkpointing: false
   dtype: ${actor.dtype}
   mb_spec:
-    max_tokens_per_mb: 32768
+    max_tokens_per_mb: 16000
     n_mbs: 1
   optimizer: null
   scheduling_strategy:
@@ -132,7 +132,7 @@ vllm:
   max_num_seqs: 128
   no_enable_prefix_caching: false
   dtype: ${actor.dtype}
-  max_model_len: 32768
+  max_model_len: 16000
   gpu_memory_utilization: 0.8
   enforce_eager: false
   enable_lora: ${actor.use_lora}
@@ -164,10 +164,10 @@ sampler:
   execution_concurrency: 64
 train_dataset:
   batch_size: ${sampler.batch_size}
-  max_length: 32768
+  max_length: 16000
 valid_dataset:
   batch_size: 8
-  max_length: 32768
+  max_length: 16000
 saver:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}

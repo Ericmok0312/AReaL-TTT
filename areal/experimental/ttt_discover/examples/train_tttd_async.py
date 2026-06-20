@@ -778,6 +778,24 @@ class TTTDPPOTrainer(PPOTrainer):
                 logger.info(f"[SCHEME1][Step {global_step}] Enabled batch tracking")
 
             # === Rollout with async prepare_batch ===
+            # NOTE: self.actor.prepare_batch() routes through DistRolloutCoordinator,
+            # which performs an all-gather across data-parallel ranks. When using the
+            # real tttd_reward_fn (i.e. executing generated Python code via
+            # AsyncRewardWrapper), rollout completion times can differ wildly across
+            # ranks. The fast rank then waits at the NCCL all-gather for the slow
+            # rank; if the gap exceeds ~480s, PyTorch's NCCL watchdog aborts with a
+            # "watchdog got stuck" error.
+            #
+            # Known workarounds:
+            #   export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=1800
+            #
+            # Long-term fix (already used in eval_tttd_multi_v2.py): bypass
+            # DistRolloutCoordinator by calling self.rollout.prepare_batch() directly.
+            # That avoids the cross-rank all-gather at the cost of not redistributing
+            # trajectories for load balancing. Since TTT-Discover syncs the PUCT
+            # sampler state via sync_sampler(), per-rank training is acceptable here.
+            # TODO: migrate this call to self.rollout.prepare_batch() once we verify
+            # downstream metrics remain consistent without DistRolloutCoordinator.
             rollout_start = time.perf_counter()
             with stats_tracker.record_timing("rollout"):
                 rollout_batch = self.actor.prepare_batch(
