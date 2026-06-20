@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Environment definitions for TTT-Discover.
 
@@ -19,7 +21,7 @@ from ..state import State
 class EnvResult:
     """
     Result of executing code in an environment.
-    
+
     Attributes:
         reward: The computed reward value (higher is better)
         observation: Optional logs/stdout from execution
@@ -27,6 +29,7 @@ class EnvResult:
         metadata: Additional environment-specific data
         fail_type: Type of failure (timeout, code_extraction_failed, execution_error, etc.)
     """
+
     reward: float
     observation: str = ""
     is_valid: bool = True
@@ -37,18 +40,18 @@ class EnvResult:
 class BaseEnv(ABC):
     """
     Abstract base class for problem environments.
-    
+
     Users should subclass this to define custom problem domains.
     Each environment handles:
     - Prompt generation for a given State
     - Code execution and reward computation
     - Optional custom code extraction logic
-    
+
     Example:
         >>> class CirclePackingEnv(BaseEnv):
         ...     def get_prompt(self, state):
         ...         return f"Pack circles with radii: {state.radii}"
-        ...     
+        ...
         ...     def execute(self, code, state):
         ...         # Run the generated code in a sandbox
         ...         circles = extract_circles_from_code(code)
@@ -60,10 +63,10 @@ class BaseEnv(ABC):
     def get_prompt(self, state: State) -> str:
         """
         Generate a prompt string for the given State.
-        
+
         Args:
             state: The State object containing problem context
-            
+
         Returns:
             A prompt string to be sent to the LLM
         """
@@ -73,14 +76,14 @@ class BaseEnv(ABC):
     def execute(self, code: str, state: State) -> EnvResult:
         """
         Execute the LLM-generated code and compute reward.
-        
+
         This is where the actual environment interaction happens.
         The code should be executed in a sandbox or controlled environment.
-        
+
         Args:
             code: The extracted code from LLM completion
             state: The State object containing problem context (construction, etc.)
-            
+
         Returns:
             EnvResult containing reward and execution metadata
         """
@@ -97,21 +100,21 @@ class BaseEnv(ABC):
     ) -> State:
         """
         Create a new child State from the execution result.
-        
+
         This method creates a new State object that represents the child node
         in the PUCT search tree. The environment determines the specific State
         subclass to instantiate based on its problem domain.
-        
+
         Args:
             parent_state: The parent State from which this rollout originated
             code: The extracted code from LLM completion
             reward: The computed reward value
             result: The full EnvResult from environment execution
             timestep: The current timestep (parent_state.timestep + 1)
-            
+
         Returns:
             A new State instance (specific subclass) representing the child node
-            
+
         Example:
             >>> def create_state(self, parent, code, reward, result, timestep):
             ...     from .state import InequalitiesState
@@ -130,29 +133,29 @@ class BaseEnv(ABC):
     def extract_code(self, completion: str) -> str | None:
         """
         Extract executable code from raw LLM completion.
-        
+
         Override this for custom extraction logic (e.g., different markdown formats).
-        
+
         Args:
             completion: Raw completion string from LLM
-            
+
         Returns:
             Extracted code string, or None if extraction fails
         """
         import re
-        
+
         # Default: extract code from ```python ... ``` blocks
         pattern = r"```python\s+([\s\S]*?)\s*```"
         match = re.search(pattern, completion)
         if match:
             return match.group(1).strip()
-        
+
         # Fallback: try generic code block
         pattern = r"```\s+([\s\S]*?)\s*```"
         match = re.search(pattern, completion)
         if match:
             return match.group(1).strip()
-        
+
         # No code block found, return the whole completion
         return completion.strip()
 
@@ -164,42 +167,50 @@ class BaseEnv(ABC):
     ) -> EnvResult:
         """
         Create failure result for a rollout.
-        
+
         Subclasses can override this to customize failure rewards and observations.
-        
+
         Args:
             state: The state object (may be None if state is missing)
             fail_type: Type of failure (timeout, code_extraction_failed, execution_error, missing_state)
             error_msg: Additional error message
-            
+
         Returns:
             EnvResult with appropriate reward and observation for the failure type
         """
         if fail_type == "timeout":
             return EnvResult(
                 reward=0.0,
-                observation=f"Execution timeout: {error_msg}" if error_msg else "Execution timeout",
+                observation=f"Execution timeout: {error_msg}"
+                if error_msg
+                else "Execution timeout",
                 is_valid=False,
                 fail_type=fail_type,
             )
         elif fail_type == "code_extraction_failed":
             return EnvResult(
                 reward=0.0,
-                observation=f"Failed to extract code: {error_msg}" if error_msg else "Failed to extract code from response",
+                observation=f"Failed to extract code: {error_msg}"
+                if error_msg
+                else "Failed to extract code from response",
                 is_valid=False,
                 fail_type=fail_type,
             )
         elif fail_type == "missing_state":
             return EnvResult(
                 reward=-1.0,
-                observation=f"Missing state: {error_msg}" if error_msg else "Missing state object",
+                observation=f"Missing state: {error_msg}"
+                if error_msg
+                else "Missing state object",
                 is_valid=False,
                 fail_type=fail_type,
             )
         else:  # execution_error or other
             return EnvResult(
                 reward=0.0,
-                observation=f"Execution error: {error_msg}" if error_msg else "Execution failed",
+                observation=f"Execution error: {error_msg}"
+                if error_msg
+                else "Execution failed",
                 is_valid=False,
                 fail_type=fail_type,
             )
@@ -214,36 +225,39 @@ class BaseEnv(ABC):
     ) -> dict[str, torch.Tensor]:
         """
         Create trajectory for a failed rollout.
-        
+
         This method allows the environment to control:
         - The reward for different failure types
         - Whether the failure should contribute to training (loss_mask)
         - The observation/error message
-        
+
         Args:
             state: The state object (may be None)
             input_ids: Input token IDs
             tokenizer: Tokenizer for encoding
             fail_type: Type of failure
             error_msg: Additional error message
-            
+
         Returns:
             Dictionary with trajectory tensors
         """
         # Get environment-specific failure result
         result = self.get_failure_result(state, fail_type, error_msg)
-        
+
         seq = input_ids + [tokenizer.eos_token_id or 0]
-        
+
         # Following ttt-discover logic: all failed rollouts participate in training
         # with reward=0. Only successful rollouts (correctness > 0) create new states.
         # This allows the model to learn from failures (what not to do).
-        
+
         return {
             "input_ids": torch.tensor(seq, dtype=torch.int32).unsqueeze(0),
-            "loss_mask": torch.ones(len(seq), dtype=torch.int32).unsqueeze(0),  # Train on all
+            "loss_mask": torch.ones(len(seq), dtype=torch.int32).unsqueeze(
+                0
+            ),  # Train on all
             "logprobs": torch.zeros(len(seq), dtype=torch.float32).unsqueeze(0),
             "versions": torch.full((len(seq),), -1, dtype=torch.int32).unsqueeze(0),
             "attention_mask": torch.ones(len(seq), dtype=torch.bool).unsqueeze(0),
             "rewards": torch.tensor([result.reward], dtype=torch.float32),
+            "raw_scores": torch.tensor([float("nan")], dtype=torch.float32),
         }

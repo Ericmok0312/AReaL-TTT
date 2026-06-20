@@ -14,9 +14,12 @@ and run C++/Rust judge code, so a working Docker daemon is required.
 
 from __future__ import annotations
 
+import datetime as dt
+import threading
 from typing import Any
 
 from ale_bench.code_language import CodeLanguage, JudgeVersion
+from ale_bench.error import AleBenchError
 from ale_bench.result import JudgeResult
 from ale_bench.start import start
 
@@ -29,25 +32,47 @@ logger = logging.getLogger("AleBenchEnv")
 
 # Cache sessions per problem to avoid rebuilding Rust tools repeatedly.
 # The ALE-Bench Session closes its temp tool_dir on process exit.
-_ALE_SESSIONS: dict[tuple[str, bool, str], Any] = {}
+_ALE_SESSIONS: dict[tuple[str, bool, str, int, float], Any] = {}
+
+# Lock protecting cache access and in-process session recreation. Process-based
+# executors (e.g. AsyncRewardWrapper's ProcessPoolExecutor) each have their own
+# module state, so this lock coordinates threads within one process.
+_ALE_SESSIONS_LOCK = threading.Lock()
+
+# Very long session duration (100 years in seconds) to avoid ALE-Bench's default
+# problem-defined session time limit during long-running RL training.
+_DEFAULT_SESSION_DURATION_SECONDS: float = 100.0 * 365.25 * 24.0 * 3600.0
 
 
 def _get_session(
-    problem_id: str, lite_version: bool, log_dir: str, num_workers: int = 1
+    problem_id: str,
+    lite_version: bool,
+    log_dir: str,
+    num_workers: int = 1,
+    session_duration_seconds: float = _DEFAULT_SESSION_DURATION_SECONDS,
 ):
     """Get or create an ALE-Bench session for the problem."""
-    key = (problem_id, lite_version, log_dir, num_workers)
-    if key not in _ALE_SESSIONS:
-        session = start(
-            problem_id=problem_id,
-            lite_version=lite_version,
-            use_same_time_scale=False,
-            session_duration=None,
-            num_workers=num_workers,
-            run_visualization_server=False,
-        )
+    key = (problem_id, lite_version, log_dir, num_workers, session_duration_seconds)
+    with _ALE_SESSIONS_LOCK:
+        session = _ALE_SESSIONS.get(key)
+        if session is not None:
+            return session
+    # Create the session outside the lock so other threads are not blocked by the
+    # potentially slow tool-build step.
+    session = start(
+        problem_id=problem_id,
+        lite_version=lite_version,
+        use_same_time_scale=False,
+        session_duration=dt.timedelta(seconds=session_duration_seconds),
+        num_workers=num_workers,
+        run_visualization_server=False,
+    )
+    with _ALE_SESSIONS_LOCK:
+        # If another thread already created one while we were building, prefer it.
+        if key in _ALE_SESSIONS:
+            return _ALE_SESSIONS[key]
         _ALE_SESSIONS[key] = session
-    return _ALE_SESSIONS[key]
+        return session
 
 
 class AleBenchEnv(BaseEnv):
@@ -66,6 +91,9 @@ class AleBenchEnv(BaseEnv):
         maximize: If True, higher score is better. If None, inferred from the
             problem's ``score_type``.
         code_language: Language string expected from the model, e.g. ``"cpp20"``.
+        session_duration_seconds: ALE-Bench session duration in seconds. Defaults
+            to ~100 years to avoid the problem-defined contest time limit during
+            long RL training runs.
     """
 
     def __init__(
@@ -78,6 +106,7 @@ class AleBenchEnv(BaseEnv):
         reward_scale: float | None = None,
         maximize: bool | None = None,
         code_language: str = "cpp20",
+        session_duration_seconds: float = _DEFAULT_SESSION_DURATION_SECONDS,
     ):
         self.problem_id = problem_id
         self.lite_version = lite_version
@@ -85,6 +114,7 @@ class AleBenchEnv(BaseEnv):
         self.log_dir = log_dir
         self.num_cpus = num_cpus
         self.code_language = code_language
+        self.session_duration_seconds = session_duration_seconds
 
         # Map string code_language to ale_bench CodeLanguage enum.
         self._code_language_enum = getattr(CodeLanguage, code_language.upper(), None)
@@ -95,7 +125,11 @@ class AleBenchEnv(BaseEnv):
             )
 
         self.session = _get_session(
-            problem_id, lite_version, log_dir, num_workers=num_cpus
+            problem_id,
+            lite_version,
+            log_dir,
+            num_workers=num_cpus,
+            session_duration_seconds=session_duration_seconds,
         )
         self.problem = self.session.problem
         self.standings = self.session._standings
@@ -193,26 +227,88 @@ Rules:
 - Make sure you /think carefully before coding by learning from previous code and feedback.
 """
 
+    def _recreate_session(self) -> None:
+        """Drop the cached ALE-Bench session and create a fresh one.
+
+        ALE-Bench sessions can finish when their time or resource budget is
+        exhausted. Recreating gives the trainer a fresh budget while keeping the
+        same problem, standings, and reward-scale configuration.
+
+        This method is atomic with respect to other threads in the same process
+        that are also recreating or fetching the cached session.
+        """
+        key = (
+            self.problem_id,
+            self.lite_version,
+            self.log_dir,
+            self.num_cpus,
+            self.session_duration_seconds,
+        )
+        with _ALE_SESSIONS_LOCK:
+            _ALE_SESSIONS.pop(key, None)
+            # Build the new session while holding the lock so concurrent
+            # recreations of the same key do not waste work.
+            session = start(
+                problem_id=self.problem_id,
+                lite_version=self.lite_version,
+                use_same_time_scale=False,
+                session_duration=dt.timedelta(seconds=self.session_duration_seconds),
+                num_workers=self.num_cpus,
+                run_visualization_server=False,
+            )
+            _ALE_SESSIONS[key] = session
+        self.session = session
+        self.problem = self.session.problem
+        self.standings = self.session._standings
+        logger.info(
+            f"[AleBenchEnv] recreated session for {self.problem_id} "
+            f"(duration={self.session_duration_seconds:.0f}s)"
+        )
+
+    def _eval_code(self, code: str) -> Any:
+        """Run ALE-Bench evaluation, recreating the session if it has finished."""
+        max_retries = 1
+        last_error: Exception | None = None
+        for attempt in range(max_retries + 1):
+            try:
+                if hasattr(self.session, "public_eval"):
+                    return self.session.public_eval(
+                        code=code,
+                        code_language=self._code_language_enum,
+                    )
+                else:
+                    return self.session.case_eval(
+                        input_str=self.session._public_inputs,
+                        code=code,
+                        code_language=self._code_language_enum,
+                        judge_version=JudgeVersion.V202301,
+                        time_limit=self.problem.constraints.time_limit,
+                        memory_limit=self.problem.constraints.memory_limit,
+                        skip_local_visualization=True,
+                    )
+            except AleBenchError as e:
+                last_error = e
+                error_msg = str(e)
+                if "session is finished" in error_msg.lower() and attempt < max_retries:
+                    logger.warning(
+                        f"[AleBenchEnv] session finished on attempt {attempt + 1}, "
+                        f"recreating session and retrying"
+                    )
+                    self._recreate_session()
+                else:
+                    break
+        raise (
+            last_error
+            if last_error is not None
+            else RuntimeError("_eval_code failed without raising an exception")
+        )
+
     def execute(self, code: str, state: State) -> EnvResult:
         """Evaluate the generated C++ code on the ALE-Bench public cases."""
         # ALE-Bench's official API is session.public_eval(code, code_language=...).
         # Fallback to the lower-level case_eval if public_eval is unavailable.
         try:
-            if hasattr(self.session, "public_eval"):
-                result = self.session.public_eval(
-                    code=code,
-                    code_language=self._code_language_enum,
-                )
-            else:
-                result = self.session.case_eval(
-                    input_str=self.session._public_inputs,
-                    code=code,
-                    code_language=self._code_language_enum,
-                    judge_version=JudgeVersion.V202301,
-                    time_limit=self.problem.constraints.time_limit,
-                    memory_limit=self.problem.constraints.memory_limit,
-                    skip_local_visualization=True,
-                )
+            result = self._eval_code(code)
         except Exception as e:
             logger.warning(f"[AleBenchEnv] evaluation failed: {e}", exc_info=True)
             self._log_failed_code(code, fail_type="execution_error", error_msg=str(e))

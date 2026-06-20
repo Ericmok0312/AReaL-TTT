@@ -588,6 +588,9 @@ def create_env_from_config(config):
             log_dir=config.saver.fileroot,
             num_cpus=getattr(config.sampler, "num_cpus", 2),
             reward_scale=getattr(config.sampler, "reward_scale", None),
+            session_duration_seconds=getattr(
+                config.sampler, "ale_bench_session_duration_seconds", None
+            ),
         )
     else:
         raise ValueError(f"Unknown env_type: {env_type}")

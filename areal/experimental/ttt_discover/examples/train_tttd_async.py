@@ -23,6 +23,7 @@ import sys
 import time
 from typing import Any
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -707,6 +708,7 @@ class TTTDPPOTrainer(PPOTrainer):
         batch_size = config.sampler.batch_size
         group_size = config.gconfig.n_samples
         best_reward = float("-inf")
+        best_raw_score = float("-inf")
 
         # DEBUG: Log critical values
         logger.info(
@@ -1082,6 +1084,21 @@ class TTTDPPOTrainer(PPOTrainer):
             step_max_reward = float(step_rewards.max())
             step_mean_reward = float(step_rewards.mean())
 
+            # Compute raw score statistics (if available; NaN means unavailable)
+            if "raw_scores" in rollout_batch:
+                step_raw_scores = rollout_batch["raw_scores"].cpu().numpy()
+                local_raw_max = (
+                    float(np.nanmax(step_raw_scores))
+                    if np.any(~np.isnan(step_raw_scores))
+                    else float("-inf")
+                )
+                local_raw_sum = float(np.nansum(step_raw_scores))
+                local_raw_count = int(np.sum(~np.isnan(step_raw_scores)))
+            else:
+                local_raw_max = float("-inf")
+                local_raw_sum = 0.0
+                local_raw_count = 0
+
             # Global reward statistics (All-Reduce)
             if dist.is_initialized():
                 local_max = torch.tensor(
@@ -1103,10 +1120,44 @@ class TTTDPPOTrainer(PPOTrainer):
                     (local_sum / local_count).item() if local_count.item() > 0 else 0.0
                 )
                 global_rollouts = int(local_count.item())
+
+                # Global raw score statistics
+                local_raw_max_t = torch.tensor(
+                    [local_raw_max], dtype=torch.float32, device=self.actor.device
+                )
+                local_raw_sum_t = torch.tensor(
+                    [local_raw_sum], dtype=torch.float32, device=self.actor.device
+                )
+                local_raw_count_t = torch.tensor(
+                    [local_raw_count], dtype=torch.float32, device=self.actor.device
+                )
+                dist.all_reduce(local_raw_max_t, op=dist.ReduceOp.MAX)
+                dist.all_reduce(local_raw_sum_t, op=dist.ReduceOp.SUM)
+                dist.all_reduce(local_raw_count_t, op=dist.ReduceOp.SUM)
+                step_max_raw_score = (
+                    local_raw_max_t.item()
+                    if local_raw_count_t.item() > 0
+                    else float("nan")
+                )
+                step_mean_raw_score = (
+                    (local_raw_sum_t / local_raw_count_t).item()
+                    if local_raw_count_t.item() > 0
+                    else float("nan")
+                )
             else:
                 global_rollouts = local_rollouts
+                step_max_raw_score = (
+                    local_raw_max if local_raw_count > 0 else float("nan")
+                )
+                step_mean_raw_score = (
+                    local_raw_sum / local_raw_count
+                    if local_raw_count > 0
+                    else float("nan")
+                )
 
             best_reward = max(best_reward, step_max_reward)
+            if not np.isnan(step_max_raw_score):
+                best_raw_score = max(best_raw_score, step_max_raw_score)
 
             # === Actor policy update token counting for MFU calculation ===
             # loss_mask indicates which tokens actually participate in policy gradient computation
@@ -1145,6 +1196,8 @@ class TTTDPPOTrainer(PPOTrainer):
                 "global_rollouts": global_rollouts,
                 "step_max_reward": step_max_reward,
                 "step_mean_reward": step_mean_reward,
+                "step_max_raw_score": step_max_raw_score,
+                "step_mean_raw_score": step_mean_raw_score,
                 "rollout_total_tokens": global_rollout_tokens,
                 "actor_update_tokens": global_actor_update_tokens,
                 "local_rollout_total_tokens": rollout_total_tokens,
@@ -1209,6 +1262,10 @@ class TTTDPPOTrainer(PPOTrainer):
                 "reward/mean": step_mean_reward,
                 "reward/best_overall": best_reward,
             }
+            if not np.isnan(step_max_raw_score):
+                metrics["raw_score/max"] = step_max_raw_score
+                metrics["raw_score/mean"] = step_mean_raw_score
+                metrics["raw_score/best_overall"] = best_raw_score
 
             if config.actor.should_compute_prox_logp():
                 prox_logp_list = self.actor.compute_logp([rollout_batch])
@@ -1292,8 +1349,15 @@ class TTTDPPOTrainer(PPOTrainer):
                     global_step=global_step,
                     data=metrics,
                 )
+                raw_score_str = ""
+                if not np.isnan(step_max_raw_score):
+                    raw_score_str = (
+                        f"RawScore: max={step_max_raw_score:.4f}, "
+                        f"mean={step_mean_raw_score:.4f}, best={best_raw_score:.4f} | "
+                    )
                 logger.info(
                     f"[Step {global_step}] Reward: max={step_max_reward:.4f}, mean={step_mean_reward:.4f}, best={best_reward:.4f} | "
+                    f"{raw_score_str}"
                     f"Loss: {metrics['train/actor_loss']:.4f}, KL: {metrics['train/approx_kl']:.4f}, "
                     f"Entropy: {metrics['train/entropy']:.4f}, GradNorm: {metrics['train/grad_norm']:.4f}, LR: {metrics['train/lr']:.6f} | "
                     f"Tokens: rollout={global_rollout_tokens}, actor_update={global_actor_update_tokens}"
@@ -1384,6 +1448,9 @@ class TTTDPPOTrainer(PPOTrainer):
             )
 
             if is_dp_head:
+                raw_score_timing_str = ""
+                if not np.isnan(step_max_raw_score):
+                    raw_score_timing_str = f"raw_score={step_max_raw_score:.4f} | "
                 # Log detailed timing breakdown if available
                 if timing_stats:
                     logger.info(
@@ -1393,6 +1460,7 @@ class TTTDPPOTrainer(PPOTrainer):
                         f"training={training_time:.2f}s | "
                         f"total={step_total:.2f}s | "
                         f"reward={step_max_reward:.4f} | "
+                        f"{raw_score_timing_str}"
                         f"n={timing_stats.get('n_rollouts', 0)}"
                     )
                 else:
@@ -1402,7 +1470,8 @@ class TTTDPPOTrainer(PPOTrainer):
                         f"exec_tail={execute_tail:.2f}s | "
                         f"training={training_time:.2f}s | "
                         f"total={step_total:.2f}s | "
-                        f"reward={step_max_reward:.4f}"
+                        f"reward={step_max_reward:.4f} | "
+                        f"{raw_score_timing_str}"
                     )
 
             # Save Training History Checkpoint AFTER recording step data

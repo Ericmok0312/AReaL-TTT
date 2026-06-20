@@ -416,6 +416,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         self,
         resp: ModelResponse,
         reward: float,
+        raw_score: float | None = None,
         state: State | None = None,
         breakthrough_child: State | None = None,
     ) -> dict[str, torch.Tensor]:
@@ -432,6 +433,10 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             "versions": torch.tensor(versions, dtype=torch.int32).unsqueeze(0),
             "attention_mask": torch.ones(len(seq), dtype=torch.bool).unsqueeze(0),
             "rewards": torch.tensor([reward], dtype=torch.float32),
+            "raw_scores": torch.tensor(
+                [raw_score if raw_score is not None else float("nan")],
+                dtype=torch.float32,
+            ),
             "_student_prompts": [
                 self._get_prompt(state, use_hint=False) if state is not None else ""
             ],
@@ -462,6 +467,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         error_msg: str = "",
         resp: ModelResponse | None = None,
         breakthrough_child: State | None = None,
+        raw_score: float | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Create a trajectory for failed rollouts.
@@ -497,6 +503,10 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 "versions": torch.tensor(versions, dtype=torch.int32).unsqueeze(0),
                 "attention_mask": torch.ones(len(seq), dtype=torch.bool).unsqueeze(0),
                 "rewards": torch.tensor([result.reward], dtype=torch.float32),
+                "raw_scores": torch.tensor(
+                    [raw_score if raw_score is not None else float("nan")],
+                    dtype=torch.float32,
+                ),
             }
         else:
             # Fallback: no response available (e.g. missing state, engine exception)
@@ -601,8 +611,14 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             fail_type_info = (
                 f", fail_type={result.fail_type}" if result.fail_type else ""
             )
+            raw_score_info = ""
+            if result.metadata is not None:
+                raw_score = result.metadata.get("avg_raw_score")
+                if raw_score is not None:
+                    raw_score_info = f", raw_score={float(raw_score):.4f}"
             logger.info(
-                f"reward={result.reward:.4f}, valid={result.is_valid}, exec_time={exec_time_ms:.1f}ms, elapsed={elapsed:.1f}s{fail_type_info}"
+                f"reward={result.reward:.4f}, valid={result.is_valid}{raw_score_info}, "
+                f"exec_time={exec_time_ms:.1f}ms, elapsed={elapsed:.1f}s{fail_type_info}"
             )
 
         except Exception as e:
@@ -614,11 +630,16 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             )
             extracted_code = code  # Use originally extracted code on failure
 
-        stats_tracker.get("rollout").scalar(
-            reward=result.reward,
-            is_valid=float(result.is_valid),
-            exec_time_ms=exec_time_ms,
-        )
+        rollout_scalar_kwargs = {
+            "reward": result.reward,
+            "is_valid": float(result.is_valid),
+            "exec_time_ms": exec_time_ms,
+        }
+        if result.metadata is not None:
+            raw_score = result.metadata.get("avg_raw_score")
+            if raw_score is not None:
+                rollout_scalar_kwargs["raw_score"] = float(raw_score)
+        stats_tracker.get("rollout").scalar(**rollout_scalar_kwargs)
 
         if gpu_done_time is not None:
             self._rollout_timing_pairs.append((gpu_done_time, time.perf_counter()))
@@ -1101,15 +1122,26 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
 
             # Create trajectory - use failed trajectory for invalid results
             if result.is_valid:
+                raw_score = (
+                    result.metadata.get("avg_raw_score")
+                    if result.metadata is not None
+                    else None
+                )
                 trajectory = self._create_trajectory(
                     resp,
                     reward,
+                    raw_score=raw_score,
                     state=state,
                     breakthrough_child=data.get("_breakthrough_child"),
                 )
             else:
                 # Use fail_type from result if available, otherwise default to execution_error
                 fail_type = result.fail_type or "execution_error"
+                raw_score = (
+                    result.metadata.get("avg_raw_score")
+                    if result.metadata is not None
+                    else None
+                )
                 trajectory = self._create_failed_trajectory(
                     state=state,
                     input_ids=input_ids,
@@ -1117,6 +1149,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                     error_msg=result.observation,
                     resp=resp,
                     breakthrough_child=data.get("_breakthrough_child"),
+                    raw_score=raw_score,
                 )
 
             # Create child state and buffer sampler update (thread-safe)
