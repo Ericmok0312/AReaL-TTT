@@ -310,10 +310,13 @@ Rules:
         num_cases: int | None = None,
     ) -> None:
         """Log a failed rollout's code and diagnostic info for debugging."""
+        # Failure details are verbose and bloat trainer logs when many rollouts
+        # fail (common during early training). Keep everything at debug level so
+        # the info is available on demand without spamming the default output.
         header = f"[AleBenchEnv][FAILED ROLLOUT][{self.problem_id}] type={fail_type}"
         if num_accepted is not None and num_cases is not None:
             header += f" passed={num_accepted}/{num_cases}"
-        logger.warning(header)
+        logger.debug(header)
 
         # Print the extracted code (truncated if extremely long).
         code_lines = code.splitlines()
@@ -321,10 +324,9 @@ Rules:
         preview = "\n".join(preview_lines)
         if len(code_lines) > 80:
             preview += "\n...(truncated)..."
-        logger.warning(f"Extracted code:\n```cpp\n{preview}\n```")
+        logger.debug(f"Extracted code:\n```cpp\n{preview}\n```")
 
-        # Print the diagnostic message.
-        logger.warning(f"Diagnostic:\n{error_msg}")
+        logger.debug(f"Diagnostic:\n{error_msg}")
 
     def create_state(
         self,
