@@ -296,6 +296,7 @@ class AleBenchState(State):
 
     code: str  # the code that generated the result
     raw_score: float | None  # average raw score before scaling/negation
+    parent_raw_scores: list[float]  # ancestor raw scores (most recent first)
 
     def __init__(
         self,
@@ -303,6 +304,7 @@ class AleBenchState(State):
         code: str,
         value: float = None,
         raw_score: float | None = None,
+        parent_raw_scores: list[float] = None,
         parent_values: list[float] = None,
         parents: list[dict] = None,
         id: str = None,
@@ -311,6 +313,9 @@ class AleBenchState(State):
         super().__init__(timestep, value, parent_values, parents, id, observation)
         self.code = code
         self.raw_score = raw_score
+        self.parent_raw_scores = (
+            parent_raw_scores if parent_raw_scores is not None else []
+        )
 
     def to_dict(self) -> dict:
         return {
@@ -319,6 +324,7 @@ class AleBenchState(State):
             "timestep": self.timestep,
             "value": self.value,
             "raw_score": self.raw_score,
+            "parent_raw_scores": self.parent_raw_scores,
             "parent_values": self.parent_values,
             "parents": self.parents,
             "exec_time_ms": self.exec_time_ms,
@@ -356,17 +362,46 @@ class AleBenchState(State):
             # raw_score is already in the original problem metric domain, so we
             # do not negate it for minimize problems; the direction text tells the
             # model whether lower or higher is better.
-            current_gap = target - current_raw if maximize else current_raw - target
             value_ctx += (
                 f"\nCurrent {metric_name} ({improvement_direction} is better): "
                 f"{current_raw:.6f}"
             )
-            value_ctx += (
-                f"\nTarget: {target}. Current gap: {current_gap:.6f}. "
-                f"Further improvements will also be generously rewarded."
-            )
+            if target is not None:
+                current_gap = target - current_raw if maximize else current_raw - target
+                value_ctx += (
+                    f"\nTarget: {target}. Current gap: {current_gap:.6f}. "
+                    f"Further improvements will also be generously rewarded."
+                )
+            else:
+                # No global target: emphasize relative improvement over the
+                # previous attempt. This avoids overwhelming the model with a
+                # huge absolute gap (e.g. AHC011 raw scores in the billions).
+                prev_raw = (
+                    self.parent_raw_scores[0]
+                    if self.parent_raw_scores
+                    else None
+                )
+                if prev_raw is not None:
+                    value_ctx += (
+                        f"\nPrevious {metric_name}: {prev_raw:.6f}. "
+                        f"There is no fixed boundary for the score; keep improving step by step. "
+                        f"Further improvements will also be generously rewarded."
+                    )
+                else:
+                    value_ctx += (
+                        "\nThere is no fixed boundary for the score. "
+                        "Keep improving this score step by step. "
+                        "Even small improvements over the previous attempt are valuable. "
+                        "Further improvements will also be generously rewarded."
+                    )
         else:
-            value_ctx += f"\nTarget {metric_name}: {target}"
+            if target is not None:
+                value_ctx += f"\nTarget {metric_name}: {target}"
+            else:
+                value_ctx += (
+                    f"\nOptimize {metric_name} to be as "
+                    f"{improvement_direction} as possible."
+                )
 
         if self.observation and self.observation.strip():
             stdout = self.observation.strip()
@@ -385,6 +420,7 @@ class AleBenchState(State):
             code=d["code"],
             value=d.get("value"),
             raw_score=d.get("raw_score"),
+            parent_raw_scores=d.get("parent_raw_scores", []),
             parent_values=d.get("parent_values", []),
             parents=d.get("parents", []),
             id=d.get("id"),

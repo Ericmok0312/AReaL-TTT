@@ -198,7 +198,8 @@ class AleBenchEnv(BaseEnv):
         example_output = getattr(self.problem, "example_output", "")
 
         value_context = state.to_prompt(
-            target=self.target_raw_score,
+            target=None,  # Do not show the global target/gap; let the model focus
+            # on incremental improvement instead of a potentially overwhelming gap.
             metric_name="score",
             maximize=self.maximize,
             language=self.code_language,
@@ -431,11 +432,15 @@ Rules:
         timestep: int,
     ) -> AleBenchState:
         """Create a new AleBenchState child from the execution result."""
+        parent_raw_score = getattr(parent_state, "raw_score", None)
         return AleBenchState(
             timestep=timestep,
             code=code,
             value=float(reward),
             raw_score=result.metadata.get("avg_raw_score") if result.metadata else None,
+            parent_raw_scores=[parent_raw_score]
+            if parent_raw_score is not None
+            else [],
             observation=result.observation,
             parent_values=[parent_state.value]
             if parent_state.value is not None
