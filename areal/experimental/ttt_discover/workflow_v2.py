@@ -613,9 +613,15 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             )
             raw_score_info = ""
             if result.metadata is not None:
-                raw_score = result.metadata.get("raw_score")
-                if raw_score is not None:
-                    raw_score_info = f", raw_score={float(raw_score):.4f}"
+                avg_raw_score = result.metadata.get("avg_raw_score")
+                total_raw_score = result.metadata.get("total_raw_score")
+                if avg_raw_score is None:
+                    avg_raw_score = result.metadata.get("raw_score")
+                if avg_raw_score is not None and total_raw_score is not None:
+                    raw_score_info = (
+                        f", avg_raw_score={float(avg_raw_score):.4f}, "
+                        f"total_raw_score={float(total_raw_score):.4f}"
+                    )
             logger.info(
                 f"reward={result.reward:.4f}, valid={result.is_valid}{raw_score_info}, "
                 f"exec_time={exec_time_ms:.1f}ms, elapsed={elapsed:.1f}s{fail_type_info}"
