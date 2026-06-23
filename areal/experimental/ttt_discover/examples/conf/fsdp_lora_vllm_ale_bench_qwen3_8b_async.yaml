@@ -158,7 +158,6 @@ sampler:
   ale_bench_lite_version: false
   # AHC011 full has max standing score ~2.69B. Use a smaller scale so that
   # early-training raw scores (e.g. 5e4) produce visible rewards (~0.5).
-  reward_scale: 100000.0
   eval_timeout: 600
   num_cpus: 2
   budget_s: 1100
