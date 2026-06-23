@@ -613,7 +613,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             )
             raw_score_info = ""
             if result.metadata is not None:
-                raw_score = result.metadata.get("avg_raw_score")
+                raw_score = result.metadata.get("raw_score")
                 if raw_score is not None:
                     raw_score_info = f", raw_score={float(raw_score):.4f}"
             logger.info(
@@ -636,7 +636,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             "exec_time_ms": exec_time_ms,
         }
         if result.metadata is not None:
-            raw_score = result.metadata.get("avg_raw_score")
+            raw_score = result.metadata.get("raw_score")
             if raw_score is not None:
                 rollout_scalar_kwargs["raw_score"] = float(raw_score)
         stats_tracker.get("rollout").scalar(**rollout_scalar_kwargs)
@@ -1123,7 +1123,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             # Create trajectory - use failed trajectory for invalid results
             if result.is_valid:
                 raw_score = (
-                    result.metadata.get("avg_raw_score")
+                    result.metadata.get("raw_score")
                     if result.metadata is not None
                     else None
                 )
@@ -1138,7 +1138,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 # Use fail_type from result if available, otherwise default to execution_error
                 fail_type = result.fail_type or "execution_error"
                 raw_score = (
-                    result.metadata.get("avg_raw_score")
+                    result.metadata.get("raw_score")
                     if result.metadata is not None
                     else None
                 )

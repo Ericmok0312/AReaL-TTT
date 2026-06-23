@@ -332,22 +332,22 @@ Rules:
             for c in case_results
             if getattr(c, "judge_result", None) == JudgeResult.ACCEPTED
         )
-        total_raw_score = sum(
-            float(getattr(c, "absolute_score", 0.0)) for c in case_results
-        )
+        # Use ALE-Bench's official aggregate score (sum over all public cases).
+        total_raw_score = float(getattr(result, "overall_absolute_score", 0.0))
         avg_raw_score = total_raw_score / num_cases if num_cases > 0 else 0.0
         if self.maximize:
-            reward = avg_raw_score / self.reward_scale
+            reward = total_raw_score / self.reward_scale
         else:
             # Negate so higher reward always means better performance.
-            reward = -avg_raw_score / self.reward_scale
+            reward = -total_raw_score / self.reward_scale
 
         # Build a detailed observation for the LLM. Include per-case results and
         # the first few failure messages so the model can iterate on bugs.
         lines = [
             f"Evaluated on {num_cases} public cases.",
             f"Passed: {num_accepted}/{num_cases}.",
-            f"Avg raw score: {avg_raw_score:.4f}.",
+            f"Total raw score: {total_raw_score:.4f}.",
+            f"Avg raw score per case: {avg_raw_score:.4f}.",
             f"Overall judge: {getattr(result, 'overall_judge_result', None) and result.overall_judge_result.value or 'N/A'}.",
         ]
 
@@ -391,6 +391,7 @@ Rules:
                 "num_accepted": num_accepted,
                 "avg_raw_score": avg_raw_score,
                 "total_raw_score": total_raw_score,
+                "raw_score": total_raw_score,
                 "reward_scale": self.reward_scale,
                 "overall_judge_result": getattr(result, "overall_judge_result", None),
             },
@@ -437,7 +438,9 @@ Rules:
             timestep=timestep,
             code=code,
             value=float(reward),
-            raw_score=result.metadata.get("avg_raw_score") if result.metadata else None,
+            raw_score=result.metadata.get("total_raw_score")
+            if result.metadata
+            else None,
             parent_raw_scores=[parent_raw_score]
             if parent_raw_score is not None
             else [],
