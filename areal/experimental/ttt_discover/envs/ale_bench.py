@@ -332,7 +332,11 @@ Rules:
             for c in case_results
             if getattr(c, "judge_result", None) == JudgeResult.ACCEPTED
         )
-        # Use ALE-Bench's official aggregate score (sum over all public cases).
+        # ALE-Bench's official aggregate score is the sum over all public cases.
+        # We keep both total and per-case average: reward is computed on the total
+        # so that the scale lines up with the private standings, while the
+        # ``raw_score`` exposed to the LLM prompt is the per-case average (matching
+        # the original TTT-Discover AHC implementation).
         total_raw_score = float(getattr(result, "overall_absolute_score", 0.0))
         avg_raw_score = total_raw_score / num_cases if num_cases > 0 else 0.0
         if self.maximize:
@@ -391,7 +395,7 @@ Rules:
                 "num_accepted": num_accepted,
                 "avg_raw_score": avg_raw_score,
                 "total_raw_score": total_raw_score,
-                "raw_score": total_raw_score,
+                "raw_score": avg_raw_score,
                 "reward_scale": self.reward_scale,
                 "overall_judge_result": getattr(result, "overall_judge_result", None),
             },
@@ -438,9 +442,7 @@ Rules:
             timestep=timestep,
             code=code,
             value=float(reward),
-            raw_score=result.metadata.get("total_raw_score")
-            if result.metadata
-            else None,
+            raw_score=result.metadata.get("raw_score") if result.metadata else None,
             parent_raw_scores=[parent_raw_score]
             if parent_raw_score is not None
             else [],
