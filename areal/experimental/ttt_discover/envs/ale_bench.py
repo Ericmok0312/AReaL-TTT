@@ -225,6 +225,21 @@ class AleBenchEnv(BaseEnv):
             language=self.code_language,
         )
 
+        time_limit = getattr(self.problem.constraints, "time_limit", None)
+        memory_limit = getattr(self.problem.constraints, "memory_limit", None)
+        constraints_section = ""
+        if time_limit is not None or memory_limit is not None:
+            constraints_lines = ["\n--- Constraints ---\n"]
+            if time_limit is not None:
+                constraints_lines.append(
+                    f"- Time limit: {time_limit} seconds per test case"
+                )
+            if memory_limit is not None:
+                constraints_lines.append(
+                    f"- Memory limit: {memory_limit / 1024 / 1024:.0f} MB"
+                )
+            constraints_section = "\n".join(constraints_lines)
+
         example_section = ""
         if example_input.strip() or example_output.strip():
             example_section = "\n--- Example Input/Output ---\n"
@@ -238,7 +253,7 @@ class AleBenchEnv(BaseEnv):
 Below is the full problem statement. Read it carefully and write a complete C++20 program that solves it.
 
 --- Problem Statement ---
-{problem_statement}{example_section}
+{problem_statement}{constraints_section}{example_section}
 
 --- Tool README ---
 {tool_readme}
