@@ -178,16 +178,23 @@ class AleBenchEnv(BaseEnv):
         positive_scores = [s for _, s in self.standings.standings_scores if s > 0]
         best_raw_score = positive_scores[0] if positive_scores else 0.0
         worst_raw_score = positive_scores[-1] if positive_scores else 0.0
-        self.target_raw_score = best_raw_score
-        self.target_score = best_raw_score / self.reward_scale
+        # NOTE: standings scores are what the original contest used for ranking.
+        # They are already "higher is better" by construction:
+        #   - maximize problems: sum of absolute per-case scores
+        #   - minimize problems: sum of relative per-case scores
+        #   - special problems (e.g. ahc025): sum of rank scores
+        # The values returned by ALE-Bench as "overall_absolute_score" are these
+        # standing scores, not a normalized performance metric.
+        self.best_standings_score = best_raw_score
+        self.best_normalized_score = best_raw_score / self.reward_scale
 
         logger.info(
             f"[AleBenchEnv] problem_id={problem_id} lite_version={lite_version} "
             f"score_type={self.problem.metadata.score_type.value} "
             f"maximize={self.maximize} reward_scale={self.reward_scale:.4f} "
-            f"target_raw_score={self.target_raw_score:.4f} "
-            f"worst_raw_score={worst_raw_score:.4f} "
-            f"target_score={self.target_score:.4f}"
+            f"best_standings_score={self.best_standings_score:.4f} "
+            f"worst_standings_score={worst_raw_score:.4f} "
+            f"best_normalized_score={self.best_normalized_score:.4f}"
         )
 
     def get_prompt(self, state: State) -> str:
@@ -382,11 +389,35 @@ Rules:
                 num_accepted=num_accepted,
                 num_cases=num_cases,
             )
+            # Treat any non-accepted case as a failure. For minimization problems
+            # the partial raw score can be misleadingly good (close to 0), so we
+            # return a reward worse than the worst valid score instead.
+            failure = self.get_failure_result(
+                state=state,
+                fail_type="case_failed",
+                error_msg=observation,
+            )
+            failure.metadata = failure.metadata or {}
+            failure.metadata.update(
+                {
+                    "problem_id": self.problem_id,
+                    "num_cases": num_cases,
+                    "num_accepted": num_accepted,
+                    "avg_raw_score": avg_raw_score,
+                    "total_raw_score": total_raw_score,
+                    "raw_score": avg_raw_score,
+                    "reward_scale": self.reward_scale,
+                    "overall_judge_result": getattr(
+                        result, "overall_judge_result", None
+                    ),
+                }
+            )
+            return failure
 
         return EnvResult(
             reward=float(reward),
             observation=observation,
-            is_valid=num_accepted == num_cases,
+            is_valid=True,
             metadata={
                 "problem_id": self.problem_id,
                 "num_cases": num_cases,
@@ -484,14 +515,19 @@ Rules:
     ) -> EnvResult:
         """Return a failure result worse than the worst valid score.
 
-        The base implementation uses ``reward=0.0`` for most failures, which is
-        appropriate for maximization problems but misleading for minimization
-        (where ``0.0`` corresponds to the best possible raw score). We override
+        The base implementation uses ``reward=0.0`` for most failures. For
+        maximization problems this is merely a poor score, but for minimization
+        problems it can be better than many valid solutions (whose rewards are
+        negative because we negate the average absolute raw score). We override
         the reward so that failures are always worse than the worst valid score,
         regardless of the optimization direction.
         """
         result = super().get_failure_result(state, fail_type, error_msg)
-        result.reward = -max(1.0, abs(self.target_score)) * 2.0
+        # Failure reward must be worse than any plausible valid score.
+        # since best normalized score is already converted to "higher the better" for both maximization and minimization problems
+        # For minimization problems, we can set the failure reward to be negative of the best normalized score multiplied by a factor (e.g., 2.0) to ensure it's worse than the worst valid score.
+        # Note that we use average absolute raw score from ALE bench to compute the reward, which is strictly aligns to the context of minimization and maximization (i.e. lower the better and higher the better)
+        result.reward = -abs(self.best_normalized_score) * 2.0
         return result
 
 
