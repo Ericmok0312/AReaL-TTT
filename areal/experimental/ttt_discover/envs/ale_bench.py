@@ -379,7 +379,12 @@ Rules:
             # Reciprocal so higher reward always means better performance.
             # Valid rewards are strictly positive; failure reward=0 is then
             # worse than any valid solution.
-            reward = 1.0 / (1e-8 + normalized_avg_raw_score)
+            # For partial case failures (num_accepted < num_cases) avg_raw_score
+            # can be 0, which would make the reciprocal explode. Use 0 for those.
+            if num_accepted < num_cases:
+                reward = 0.0
+            else:
+                reward = 1.0 / (1e-8 + normalized_avg_raw_score)
 
         # Build a detailed observation for the LLM. Include per-case results and
         # the first few failure messages so the model can iterate on bugs.
