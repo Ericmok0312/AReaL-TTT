@@ -10,6 +10,19 @@ single problem_id; launch multiple runs for ALE-Bench lite's 10 problems.
 This module imports the official ``ale_bench`` package (installed from
 ``https://github.com/SakanaAI/ALE-Bench``). It relies on Docker to compile
 and run C++/Rust judge code, so a working Docker daemon is required.
+
+ALE-Bench score terminology used in this module:
+
+- ``performance`` / ``relative score`` / ``standing score``: A normalized score
+  where higher is always better, regardless of the original problem type. This
+  is what ALE-Bench uses for historical rankings and for ``reward_scale``.
+- ``absolute raw score``: The raw per-case score returned by the judge. For
+  minimization problems lower is better; for maximization problems higher is
+  better. This is what we use to compute the training reward.
+
+In other words, the reward follows the original problem semantics
+(minimization = lower absolute raw score is better), while the standing-based
+values are only used as a normalization reference.
 """
 
 from __future__ import annotations
@@ -344,11 +357,14 @@ Rules:
         # basis, matching the original TTT-Discover AHC implementation.
         total_raw_score = float(getattr(result, "overall_absolute_score", 0.0))
         avg_raw_score = total_raw_score / num_cases if num_cases > 0 else 0.0
+        normalized_avg_raw_score = avg_raw_score / self.reward_scale
         if self.maximize:
-            reward = avg_raw_score / self.reward_scale
+            reward = normalized_avg_raw_score
         else:
-            # Negate so higher reward always means better performance.
-            reward = -avg_raw_score / self.reward_scale
+            # Reciprocal so higher reward always means better performance.
+            # Valid rewards are strictly positive; failure reward=0 is then
+            # worse than any valid solution.
+            reward = 1.0 / (1e-8 + normalized_avg_raw_score)
 
         # Build a detailed observation for the LLM. Include per-case results and
         # the first few failure messages so the model can iterate on bugs.
@@ -515,20 +531,12 @@ Rules:
     ) -> EnvResult:
         """Return a failure result worse than the worst valid score.
 
-        The base implementation uses ``reward=0.0`` for most failures. For
-        maximization problems this is merely a poor score, but for minimization
-        problems it can be better than many valid solutions (whose rewards are
-        negative because we negate the average absolute raw score). We override
-        the reward so that failures are always worse than the worst valid score,
-        regardless of the optimization direction.
+        Valid rewards are non-negative for both maximization and minimization
+        (minimization uses a positive reciprocal). Therefore ``reward=0.0`` is
+        always worse than any valid solution, and we keep the base implementation
+        unchanged.
         """
-        result = super().get_failure_result(state, fail_type, error_msg)
-        # Failure reward must be worse than any plausible valid score.
-        # since best normalized score is already converted to "higher the better" for both maximization and minimization problems
-        # For minimization problems, we can set the failure reward to be negative of the best normalized score multiplied by a factor (e.g., 2.0) to ensure it's worse than the worst valid score.
-        # Note that we use average absolute raw score from ALE bench to compute the reward, which is strictly aligns to the context of minimization and maximization (i.e. lower the better and higher the better)
-        result.reward = -abs(self.best_normalized_score) * 2.0
-        return result
+        return super().get_failure_result(state, fail_type, error_msg)
 
 
 def create_initial_state_ale_bench(problem_id: str) -> AleBenchState:
