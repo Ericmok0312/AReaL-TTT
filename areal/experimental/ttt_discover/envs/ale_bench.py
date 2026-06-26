@@ -405,35 +405,11 @@ Rules:
                 num_accepted=num_accepted,
                 num_cases=num_cases,
             )
-            # Treat any non-accepted case as a failure. For minimization problems
-            # the partial raw score can be misleadingly good (close to 0), so we
-            # return a reward worse than the worst valid score instead.
-            failure = self.get_failure_result(
-                state=state,
-                fail_type="case_failed",
-                error_msg=observation,
-            )
-            failure.metadata = failure.metadata or {}
-            failure.metadata.update(
-                {
-                    "problem_id": self.problem_id,
-                    "num_cases": num_cases,
-                    "num_accepted": num_accepted,
-                    "avg_raw_score": avg_raw_score,
-                    "total_raw_score": total_raw_score,
-                    "raw_score": avg_raw_score,
-                    "reward_scale": self.reward_scale,
-                    "overall_judge_result": getattr(
-                        result, "overall_judge_result", None
-                    ),
-                }
-            )
-            return failure
 
         return EnvResult(
             reward=float(reward),
             observation=observation,
-            is_valid=True,
+            is_valid=num_accepted == num_cases,
             metadata={
                 "problem_id": self.problem_id,
                 "num_cases": num_cases,
