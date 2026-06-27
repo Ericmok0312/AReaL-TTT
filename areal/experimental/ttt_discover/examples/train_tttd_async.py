@@ -708,7 +708,7 @@ class TTTDPPOTrainer(PPOTrainer):
         batch_size = config.sampler.batch_size
         group_size = config.gconfig.n_samples
         best_reward = float("-inf")
-        best_raw_score = float("-inf")
+        best_raw_score = None  # Will be set on the first step with valid raw scores
 
         # DEBUG: Log critical values
         logger.info(
@@ -1084,7 +1084,9 @@ class TTTDPPOTrainer(PPOTrainer):
             step_max_reward = float(step_rewards.max())
             step_mean_reward = float(step_rewards.mean())
 
-            # Compute raw score statistics (if available; NaN means unavailable)
+            # Compute raw score statistics (if available; NaN means unavailable).
+            # Raw scores preserve the problem's original semantics (e.g. lower is
+            # better for minimization problems), so we track both min and max.
             if "raw_scores" in rollout_batch:
                 step_raw_scores = rollout_batch["raw_scores"].cpu().numpy()
                 local_raw_max = (
@@ -1092,10 +1094,16 @@ class TTTDPPOTrainer(PPOTrainer):
                     if np.any(~np.isnan(step_raw_scores))
                     else float("-inf")
                 )
+                local_raw_min = (
+                    float(np.nanmin(step_raw_scores))
+                    if np.any(~np.isnan(step_raw_scores))
+                    else float("inf")
+                )
                 local_raw_sum = float(np.nansum(step_raw_scores))
                 local_raw_count = int(np.sum(~np.isnan(step_raw_scores)))
             else:
                 local_raw_max = float("-inf")
+                local_raw_min = float("inf")
                 local_raw_sum = 0.0
                 local_raw_count = 0
 
@@ -1125,6 +1133,9 @@ class TTTDPPOTrainer(PPOTrainer):
                 local_raw_max_t = torch.tensor(
                     [local_raw_max], dtype=torch.float32, device=self.actor.device
                 )
+                local_raw_min_t = torch.tensor(
+                    [local_raw_min], dtype=torch.float32, device=self.actor.device
+                )
                 local_raw_sum_t = torch.tensor(
                     [local_raw_sum], dtype=torch.float32, device=self.actor.device
                 )
@@ -1132,10 +1143,16 @@ class TTTDPPOTrainer(PPOTrainer):
                     [local_raw_count], dtype=torch.float32, device=self.actor.device
                 )
                 dist.all_reduce(local_raw_max_t, op=dist.ReduceOp.MAX)
+                dist.all_reduce(local_raw_min_t, op=dist.ReduceOp.MIN)
                 dist.all_reduce(local_raw_sum_t, op=dist.ReduceOp.SUM)
                 dist.all_reduce(local_raw_count_t, op=dist.ReduceOp.SUM)
                 step_max_raw_score = (
                     local_raw_max_t.item()
+                    if local_raw_count_t.item() > 0
+                    else float("nan")
+                )
+                step_min_raw_score = (
+                    local_raw_min_t.item()
                     if local_raw_count_t.item() > 0
                     else float("nan")
                 )
@@ -1149,15 +1166,36 @@ class TTTDPPOTrainer(PPOTrainer):
                 step_max_raw_score = (
                     local_raw_max if local_raw_count > 0 else float("nan")
                 )
+                step_min_raw_score = (
+                    local_raw_min if local_raw_count > 0 else float("nan")
+                )
                 step_mean_raw_score = (
                     local_raw_sum / local_raw_count
                     if local_raw_count > 0
                     else float("nan")
                 )
 
+            # Raw scores preserve the original problem semantics. For minimization
+            # problems the "best" raw score is the minimum; for maximization it is
+            # the maximum. Reward is always shaped to be higher=better.
+            workflow_env = getattr(self.workflow, "env", None)
+            maximize = getattr(workflow_env, "maximize", True)
+
             best_reward = max(best_reward, step_max_reward)
-            if not np.isnan(step_max_raw_score):
-                best_raw_score = max(best_raw_score, step_max_raw_score)
+            if maximize:
+                if not np.isnan(step_max_raw_score):
+                    best_raw_score = (
+                        step_max_raw_score
+                        if best_raw_score is None
+                        else max(best_raw_score, step_max_raw_score)
+                    )
+            else:
+                if not np.isnan(step_min_raw_score):
+                    best_raw_score = (
+                        step_min_raw_score
+                        if best_raw_score is None
+                        else min(best_raw_score, step_min_raw_score)
+                    )
 
             # === Actor policy update token counting for MFU calculation ===
             # loss_mask indicates which tokens actually participate in policy gradient computation
@@ -1263,9 +1301,11 @@ class TTTDPPOTrainer(PPOTrainer):
                 "reward/best_overall": best_reward,
             }
             if not np.isnan(step_max_raw_score):
+                metrics["raw_score/min"] = step_min_raw_score
                 metrics["raw_score/max"] = step_max_raw_score
                 metrics["raw_score/mean"] = step_mean_raw_score
-                metrics["raw_score/best_overall"] = best_raw_score
+                if best_raw_score is not None:
+                    metrics["raw_score/best_overall"] = best_raw_score
 
             if config.actor.should_compute_prox_logp():
                 prox_logp_list = self.actor.compute_logp([rollout_batch])
@@ -1352,8 +1392,10 @@ class TTTDPPOTrainer(PPOTrainer):
                 raw_score_str = ""
                 if not np.isnan(step_max_raw_score):
                     raw_score_str = (
-                        f"RawScore: max={step_max_raw_score:.4f}, "
-                        f"mean={step_mean_raw_score:.4f}, best={best_raw_score:.4f} | "
+                        f"RawScore: min={step_min_raw_score:.4f}, "
+                        f"max={step_max_raw_score:.4f}, "
+                        f"mean={step_mean_raw_score:.4f}, "
+                        f"best={best_raw_score:.4f} | "
                     )
                 logger.info(
                     f"[Step {global_step}] Reward: max={step_max_reward:.4f}, mean={step_mean_reward:.4f}, best={best_reward:.4f} | "
