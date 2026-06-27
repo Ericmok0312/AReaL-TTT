@@ -418,6 +418,10 @@ Rules:
         observation = "\n".join(lines)
 
         if num_accepted < num_cases:
+            logger.info(
+                f"[AleBenchEnv][{self.problem_id}] partial case results: "
+                f"passed={num_accepted}/{num_cases}, observation=\n{observation}"
+            )
             self._log_failed_code(
                 code,
                 fail_type="case_failed",
