@@ -33,8 +33,11 @@ class TTTDActor(FSDPEngine):
         super().__init__(config)
         self.actor = PPOActor(config, self)
 
-        # Validate configuration type
-        if not hasattr(config, "is_tttd_config"):
+        # Validate configuration type. is_tttd_config lives on TTTDPPOConfig (top-level),
+        # so check the actor config class directly instead.
+        from areal.experimental.ttt_discover.config import TTTDPPOActorConfig
+
+        if not isinstance(config, TTTDPPOActorConfig):
             import warnings
 
             warnings.warn(
