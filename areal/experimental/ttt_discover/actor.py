@@ -9,8 +9,11 @@ import torch.distributed as dist
 
 from areal.engine.fsdp_engine import FSDPEngine
 from areal.experimental.ttt_discover.sampler import StateSampler
+from areal.utils import logging
 from areal.utils.functional import reward_overlong_penalty
 from areal.utils.perf_tracer import trace_perf
+
+logger = logging.getLogger("TTTDActor")
 
 if TYPE_CHECKING:
     from areal.api.scheduler_api import Scheduler
@@ -38,7 +41,7 @@ class TTTDActor(FSDPEngine):
         from areal.experimental.ttt_discover.config import TTTDPPOActorConfig
 
         adv_estimator = getattr(config, "adv_estimator", "<missing>")
-        self.logger.info(
+        logger.info(
             f"[TTTDActor] config type: {type(config).__name__}, "
             f"is_tttd_actor_config: {isinstance(config, TTTDPPOActorConfig)}, "
             f"adv_estimator: {adv_estimator}"
@@ -150,7 +153,7 @@ class TTTDActor(FSDPEngine):
         group_ids = self._extract_group_ids(data, bs)
 
         # Compute sequence-level entropic advantages: w_beta - 1
-        self.logger.info(
+        logger.info(
             f"[TTTDActor.compute_advantages] adv_estimator={self.config.adv_estimator}"
         )
         entropic_adv_seq = self._compute_entropic_advantages(
@@ -228,7 +231,7 @@ class TTTDActor(FSDPEngine):
                 iters = getattr(self.config, "adv_estimator_beta_iters", 60)
 
                 beta = self._solve_adaptive_beta(group_rewards, delta, beta_max, iters)
-                self.logger.info(
+                logger.info(
                     f"[TTTDActor._compute_entropic_advantages] "
                     f"method={method}, group_size={group_rewards.shape[0]}, "
                     f"solved_beta={beta.item():.6f}"
