@@ -154,7 +154,7 @@ sampler:
   env_type: ale_bench
   # Set problem_id per run, e.g. ahc008(X), ahc011(might need rerun), ahc015(might need rerun), ahc016(might need rerun), ahc024(X),
   # ahc025, ahc026, ahc027, ahc039, ahc046.
-  problem_id: ahc027
+  problem_id: ahc046
   ale_bench_lite_version: false
   # AHC011 full has max standing score ~2.69B. Use a smaller scale so that
   # early-training raw scores (e.g. 5e4) produce visible rewards (~0.5).
