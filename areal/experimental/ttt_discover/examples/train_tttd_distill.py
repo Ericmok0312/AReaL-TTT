@@ -2482,15 +2482,27 @@ class TTTDDistillTrainer(PPOTrainer):
         )
 
         # Gather per-rank results onto the DP head for aggregation and logging.
+        logger.info(
+            f"[AleBenchEval][Step {global_step}] "
+            f"Rank {dp_rank} entering all_gather_object with {len(local_results)} local results"
+        )
         if dist.is_initialized():
             gathered_results: list[Any] = [None] * dp_world_size
             dist.all_gather_object(
                 gathered_results, local_results, group=self.actor.cpu_group
             )
+            logger.info(
+                f"[AleBenchEval][Step {global_step}] "
+                f"Rank {dp_rank} all_gather_object done"
+            )
         else:
             gathered_results = [local_results]
 
         if not self.actor.is_data_parallel_head():
+            logger.info(
+                f"[AleBenchEval][Step {global_step}] "
+                f"Rank {dp_rank} is not DP head, returning"
+            )
             return
 
         ordered_results: list[dict[str, Any]] = []
