@@ -434,6 +434,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         resp: ModelResponse,
         reward: float,
         raw_score: float | None = None,
+        metadata: dict[str, Any] | None = None,
         state: State | None = None,
         breakthrough_child: State | None = None,
         data: dict[str, Any] | None = None,
@@ -463,6 +464,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 else ""
             ],
             "_problem_ids": [data.get("_problem_id", "")] if data is not None else [""],
+            "_metadata": [metadata if metadata is not None else {}],
         }
         # Attach breakthrough parent/child for Breakthrough-Aware OPD
         # Wrap in list so concat_padded_tensors flat-concats them correctly
@@ -491,6 +493,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         resp: ModelResponse | None = None,
         breakthrough_child: State | None = None,
         raw_score: float | None = None,
+        metadata: dict[str, Any] | None = None,
         data: dict[str, Any] | None = None,
         env: BaseEnv | None = None,
     ) -> dict[str, torch.Tensor]:
@@ -551,6 +554,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             else ""
         ]
         trajectory["_problem_ids"] = [data.get("_problem_id", "")]
+        trajectory["_metadata"] = [metadata if metadata is not None else {}]
 
         # Attach breakthrough parent/child for Breakthrough-Aware OPD
         # Wrap in list so concat_padded_tensors flat-concats them correctly
@@ -619,6 +623,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 resp.output_tokens,
                 _env=env,
                 _state=state,
+                _problem_id=task_data.get("_problem_id"),
             )
 
             # Handle both timeout (int) and normal (tuple) return values
@@ -1204,6 +1209,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                     resp,
                     reward,
                     raw_score=raw_score,
+                    metadata=result.metadata,
                     state=state,
                     breakthrough_child=data.get("_breakthrough_child"),
                     data=data,
@@ -1225,6 +1231,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                     resp=resp,
                     breakthrough_child=data.get("_breakthrough_child"),
                     raw_score=raw_score,
+                    metadata=result.metadata,
                     data=data,
                     env=env,
                 )

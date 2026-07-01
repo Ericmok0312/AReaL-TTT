@@ -18,6 +18,7 @@ Usage:
 """
 
 import copy
+import functools
 import json
 import os
 import queue
@@ -41,8 +42,9 @@ from areal.experimental.ttt_discover.actor import TTTDActor
 
 # Native AReaL KDRL uses teacher_logp in ppo_update; no manual KL estimator needed.
 from areal.experimental.ttt_discover.ale_bench_eval import (
+    ale_bench_public_reward_fn,
     combine_ale_bench_results,
-    evaluate_problem_subset,
+    evaluate_problem_subset_with_public_scores,
     list_ale_bench_problem_ids,
 )
 from areal.experimental.ttt_discover.config import (
@@ -961,6 +963,7 @@ class TTTDDistillTrainer(PPOTrainer):
             breakthrough_parents: list[Any] = []
             breakthrough_children: list[Any] = []
             problem_ids: list[str] = []
+            metadata_list: list[dict[str, Any]] = []
             for d in rollout_batch:
                 sp = d.pop("_student_prompts", None)
                 if isinstance(sp, (list, tuple)):
@@ -986,6 +989,12 @@ class TTTDDistillTrainer(PPOTrainer):
                 elif pids is not None:
                     problem_ids.append(pids)
 
+                md = d.pop("_metadata", None)
+                if isinstance(md, (list, tuple)):
+                    metadata_list.extend(md)
+                elif md is not None:
+                    metadata_list.append(md)
+
             batched, _meta = concat_batch(rollout_batch)
             if student_prompts:
                 batched["_student_prompts"] = student_prompts
@@ -995,6 +1004,8 @@ class TTTDDistillTrainer(PPOTrainer):
                 batched["_breakthrough_child"] = breakthrough_children
             if problem_ids:
                 batched["_problem_ids"] = problem_ids
+            if metadata_list:
+                batched["_metadata"] = metadata_list
             return batched
         raise TypeError(f"Unexpected rollout_batch type: {type(rollout_batch)}")
 
@@ -2329,8 +2340,14 @@ class TTTDDistillTrainer(PPOTrainer):
 
     def _generate_ale_bench_eval_candidates(
         self, global_step: int
-    ) -> dict[str, list[str]]:
+    ) -> tuple[dict[str, list[str]], dict[str, list[dict[str, Any]]]]:
         """Generate candidate responses for ALE-Bench evaluation.
+
+        Public evaluation is performed inside the rollout reward function so that
+        GPU generation and CPU/Docker public scoring overlap.  This method returns
+        both the extracted candidate codes and the public evaluation results
+        (stored in trajectory metadata) so the caller can run private evaluation
+        on the best candidate per problem.
 
         To avoid cross-rank synchronization issues while debugging, candidate
         generation runs only on the DP head.  vLLM internally load-balances
@@ -2340,17 +2357,30 @@ class TTTDDistillTrainer(PPOTrainer):
         n_candidates = config.ale_bench_eval_n_candidates
 
         if self.actor.rank != 0:
-            return {}
+            return {}, {}
 
         dp_rank = getattr(self.actor, "data_parallel_rank", 0)
         dp_world_size = getattr(self.actor, "data_parallel_world_size", 1)
         eval_problem_ids = self._ale_bench_eval_problem_ids
 
         local_candidates: dict[str, list[str]] = {}
+        public_results_by_problem: dict[str, list[dict[str, Any]]] = {}
         if eval_problem_ids:
-            # Use a separate generation config for eval so that the workflow's
-            # expected_children matches the requested number of candidates.
-            eval_gconfig = config.gconfig.new(n_samples=n_candidates)
+            # Use the eval generation config (standard AReaL pattern) and override
+            # n_samples to match the requested number of ALE-Bench candidates.
+            base_eval_gconfig = config.eval_gconfig or config.gconfig
+            eval_gconfig = base_eval_gconfig.new(n_samples=n_candidates)
+
+            # Public evaluation runs inside the rollout reward function so that GPU
+            # generation and CPU/Docker public scoring overlap.  Private evaluation
+            # is still done after all rollouts finish using the existing median rule.
+            public_reward_fn = functools.partial(
+                ale_bench_public_reward_fn,
+                lite_version=config.ale_bench_eval_lite_version,
+                session_duration_hours=4.0,
+                ale_bench_num_workers=config.ale_bench_eval_num_workers,
+            )
+
             eval_workflow_kwargs = dict(
                 env=self.env,
                 problem_envs=self._ale_bench_eval_envs,
@@ -2361,7 +2391,7 @@ class TTTDDistillTrainer(PPOTrainer):
                 batch_size=1,
                 group_size=n_candidates,
                 lazy_sampling=False,
-                reward_fn=dummy_reward_fn,
+                reward_fn=public_reward_fn,
                 max_reward_workers=1,
                 # Use the stateless distillation prompt for eval, matching training.
                 distill_mode=True,
@@ -2423,11 +2453,12 @@ class TTTDDistillTrainer(PPOTrainer):
                 )
                 batch = self._normalize_rollout_batch(results)
 
-                # Decode completions and extract code per problem.
+                # Decode completions and extract code + public eval scores per problem.
                 input_ids = batch["input_ids"]
                 attention_mask = batch["attention_mask"]
                 loss_mask = batch["loss_mask"]
                 problem_ids = batch.get("_problem_ids", [])
+                metadata_list = batch.get("_metadata", [])
 
                 prompt_lens = (
                     (attention_mask & (loss_mask == 0)).sum(dim=1).cpu().numpy()
@@ -2450,6 +2481,36 @@ class TTTDDistillTrainer(PPOTrainer):
                         code if code is not None else ""
                     )
 
+                    md = metadata_list[i] if i < len(metadata_list) else {}
+                    public_info = md.get("metadata", md) if isinstance(md, dict) else {}
+                    # Reward function stores public scores under public_* keys.
+                    public_result = {
+                        "idx": len(local_candidates.get(problem_id, [])) - 1,
+                        "code": code if code is not None else "",
+                        "public": {
+                            "median_case_score": float(
+                                public_info.get("public_median", 0.0)
+                            ),
+                            "overall_absolute_score": float(
+                                public_info.get("public_overall_absolute", 0.0)
+                            ),
+                            "overall_relative_score": float(
+                                public_info.get("public_overall_relative", 0.0)
+                            ),
+                            "judge_result": str(
+                                public_info.get("public_judge_result", "UNKNOWN")
+                            ),
+                            "num_cases": int(public_info.get("public_num_cases", 0)),
+                            "rank": int(public_info.get("public_rank", -1)),
+                            "performance": int(
+                                public_info.get("public_performance", -1)
+                            ),
+                        },
+                    }
+                    public_results_by_problem.setdefault(problem_id, []).append(
+                        public_result
+                    )
+
                 generated_count = sum(len(v) for v in local_candidates.values())
                 logger.info(
                     f"[AleBenchEval][Step {global_step}] "
@@ -2462,7 +2523,7 @@ class TTTDDistillTrainer(PPOTrainer):
             f"[AleBenchEval][Step {global_step}] DP head has "
             f"{total_count} candidates across {len(local_candidates)} problems"
         )
-        return local_candidates
+        return local_candidates, public_results_by_problem
 
     def _run_ale_bench_eval(self, global_step: int):
         """Run full ALE-Bench public→private evaluation and save results."""
@@ -2482,18 +2543,20 @@ class TTTDDistillTrainer(PPOTrainer):
 
         # Generate candidates and evaluate only on the DP head.
         logger.info(f"[AleBenchEval][Step {global_step}] Starting candidate generation")
-        candidates_by_problem = self._generate_ale_bench_eval_candidates(global_step)
+        candidates_by_problem, public_results_by_problem = (
+            self._generate_ale_bench_eval_candidates(global_step)
+        )
         logger.info(f"[AleBenchEval][Step {global_step}] Candidate generation done")
 
         eval_problem_ids = self._ale_bench_eval_problem_ids
         logger.info(
             f"[AleBenchEval][Step {global_step}] "
-            f"DP head evaluating {len(eval_problem_ids)} problems"
+            f"DP head running private eval for {len(eval_problem_ids)} problems"
         )
 
-        local_results = evaluate_problem_subset(
+        local_results = evaluate_problem_subset_with_public_scores(
             eval_problem_ids,
-            candidates_by_problem,
+            public_results_by_problem,
             lite_version=config.ale_bench_eval_lite_version,
             session_duration_hours=4.0,
             ale_bench_num_workers=config.ale_bench_eval_num_workers,
@@ -2501,7 +2564,7 @@ class TTTDDistillTrainer(PPOTrainer):
         )
         logger.info(
             f"[AleBenchEval][Step {global_step}] "
-            f"DP head evaluation done, {len(local_results)} results"
+            f"DP head private eval done, {len(local_results)} results"
         )
 
         ordered_results: list[dict[str, Any]] = local_results
