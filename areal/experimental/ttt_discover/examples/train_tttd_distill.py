@@ -2348,10 +2348,13 @@ class TTTDDistillTrainer(PPOTrainer):
 
         local_candidates: dict[str, list[str]] = {}
         if eval_problem_ids:
+            # Use a separate generation config for eval so that the workflow's
+            # expected_children matches the requested number of candidates.
+            eval_gconfig = config.gconfig.new(n_samples=n_candidates)
             eval_workflow_kwargs = dict(
                 env=self.env,
                 problem_envs=self._ale_bench_eval_envs,
-                gconfig=config.gconfig,
+                gconfig=eval_gconfig,
                 tokenizer=self.tokenizer,
                 enable_thinking=config.enable_thinking,
                 max_prompt_thinking_tokens=config.max_prompt_thinking_tokens,
@@ -2363,7 +2366,9 @@ class TTTDDistillTrainer(PPOTrainer):
                 # Use the stateless distillation prompt for eval, matching training.
                 distill_mode=True,
             )
-            eval_workflow = MultiProblemTTTDiscoverWorkflowV2(**eval_workflow_kwargs)
+            # Pass the workflow class (not an instance) so that the rollout engine
+            # respects group_size.  This matches the standard AReaL evaluator pattern.
+            eval_workflow_cls = MultiProblemTTTDiscoverWorkflowV2
 
             data_list: list[dict[str, Any]] = []
             for problem_id in eval_problem_ids:
@@ -2397,19 +2402,21 @@ class TTTDDistillTrainer(PPOTrainer):
                     f"[AleBenchEval][Step {global_step}] Submitting {len(data_list)} "
                     f"problems x {n_candidates} candidates to rollout"
                 )
+                eval_rollout = self.eval_rollout or self.rollout
                 for data in data_list:
-                    self.rollout.submit(
+                    eval_rollout.submit(
                         data,
-                        eval_workflow,
-                        workflow_kwargs=None,
+                        eval_workflow_cls,
+                        workflow_kwargs=eval_workflow_kwargs,
                         group_size=n_candidates,
                         is_eval=True,
                     )
 
                 logger.info(
-                    f"[AleBenchEval][Step {global_step}] Waiting for {len(data_list)} rollout results"
+                    f"[AleBenchEval][Step {global_step}] "
+                    f"Waiting for {len(data_list)} grouped rollout results"
                 )
-                results = self.rollout.wait(len(data_list), timeout=None)
+                results = eval_rollout.wait(len(data_list), timeout=None)
                 logger.info(
                     f"[AleBenchEval][Step {global_step}] Got {len(results)} rollout results"
                 )
