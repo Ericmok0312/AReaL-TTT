@@ -745,6 +745,8 @@ class TTTDDistillTrainer(PPOTrainer):
         if self._ale_bench_eval_enabled:
             if getattr(config, "ale_bench_eval_freq_steps", None) is not None:
                 config.evaluator.freq_steps = config.ale_bench_eval_freq_steps
+            # Disable epoch-based eval triggers; ALE-Bench eval is purely step-based.
+            config.evaluator.freq_epochs = None
             config.evaluator.eval_before_train = config.ale_bench_eval_before_train
 
         self.evaluator = Evaluator(config.evaluator, ft_spec)

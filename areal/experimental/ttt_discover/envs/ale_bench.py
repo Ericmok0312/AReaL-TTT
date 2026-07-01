@@ -35,7 +35,6 @@ from ale_bench.code_language import CodeLanguage, JudgeVersion
 from ale_bench.error import AleBenchError
 from ale_bench.result import JudgeResult
 from ale_bench.start import start
-from transformers import PreTrainedTokenizerFast
 
 from areal.experimental.ttt_discover.envs.env import BaseEnv, EnvResult
 from areal.experimental.ttt_discover.state import AleBenchState, State
@@ -276,125 +275,32 @@ Rules:
 - Make sure you /think carefully before coding by learning from previous code and feedback.
 """
 
-    def _build_distill_prompt(
-        self,
-        problem_statement: str,
-        tool_readme: str,
-        constraints_section: str,
-        example_section: str,
-    ) -> str:
-        """Assemble the distillation prompt from its sections."""
-        return f"""You are participating in an AtCoder Heuristic Contest.
-
-Solve the problem below by writing a complete C++20 program. Read the statement, constraints, and examples carefully, reason about your algorithm, and then produce the final code.
-
---- Problem Statement ---
-{problem_statement}{constraints_section}{example_section}
-
---- Tool README ---
-{tool_readme}
-
-Instructions:
-- Write a complete C++20 program (GNU G++17 / C++20 compatible).
-- Your program must read from stdin and write to stdout exactly as described in the statement.
-- Reason about your approach before coding. Include a brief explanation of your algorithmic idea before the final code block.
-- Place your complete solution inside a single ```cpp ... ``` block.
-- The code should be clean, well-structured, and include comments where helpful.
-"""
-
     def get_prompt_distill(self, state: State) -> str:
         """Build a clean, from-scratch prompt for distillation rollouts.
 
-        Unlike :meth:`get_prompt`, this variant intentionally omits the state's
-        previous code and any "improve this solution" framing. It is used for
-        both distillation training rollouts and full ALE-Bench evaluation
-        rollouts so both settings see the same problem-only instruction.
+        This prompt mirrors the official ALE-Bench evaluation prompt used by
+        frontierSmith (``ale_bench_eval``): it provides the problem statement
+        and constraints, but omits the verbose ``tool_readme`` and example
+        input/output sections that are not part of the standard eval prompt.
+        This keeps prompts short and aligned with how the benchmark is actually
+        scored.
         """
         problem_statement = self.problem.statement
-        tool_readme = self.problem.tool_readme
-        constraints_section, example_section = self._problem_context_sections()
+        time_limit = self.problem.constraints.time_limit
+        memory_limit = self.problem.constraints.memory_limit // 1024 // 1024
 
-        return self._build_distill_prompt(
-            problem_statement, tool_readme, constraints_section, example_section
-        )
+        return f"""There is a problem statement below. First, analyze the problem carefully. Think about the essential points of the problem and possible algorithms to achieve a higher rank in the contest.
 
-    def truncate_prompt(
-        self, prompt: str, tokenizer: PreTrainedTokenizerFast, max_tokens: int
-    ) -> str:
-        """Truncate an ALE-Bench prompt by shortening the tool README first.
+Next, implement your solution in C++20 (GNU G++17 / C++20 compatible). Your solution code must be written inside a single ```cpp ... ``` code block.
+You can use the following external libraries:
+- AC Library@1.5.1
+- Boost@1.82.0
 
-        The truncation priority is:
-        1. Truncate the ``--- Tool README ---`` section.
-        2. If still too long, truncate the ``--- Example Input/Output ---`` section.
-        3. Fall back to end-truncation only if the problem statement itself exceeds
-           the budget.
+[Problem statement]
+Execution time limit: {time_limit} sec / Memory limit: {memory_limit} MiB
 
-        This preserves the most critical information (problem statement and
-        constraints) while removing verbose auxiliary material.
-        """
-        input_ids = tokenizer.encode(prompt, add_special_tokens=False)
-        if len(input_ids) <= max_tokens:
-            return prompt
-
-        problem_statement = self.problem.statement
-        tool_readme = self.problem.tool_readme
-        constraints_section, example_section = self._problem_context_sections()
-
-        # Phase 1: try to fit by truncating the tool README.
-        prompt_without_tool = self._build_distill_prompt(
-            problem_statement, "", constraints_section, example_section
-        )
-        ids_without_tool = tokenizer.encode(
-            prompt_without_tool, add_special_tokens=False
-        )
-        if len(ids_without_tool) < max_tokens:
-            available_for_tool = max_tokens - len(ids_without_tool)
-            tool_ids = tokenizer.encode(tool_readme, add_special_tokens=False)
-            if len(tool_ids) > available_for_tool:
-                tool_ids = tool_ids[:available_for_tool]
-                tool_readme = tokenizer.decode(tool_ids)
-            truncated = self._build_distill_prompt(
-                problem_statement,
-                tool_readme,
-                constraints_section,
-                example_section,
-            )
-            if len(tokenizer.encode(truncated, add_special_tokens=False)) <= max_tokens:
-                logger.warning(
-                    f"[AleBenchEnv] Prompt truncated by shortening Tool README: "
-                    f"{len(input_ids)} -> {len(tokenizer.encode(truncated, add_special_tokens=False))} tokens"
-                )
-                return truncated
-
-        # Phase 2: drop the tool README entirely and truncate examples.
-        prompt_without_examples = self._build_distill_prompt(
-            problem_statement, "", constraints_section, ""
-        )
-        ids_without_examples = tokenizer.encode(
-            prompt_without_examples, add_special_tokens=False
-        )
-        if len(ids_without_examples) < max_tokens:
-            available_for_examples = max_tokens - len(ids_without_examples)
-            example_ids = tokenizer.encode(example_section, add_special_tokens=False)
-            if len(example_ids) > available_for_examples:
-                example_ids = example_ids[:available_for_examples]
-                example_section = tokenizer.decode(example_ids)
-            truncated = self._build_distill_prompt(
-                problem_statement, "", constraints_section, example_section
-            )
-            if len(tokenizer.encode(truncated, add_special_tokens=False)) <= max_tokens:
-                logger.warning(
-                    f"[AleBenchEnv] Prompt truncated by removing Tool README and shortening examples: "
-                    f"{len(input_ids)} -> {len(tokenizer.encode(truncated, add_special_tokens=False))} tokens"
-                )
-                return truncated
-
-        # Phase 3: problem statement itself is too long; fall back to end-truncation.
-        logger.warning(
-            f"[AleBenchEnv] Problem statement exceeds token budget ({len(input_ids)} > {max_tokens}); "
-            "falling back to end-truncation."
-        )
-        return tokenizer.decode(input_ids[:max_tokens])
+{problem_statement}
+"""
 
     def _recreate_session(self) -> None:
         """Drop the cached ALE-Bench session and create a fresh one.
