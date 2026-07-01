@@ -573,7 +573,7 @@ class MultiProblemTTTDiscoverDataLoader(TTTDiscoverDataLoader):
         self._batch_size = batch_size
 
         self._dataset = _MultiProblemStateSamplerIterableDataset(
-            state_sampler=problem_samplers,
+            problem_samplers=problem_samplers,
             rank=rank,
             world_size=world_size,
             local_batch_size=local_batch_size,
