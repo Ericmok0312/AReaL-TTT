@@ -112,13 +112,113 @@ def ale_bench_public_reward_fn(
     """
     import time
 
-    from ale_bench.session import CodeLanguage
-
     from areal.experimental.ttt_discover.envs.env import EnvResult
 
     start_time = time.time()
     problem_id = _kwargs.get("_problem_id", "")
     env = _kwargs.get("_env")
+    logger.info(
+        f"[ale_bench_public_reward_fn][{problem_id}] Called with "
+        f"completion_len={len(completions)} env={type(env).__name__ if env else None}"
+    )
+
+    if env is not None:
+        code = env.extract_code(completions)
+    else:
+        # Fallback: try to extract a code block heuristically.
+        import re
+
+        match = re.search(
+            r"```(?:cpp|c\+\+|python)?\n(.*?)\n```", completions, re.DOTALL
+        )
+        code = match.group(1) if match else completions
+
+    if code is None or not code.strip():
+        logger.warning(f"[ale_bench_public_reward_fn][{problem_id}] No code extracted")
+        result = EnvResult(
+            reward=0.0,
+            is_valid=False,
+            observation="",
+            metadata={"error": "no_code", "problem_id": problem_id},
+            fail_type="code_extraction_failed",
+        )
+        return 0.0, result, "", 0.0
+
+    try:
+        from ale_bench.session import CodeLanguage
+
+        logger.info(
+            f"[ale_bench_public_reward_fn][{problem_id}] Getting session "
+            f"(lite={lite_version}, workers={ale_bench_num_workers})"
+        )
+        session = _get_ale_bench_session(
+            problem_id=problem_id,
+            lite_version=lite_version,
+            session_duration_hours=session_duration_hours,
+            ale_bench_num_workers=ale_bench_num_workers,
+        )
+        logger.info(f"[ale_bench_public_reward_fn][{problem_id}] Running public_eval")
+        public_result = session.public_eval(
+            code=code,
+            code_language=CodeLanguage.CPP20,
+        )
+        case_scores = [_case_absolute_score(c) for c in public_result.case_results]
+        median_score = float(np.median(case_scores)) if case_scores else 0.0
+        public_rank = -1
+        public_perf = -1
+        if hasattr(public_result, "rank"):
+            public_rank = int(public_result.rank)
+        if hasattr(public_result, "performance"):
+            public_perf = int(public_result.performance)
+
+        logger.info(
+            f"[ale_bench_public_reward_fn][{problem_id}] public_eval done: "
+            f"median={median_score:.2f} "
+            f"abs={getattr(public_result, 'overall_absolute_score', 0.0):.2f} "
+            f"judge={getattr(public_result, 'overall_judge_result', 'UNKNOWN')}"
+        )
+
+        result = EnvResult(
+            reward=median_score,
+            is_valid=True,
+            observation="",
+            metadata={
+                "problem_id": problem_id,
+                "code": code,
+                "public_median": median_score,
+                "public_overall_absolute": float(
+                    getattr(public_result, "overall_absolute_score", 0.0)
+                ),
+                "public_overall_relative": float(
+                    getattr(public_result, "overall_relative_score", 0.0) or 0.0
+                ),
+                "public_judge_result": str(
+                    getattr(public_result, "overall_judge_result", "UNKNOWN")
+                ),
+                "public_num_cases": len(case_scores),
+                "public_rank": public_rank,
+                "public_performance": public_perf,
+            },
+        )
+        exec_time_ms = (time.time() - start_time) * 1000.0
+        return median_score, result, code, exec_time_ms
+    except Exception as e:
+        logger.error(
+            f"[ale_bench_public_reward_fn][{problem_id}] public_eval failed: "
+            f"{type(e).__name__}: {e}"
+        )
+        result = EnvResult(
+            reward=0.0,
+            is_valid=False,
+            observation="",
+            metadata={
+                "error": f"{type(e).__name__}: {e}",
+                "problem_id": problem_id,
+                "traceback": traceback.format_exc(),
+            },
+            fail_type="execution_error",
+        )
+        return 0.0, result, code if code is not None else "", 0.0
 
     if env is not None:
         code = env.extract_code(completions)
