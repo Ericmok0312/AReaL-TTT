@@ -640,9 +640,9 @@ class TTTDDistillTrainer(PPOTrainer):
         self._ale_bench_eval_output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
-        # Only the DP head needs per-problem envs now that eval runs on a single rank.
-        if not self.actor.is_data_parallel_head():
-            logger.info("[AleBenchEval] Skipping env creation on non-head ranks")
+        # Only global rank 0 needs per-problem envs now that eval runs on a single rank.
+        if self.actor.rank != 0:
+            logger.info("[AleBenchEval] Skipping env creation on non-zero ranks")
             return
 
         original_problem_id = getattr(config.sampler, "problem_id", "")
@@ -2339,7 +2339,7 @@ class TTTDDistillTrainer(PPOTrainer):
         config = self.config
         n_candidates = config.ale_bench_eval_n_candidates
 
-        if not self.actor.is_data_parallel_head():
+        if self.actor.rank != 0:
             return {}
 
         dp_rank = getattr(self.actor, "data_parallel_rank", 0)
@@ -2465,10 +2465,10 @@ class TTTDDistillTrainer(PPOTrainer):
         dp_rank = getattr(self.actor, "data_parallel_rank", 0)
         dp_world_size = getattr(self.actor, "data_parallel_world_size", 1)
 
-        if not self.actor.is_data_parallel_head():
+        if self.actor.rank != 0:
             logger.info(
                 f"[AleBenchEval][Step {global_step}] "
-                f"Rank {dp_rank}/{dp_world_size} skipping eval, only DP head runs"
+                f"Rank {dp_rank}/{dp_world_size} skipping eval, only rank 0 runs"
             )
             return
 
