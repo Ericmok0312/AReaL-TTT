@@ -2322,22 +2322,24 @@ class TTTDDistillTrainer(PPOTrainer):
     def _generate_ale_bench_eval_candidates(
         self, global_step: int
     ) -> dict[str, list[str]]:
-        """Generate candidate responses for the local ALE-Bench problem slice.
+        """Generate candidate responses for ALE-Bench evaluation.
 
-        The workload is partitioned across data-parallel ranks: each rank
-        generates candidates only for ``problem_ids[dp_rank::dp_world_size]``.
-        Each rank later evaluates the same slice, so no candidate broadcast is
-        required.
+        To avoid cross-rank synchronization issues while debugging, candidate
+        generation runs only on the DP head.  vLLM internally load-balances
+        requests across its engines, so this keeps the implementation simple.
         """
         config = self.config
         n_candidates = config.ale_bench_eval_n_candidates
 
+        if not self.actor.is_data_parallel_head():
+            return {}
+
         dp_rank = getattr(self.actor, "data_parallel_rank", 0)
         dp_world_size = getattr(self.actor, "data_parallel_world_size", 1)
-        local_problem_ids = self._ale_bench_eval_problem_ids[dp_rank::dp_world_size]
+        eval_problem_ids = self._ale_bench_eval_problem_ids
 
         local_candidates: dict[str, list[str]] = {}
-        if local_problem_ids:
+        if eval_problem_ids:
             eval_workflow_kwargs = dict(
                 env=self.env,
                 problem_envs=self._ale_bench_eval_envs,
@@ -2356,7 +2358,7 @@ class TTTDDistillTrainer(PPOTrainer):
             eval_workflow = MultiProblemTTTDiscoverWorkflowV2(**eval_workflow_kwargs)
 
             data_list: list[dict[str, Any]] = []
-            for problem_id in local_problem_ids:
+            for problem_id in eval_problem_ids:
                 env = self._ale_bench_eval_envs.get(problem_id)
                 if env is None:
                     continue
@@ -2379,8 +2381,8 @@ class TTTDDistillTrainer(PPOTrainer):
             if data_list:
                 logger.info(
                     f"[AleBenchEval][Step {global_step}] "
-                    f"Rank {dp_rank}/{dp_world_size} generating {n_candidates} candidates "
-                    f"for {len(data_list)} problems"
+                    f"DP head generating {n_candidates} candidates "
+                    f"for {len(data_list)} problems (dp={dp_rank}/{dp_world_size})"
                 )
 
                 logger.info(
@@ -2439,12 +2441,11 @@ class TTTDDistillTrainer(PPOTrainer):
                     f"across {len(local_candidates)} problems"
                 )
 
-        if self.actor.is_data_parallel_head():
-            total_count = sum(len(v) for v in local_candidates.values())
-            logger.info(
-                f"[AleBenchEval][Step {global_step}] Rank {dp_rank} has "
-                f"{total_count} candidates across {len(local_candidates)} problems"
-            )
+        total_count = sum(len(v) for v in local_candidates.values())
+        logger.info(
+            f"[AleBenchEval][Step {global_step}] DP head has "
+            f"{total_count} candidates across {len(local_candidates)} problems"
+        )
         return local_candidates
 
     def _run_ale_bench_eval(self, global_step: int):
@@ -2456,20 +2457,26 @@ class TTTDDistillTrainer(PPOTrainer):
         dp_rank = getattr(self.actor, "data_parallel_rank", 0)
         dp_world_size = getattr(self.actor, "data_parallel_world_size", 1)
 
-        # Generate candidates in parallel across DP ranks.
+        if not self.actor.is_data_parallel_head():
+            logger.info(
+                f"[AleBenchEval][Step {global_step}] "
+                f"Rank {dp_rank}/{dp_world_size} skipping eval, only DP head runs"
+            )
+            return
+
+        # Generate candidates and evaluate only on the DP head.
         logger.info(f"[AleBenchEval][Step {global_step}] Starting candidate generation")
         candidates_by_problem = self._generate_ale_bench_eval_candidates(global_step)
         logger.info(f"[AleBenchEval][Step {global_step}] Candidate generation done")
 
-        # Each rank evaluates a deterministic slice of the problem list.
-        local_problem_ids = self._ale_bench_eval_problem_ids[dp_rank::dp_world_size]
+        eval_problem_ids = self._ale_bench_eval_problem_ids
         logger.info(
             f"[AleBenchEval][Step {global_step}] "
-            f"Rank {dp_rank}/{dp_world_size} evaluating {len(local_problem_ids)} problems"
+            f"DP head evaluating {len(eval_problem_ids)} problems"
         )
 
         local_results = evaluate_problem_subset(
-            local_problem_ids,
+            eval_problem_ids,
             candidates_by_problem,
             lite_version=config.ale_bench_eval_lite_version,
             session_duration_hours=4.0,
@@ -2478,36 +2485,10 @@ class TTTDDistillTrainer(PPOTrainer):
         )
         logger.info(
             f"[AleBenchEval][Step {global_step}] "
-            f"Rank {dp_rank} local evaluation done, {len(local_results)} results"
+            f"DP head evaluation done, {len(local_results)} results"
         )
 
-        # Gather per-rank results onto the DP head for aggregation and logging.
-        logger.info(
-            f"[AleBenchEval][Step {global_step}] "
-            f"Rank {dp_rank} entering all_gather_object with {len(local_results)} local results"
-        )
-        if dist.is_initialized():
-            gathered_results: list[Any] = [None] * dp_world_size
-            dist.all_gather_object(
-                gathered_results, local_results, group=self.actor.cpu_group
-            )
-            logger.info(
-                f"[AleBenchEval][Step {global_step}] "
-                f"Rank {dp_rank} all_gather_object done"
-            )
-        else:
-            gathered_results = [local_results]
-
-        if not self.actor.is_data_parallel_head():
-            logger.info(
-                f"[AleBenchEval][Step {global_step}] "
-                f"Rank {dp_rank} is not DP head, returning"
-            )
-            return
-
-        ordered_results: list[dict[str, Any]] = []
-        for r in range(dp_world_size):
-            ordered_results.extend(gathered_results[r])
+        ordered_results: list[dict[str, Any]] = local_results
 
         training_problem_ids = {mt.problem_id for mt in config.multi_teacher}
         output = combine_ale_bench_results(

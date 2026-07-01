@@ -1137,21 +1137,16 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                     "[Teacher Forcing] No valid code in first generation, forcing final response"
                 )
 
-                # Append teacher forcing message
-                force_message = {
-                    "role": "assistant",
-                    "content": self.force_stop_message,
-                }
-                messages_with_force = messages + [force_message]
-
-                input_ids_force = list(
-                    self.tokenizer.apply_chat_template(
-                        messages_with_force,
-                        tokenize=True,
-                        add_generation_prompt=False,  # Continue from assistant message
-                        enable_thinking=self.enable_thinking,
-                    )
+                # Append teacher forcing message as a continuation of the assistant
+                # turn.  Re-tokenizing the full message list with the force message
+                # as a complete assistant message would append <|im_end|>, making the
+                # model think the turn is over.  Instead, append the force text
+                # directly to the original prompt (which already ends with the
+                # assistant prefix from add_generation_prompt=True).
+                force_ids = self.tokenizer.encode(
+                    self.force_stop_message, add_special_tokens=False
                 )
+                input_ids_force = input_ids + list(force_ids)
 
                 # Second generation with remaining tokens
                 remaining_tokens = max_context - len(input_ids_force)
@@ -1168,7 +1163,13 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 async with atrace_session_phase("generate_forced"):
                     resp = await engine.agenerate(req_force)
 
-                logger.info("[Teacher Forcing] Forced generation completed")
+                forced_completion_str = self.tokenizer.decode(resp.output_tokens)
+                forced_code = env.extract_code(forced_completion_str)
+                logger.info(
+                    f"[Teacher Forcing] Forced generation completed: "
+                    f"input_len={resp.input_len} output_len={resp.output_len} "
+                    f"output_tokens={len(resp.output_tokens)} has_code={forced_code is not None}"
+                )
 
             # Record GPU completion time for tail latency measurement
             gpu_done_time = time.perf_counter()
