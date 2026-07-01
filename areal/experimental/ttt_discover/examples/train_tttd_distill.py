@@ -326,6 +326,10 @@ class TTTDDistillTrainer(PPOTrainer):
 
         # Initialize inference engines
         self.rollout = self._init_rollout(config.rollout, is_eval=False)
+        # Standard AReaL pattern: separate eval rollout for ALE-Bench evaluation.
+        self.eval_rollout = None
+        if not getattr(self, "_online_mode", False):
+            self.eval_rollout = self._init_rollout(config.rollout, is_eval=True)
 
         # Setup weight update meta
         self._setup_weight_update_meta()
@@ -736,6 +740,13 @@ class TTTDDistillTrainer(PPOTrainer):
             train_batch_size=config.sampler.batch_size,
         )
 
+        # Align evaluator frequency with ALE-Bench eval settings so the standard
+        # Evaluator API can drive the custom ALE-Bench evaluation.
+        if self._ale_bench_eval_enabled:
+            if getattr(config, "ale_bench_eval_freq_steps", None) is not None:
+                config.evaluator.freq_steps = config.ale_bench_eval_freq_steps
+            config.evaluator.eval_before_train = config.ale_bench_eval_before_train
+
         self.evaluator = Evaluator(config.evaluator, ft_spec)
         self.saver = Saver(config.saver, ft_spec)
         self.recover_handler = RecoverHandler(config.recover, ft_spec)
@@ -1075,10 +1086,22 @@ class TTTDDistillTrainer(PPOTrainer):
         )
 
         # =====================================================================
-        # Baseline ALE-Bench evaluation before training
+        # ALE-Bench evaluation driver (standard AReaL Evaluator API)
         # =====================================================================
-        if self._ale_bench_eval_enabled and config.ale_bench_eval_before_train:
-            self._run_ale_bench_eval(global_step=start_step)
+        def _ale_bench_evaluate_fn(eval_global_step: int):
+            """Callable passed to Evaluator.evaluate; runs only on global rank 0."""
+            if self.actor.rank != 0:
+                return
+            self._run_ale_bench_eval(global_step=eval_global_step)
+
+        if self._ale_bench_eval_enabled:
+            # Before-train eval (if configured)
+            self.evaluator.evaluate(
+                functools.partial(_ale_bench_evaluate_fn, start_step),
+                epoch=0,
+                epoch_step=start_step,
+                global_step=start_step,
+            )
 
         # =====================================================================
         # Phase 1: Distillation steps (no verification)
@@ -1102,6 +1125,17 @@ class TTTDDistillTrainer(PPOTrainer):
             if hasattr(distill_workflow, "set_current_version"):
                 distill_workflow.set_current_version(global_step)
 
+            # Wrap with GroupedRolloutWorkflow so that prepare_batch respects
+            # group_size even when a workflow instance is passed.  Without this,
+            # RemoteInfEngine._resolve_workflow ignores group_size for instances,
+            # causing only 1 child per parent to be generated while the workflow
+            # expects n_samples children.
+            from areal.infra.remote_inf_engine import GroupedRolloutWorkflow
+
+            grouped_distill_workflow = GroupedRolloutWorkflow(
+                distill_workflow, group_size, logger
+            )
+
             # Clear workflow cache to ensure the new workflow instance is used
             self._clear_workflow_cache()
 
@@ -1110,8 +1144,8 @@ class TTTDDistillTrainer(PPOTrainer):
             with stats_tracker.record_timing("rollout"):
                 rollout_batch = self.actor.prepare_batch(
                     self.train_dataloader,
-                    workflow=distill_workflow,
-                    workflow_kwargs=None,  # Already resolved workflow instance
+                    workflow=grouped_distill_workflow,
+                    workflow_kwargs=None,  # Already resolved & grouped workflow instance
                     should_accept_fn=None,
                     group_size=group_size,
                     dynamic_bs=config.dynamic_bs,
@@ -1332,6 +1366,8 @@ class TTTDDistillTrainer(PPOTrainer):
 
             self.actor.set_version(new_version)
             self.rollout.set_version(new_version)
+            if self.eval_rollout is not None:
+                self.eval_rollout.set_version(new_version)
             logger.info(
                 f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] After set_version"
             )
@@ -1392,12 +1428,14 @@ class TTTDDistillTrainer(PPOTrainer):
                 f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] After rollout.resume"
             )
 
-            # Periodic ALE-Bench full-corpus evaluation
-            if self._ale_bench_eval_enabled and (
-                (global_step + 1) % config.ale_bench_eval_freq_steps == 0
-                or global_step == config.max_steps - 1
-            ):
-                self._run_ale_bench_eval(global_step=global_step + 1)
+            # Periodic ALE-Bench full-corpus evaluation via standard Evaluator API
+            if self._ale_bench_eval_enabled:
+                self.evaluator.evaluate(
+                    functools.partial(_ale_bench_evaluate_fn, global_step + 1),
+                    epoch=0,
+                    epoch_step=global_step + 1,
+                    global_step=global_step + 1,
+                )
 
             step_total = time.perf_counter() - step_start_time
             logger.info(
@@ -2432,10 +2470,12 @@ class TTTDDistillTrainer(PPOTrainer):
                     f"[AleBenchEval][Step {global_step}] Submitting {len(data_list)} "
                     f"problems x {n_candidates} candidates to rollout"
                 )
-                # TTTDDistillTrainer only initializes a training rollout; reuse it
-                # for eval since ALE-Bench eval already runs only on global rank 0.
+                # Use the dedicated eval rollout (standard AReaL pattern).  It
+                # colocates with the training rollout engines but has its own
+                # scheduling/in-flight policy, avoiding interference.
+                eval_rollout = self.eval_rollout or self.rollout
                 for data in data_list:
-                    self.rollout.submit(
+                    eval_rollout.submit(
                         data,
                         eval_workflow_cls,
                         workflow_kwargs=eval_workflow_kwargs,
@@ -2447,7 +2487,7 @@ class TTTDDistillTrainer(PPOTrainer):
                     f"[AleBenchEval][Step {global_step}] "
                     f"Waiting for {len(data_list)} grouped rollout results"
                 )
-                results = self.rollout.wait(len(data_list), timeout=None)
+                results = eval_rollout.wait(len(data_list), timeout=None)
                 logger.info(
                     f"[AleBenchEval][Step {global_step}] Got {len(results)} rollout results"
                 )
@@ -2811,6 +2851,8 @@ class TTTDDistillTrainer(PPOTrainer):
                 logger.warning(f"[DynamicMetrics] Failed to save checkpoint: {e}")
 
         self.stats_logger.close()
+        if hasattr(self, "eval_rollout") and self.eval_rollout is not None:
+            self.eval_rollout.destroy()
         if hasattr(self, "rollout") and self.rollout is not None:
             self.rollout.destroy()
         if hasattr(self, "teacher") and self.teacher is not None:

@@ -229,7 +229,9 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
 
         logger.info(
             f"TTTDiscoverWorkflowV2: max_reward_workers={max_reward_workers}, "
-            f"eval_timeout={eval_timeout}s, wrapper_timeout={wrapper_timeout}s (includes queue wait)"
+            f"eval_timeout={eval_timeout}s, wrapper_timeout={wrapper_timeout}s (includes queue wait) "
+            f"gconfig_n_samples={getattr(self.gconfig, 'n_samples', None)} "
+            f"group_size={self.group_size}"
         )
 
         # Wrap reward function with AsyncRewardWrapper (AReaL standard pattern)
@@ -1018,6 +1020,11 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         try:
             expected_children = (
                 self.gconfig.n_samples if hasattr(self.gconfig, "n_samples") else None
+            )
+            logger.info(
+                f"[_execute_rollout][{state.id[:8] if state else 'None'}...] "
+                f"expected_children={expected_children} "
+                f"sampled_step={sampled_step}"
             )
 
             async with self._pending_lock:
