@@ -17,7 +17,7 @@ run_eval_step: false
 total_rollouts_per_step: 64
 
 # ALE-Bench full-corpus evaluation (public→private, median selection)
-ale_bench_eval_enabled: true
+ale_bench_eval_enabled: false
 ale_bench_eval_before_train: false
 ale_bench_eval_freq_steps: 10
 ale_bench_eval_n_candidates: 15

@@ -571,6 +571,8 @@ class MultiProblemTTTDiscoverDataLoader(TTTDiscoverDataLoader):
         self._world_size = world_size
         self._lazy_sampling = lazy_sampling
         self._batch_size = batch_size
+        # Expose sampler attribute for compatibility with TTTDiscoverDataLoader.
+        self.sampler = None  # type: ignore
 
         self._dataset = _MultiProblemStateSamplerIterableDataset(
             problem_samplers=problem_samplers,
@@ -592,8 +594,6 @@ class MultiProblemTTTDiscoverDataLoader(TTTDiscoverDataLoader):
             drop_last=drop_last,
             **kwargs,
         )
-        # Expose samplers for compatibility.
-        self.sampler = None  # type: ignore
 
     def state_dict(self) -> dict[str, Any]:
         state = StatefulDataLoader.state_dict(self)
