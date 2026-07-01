@@ -96,6 +96,12 @@ def _eval_one_problem(
             median_score = float(np.median(case_scores)) if case_scores else 0.0
             candidate_medians.append(median_score)
 
+            public_rank = -1
+            public_perf = -1
+            if hasattr(public_result, "rank"):
+                public_rank = int(public_result.rank)
+            if hasattr(public_result, "performance"):
+                public_perf = int(public_result.performance)
             result["candidates"].append(
                 {
                     "idx": idx,
@@ -111,8 +117,16 @@ def _eval_one_problem(
                             getattr(public_result, "overall_judge_result", "UNKNOWN")
                         ),
                         "num_cases": len(case_scores),
+                        "rank": public_rank,
+                        "performance": public_perf,
                     },
                 }
+            )
+            logger.info(
+                f"[_eval_one_problem][{problem_id}] public candidate {idx}: "
+                f"median={median_score:.2f} abs={getattr(public_result, 'overall_absolute_score', 0.0):.2f} "
+                f"judge={getattr(public_result, 'overall_judge_result', 'UNKNOWN')} "
+                f"rank={public_rank} perf={public_perf}"
             )
 
         best_idx = int(np.argmax(candidate_medians))
@@ -143,6 +157,12 @@ def _eval_one_problem(
             "rank": int(rank),
             "performance": int(performance),
         }
+        logger.info(
+            f"[_eval_one_problem][{problem_id}] private best {best_idx}: "
+            f"abs={getattr(private_result, 'overall_absolute_score', 0.0):.2f} "
+            f"rel={getattr(private_result, 'overall_relative_score', 0.0) or 0.0:.2f} "
+            f"rank={rank} perf={performance}"
+        )
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
         result["traceback"] = traceback.format_exc()
@@ -204,6 +224,28 @@ class AleBenchEvalSpec:
     output_path: str = ""
 
 
+def _log_problem_result(result: dict[str, Any]) -> None:
+    """Log a concise summary of one problem's evaluation result."""
+    problem_id = result.get("problem_id", "unknown")
+    if result.get("error"):
+        logger.info(f"[Result][{problem_id}] error={result['error']}")
+        return
+    candidates = result.get("candidates", [])
+    public_summary = " ".join(
+        f"c{i}[median={c.get('public', {}).get('median_case_score', 0.0):.2f} "
+        f"abs={c.get('public', {}).get('overall_absolute_score', 0.0):.2f} "
+        f"perf={c.get('public', {}).get('performance', -1)}]"
+        for i, c in enumerate(candidates)
+    )
+    private = result.get("private", {})
+    logger.info(
+        f"[Result][{problem_id}] best_idx={result.get('best_candidate_idx')} "
+        f"public={public_summary} "
+        f"private[abs={private.get('absolute_score', 0.0):.2f} "
+        f"rank={private.get('rank', -1)} perf={private.get('performance', -1)}]"
+    )
+
+
 def evaluate_problem_subset(
     problem_ids: list[str],
     candidates_by_problem: dict[str, list[str]],
@@ -257,7 +299,9 @@ def evaluate_problem_subset(
                 logger.info(
                     f"[evaluate_problem_subset] Waiting for problem {problem_id}"
                 )
-                results.append(future.result())
+                result = future.result()
+                _log_problem_result(result)
+                results.append(result)
                 logger.info(f"[evaluate_problem_subset] Finished problem {problem_id}")
         logger.info("[evaluate_problem_subset] All parallel problems done")
         return results
@@ -265,15 +309,15 @@ def evaluate_problem_subset(
     results = []
     for problem_id in problem_ids:
         logger.info(f"[evaluate_problem_subset] Evaluating problem {problem_id}")
-        results.append(
-            _eval_one_problem(
-                problem_id,
-                candidates_by_problem.get(problem_id, []),
-                lite_version,
-                session_duration_hours,
-                ale_bench_num_workers,
-            )
+        result = _eval_one_problem(
+            problem_id,
+            candidates_by_problem.get(problem_id, []),
+            lite_version,
+            session_duration_hours,
+            ale_bench_num_workers,
         )
+        _log_problem_result(result)
+        results.append(result)
         logger.info(f"[evaluate_problem_subset] Finished problem {problem_id}")
     logger.info("[evaluate_problem_subset] All problems done")
     return results
