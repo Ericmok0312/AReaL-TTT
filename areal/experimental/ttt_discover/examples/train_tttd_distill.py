@@ -152,8 +152,6 @@ class TTTDDistillTrainer(PPOTrainer):
         self._ale_bench_eval_output_dir = ""
         self._ale_bench_eval_problem_ids: list[str] = []
         self._ale_bench_eval_envs: dict[str, BaseEnv] = {}
-        if self._ale_bench_eval_enabled:
-            self._setup_ale_bench_eval(config)
 
         max_head_offpolicyness = getattr(config.rollout, "max_head_offpolicyness", 2)
         max_version_history = max_head_offpolicyness + 1
@@ -208,6 +206,11 @@ class TTTDDistillTrainer(PPOTrainer):
         config.actor.group_size = config.gconfig.n_samples
         self.actor = self._create_tttd_actor(config.actor)
         self.ref = None  # No ref model needed (kl_ctl=0)
+
+        # Setup ALE-Bench eval envs now that self.actor is available.  Only the DP
+        # head creates per-problem envs because eval runs on a single rank.
+        if self._ale_bench_eval_enabled:
+            self._setup_ale_bench_eval(config)
 
         # =====================================================================
         # Create teacher model (native AReaL path)
@@ -636,6 +639,11 @@ class TTTDDistillTrainer(PPOTrainer):
             )
         self._ale_bench_eval_output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
+
+        # Only the DP head needs per-problem envs now that eval runs on a single rank.
+        if not self.actor.is_data_parallel_head():
+            logger.info("[AleBenchEval] Skipping env creation on non-head ranks")
+            return
 
         original_problem_id = getattr(config.sampler, "problem_id", "")
         for problem_id in self._ale_bench_eval_problem_ids:
