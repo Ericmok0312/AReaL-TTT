@@ -210,21 +210,8 @@ class AleBenchEnv(BaseEnv):
             f"best_normalized_score={self.best_normalized_score:.4f}"
         )
 
-    def get_prompt(self, state: State) -> str:
-        """Build a prompt for the current ALE-Bench problem and state."""
-        problem_statement = self.problem.statement
-        tool_readme = self.problem.tool_readme
-        example_input = getattr(self.problem, "example_input", "")
-        example_output = getattr(self.problem, "example_output", "")
-
-        value_context = state.to_prompt(
-            target=None,  # Do not show the global target/gap; let the model focus
-            # on incremental improvement instead of a potentially overwhelming gap.
-            metric_name="score",
-            maximize=self.maximize,
-            language=self.code_language,
-        )
-
+    def _problem_context_sections(self) -> tuple[str, str]:
+        """Return (constraints_section, example_section) for prompt construction."""
         time_limit = getattr(self.problem.constraints, "time_limit", None)
         memory_limit = getattr(self.problem.constraints, "memory_limit", None)
         constraints_section = ""
@@ -240,6 +227,8 @@ class AleBenchEnv(BaseEnv):
                 )
             constraints_section = "\n".join(constraints_lines)
 
+        example_input = getattr(self.problem, "example_input", "")
+        example_output = getattr(self.problem, "example_output", "")
         example_section = ""
         if example_input.strip() or example_output.strip():
             example_section = "\n--- Example Input/Output ---\n"
@@ -247,6 +236,23 @@ class AleBenchEnv(BaseEnv):
                 example_section += f"Input:\n```\n{example_input.strip()}\n```\n"
             if example_output.strip():
                 example_section += f"Output:\n```\n{example_output.strip()}\n```\n"
+
+        return constraints_section, example_section
+
+    def get_prompt(self, state: State) -> str:
+        """Build a prompt for the current ALE-Bench problem and state."""
+        problem_statement = self.problem.statement
+        tool_readme = self.problem.tool_readme
+
+        value_context = state.to_prompt(
+            target=None,  # Do not show the global target/gap; let the model focus
+            # on incremental improvement instead of a potentially overwhelming gap.
+            metric_name="score",
+            maximize=self.maximize,
+            language=self.code_language,
+        )
+
+        constraints_section, example_section = self._problem_context_sections()
 
         return f"""You are a world-class algorithm engineer participating in an AtCoder Heuristic Contest.
 
@@ -267,6 +273,36 @@ Rules:
 - Your program must read from stdin and write to stdout exactly as described in the statement.
 - Make efficient use of the allowed time limit. Think outside the box and try diverse approaches.
 - Make sure you /think carefully before coding by learning from previous code and feedback.
+"""
+
+    def get_prompt_distill(self, state: State) -> str:
+        """Build a clean, from-scratch prompt for distillation rollouts.
+
+        Unlike :meth:`get_prompt`, this variant intentionally omits the state's
+        previous code and any "improve this solution" framing. It is used for
+        both distillation training rollouts and full ALE-Bench evaluation
+        rollouts so both settings see the same problem-only instruction.
+        """
+        problem_statement = self.problem.statement
+        tool_readme = self.problem.tool_readme
+        constraints_section, example_section = self._problem_context_sections()
+
+        return f"""You are participating in an AtCoder Heuristic Contest.
+
+Solve the problem below by writing a complete C++20 program. Read the statement, constraints, and examples carefully, reason about your algorithm, and then produce the final code.
+
+--- Problem Statement ---
+{problem_statement}{constraints_section}{example_section}
+
+--- Tool README ---
+{tool_readme}
+
+Instructions:
+- Write a complete C++20 program (GNU G++17 / C++20 compatible).
+- Your program must read from stdin and write to stdout exactly as described in the statement.
+- Reason about your approach before coding. Include a brief explanation of your algorithmic idea before the final code block.
+- Place your complete solution inside a single ```cpp ... ``` block.
+- The code should be clean, well-structured, and include comments where helpful.
 """
 
     def _recreate_session(self) -> None:

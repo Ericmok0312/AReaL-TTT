@@ -10,6 +10,33 @@ from areal.api.cli_args import (
 
 
 @dataclass
+class MultiTeacherConfig:
+    """Configuration for one teacher in multi-teacher distillation.
+
+    Each entry corresponds to a single ALE-Bench problem whose PUCTSampler
+    checkpoint and LoRA adapter are used to provide privileged hints and
+    teacher log probabilities for that problem's rollouts.
+    """
+
+    problem_id: str = field(
+        default="",
+        metadata={"help": "ALE-Bench problem ID (e.g. 'ahc039')."},
+    )
+    sampler_checkpoint: str = field(
+        default="",
+        metadata={
+            "help": "Path to the teacher PUCTSampler checkpoint directory for this problem."
+        },
+    )
+    lora_path: str = field(
+        default="",
+        metadata={
+            "help": "Path to the teacher LoRA adapter checkpoint for this problem."
+        },
+    )
+
+
+@dataclass
 class SamplerConfig:
     """Configuration for PUCTSampler"""
 
@@ -377,6 +404,51 @@ class TTTDDistillConfig(TTTDPPOConfig):
         metadata={"help": "Path to teacher PUCTSampler checkpoint directory"},
     )
 
+    # Multi-teacher distillation: one entry per trained problem
+    multi_teacher: list[MultiTeacherConfig] = field(
+        default_factory=list,
+        metadata={
+            "help": "List of per-problem teacher configs for multi-teacher distillation. "
+            "When set, the single teacher/teacher_sampler_checkpoint fields are ignored, "
+            "and each training batch contains one group per problem."
+        },
+    )
+    multi_teacher_hint_mode: str = field(
+        default="best_worst_combined",
+        metadata={
+            "help": "How to select privileged hints from each problem's teacher sampler. "
+            "Options: 'best' (best reward state), 'worst_nonzero' (worst non-zero reward state), "
+            "'breakthrough' (largest parent->child improvement), "
+            "'best_worst_combined' (single hint with best + worst_nonzero). "
+            "'diverse_best' (best states from different PUCT branches), "
+            "'diverse_worst_nonzero' (worst non-zero states from different branches), "
+            "'diverse_best_worst' (cycle diverse best + diverse worst). "
+            "Breakthrough and best_worst_combined are independent modes and are never mixed."
+        },
+    )
+    multi_teacher_hint_min_improvement: float = field(
+        default=0.001,
+        metadata={
+            "help": "Minimum absolute value improvement for a transition to be considered a breakthrough hint."
+        },
+    )
+    multi_teacher_hint_deterministic: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, select breakthrough hints deterministically by "
+            "improvement magnitude instead of weighted random sampling. "
+            "Best/worst hints are already deterministic."
+        },
+    )
+    multi_teacher_hint_k: int = field(
+        default=1,
+        metadata={
+            "help": "Number of best/worst reference examples to include per category "
+            "in combined or few-shot hint modes. Only used by modes that show "
+            "multiple references (best_worst_combined, diverse_best_worst)."
+        },
+    )
+
     # Validation / logging
     total_rollouts_per_step: int = field(
         default=512,
@@ -518,6 +590,79 @@ class TTTDDistillConfig(TTTDPPOConfig):
             "with small group sizes by anchoring to a global reference."
         },
     )
+
+    # ALE-Bench full-corpus evaluation (public→private, median selection)
+    ale_bench_eval_enabled: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, run full ALE-Bench evaluation every ale_bench_eval_freq_steps steps. "
+            "Generates N candidates per problem, picks the one with the highest median public score, "
+            "and records the private evaluation score."
+        },
+    )
+    ale_bench_eval_before_train: bool = field(
+        default=True,
+        metadata={
+            "help": "Run an ALE-Bench evaluation before training starts (baseline)."
+        },
+    )
+    ale_bench_eval_freq_steps: int = field(
+        default=10,
+        metadata={
+            "help": "Evaluate on the full ALE-Bench corpus every N training steps."
+        },
+    )
+    ale_bench_eval_n_candidates: int = field(
+        default=15,
+        metadata={
+            "help": "Number of candidate responses generated per problem for ALE-Bench evaluation."
+        },
+    )
+    ale_bench_eval_lite_version: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, evaluate only on the ALE-Bench lite subset; "
+            "otherwise evaluate on the full problem list."
+        },
+    )
+    ale_bench_eval_num_workers: int = field(
+        default=1,
+        metadata={
+            "help": "Number of ALE-Bench workers per session (passed to ale_bench.start)."
+        },
+    )
+    ale_bench_eval_n_parallel_problems: int = field(
+        default=1,
+        metadata={
+            "help": "Number of ALE-Bench problems to evaluate concurrently within "
+            "one process (ProcessPoolExecutor). This is per-rank parallelism; "
+            "the total concurrent sessions across the job are "
+            "n_parallel_problems * data_parallel_world_size."
+        },
+    )
+    ale_bench_eval_output_dir: str = field(
+        default="",
+        metadata={
+            "help": "Directory to save ALE-Bench evaluation JSON results. "
+            "Defaults to <saver.fileroot>/<experiment>/<trial>/ale_bench_eval."
+        },
+    )
+
+    def __post_init__(self):
+        # Convert multi_teacher entries from dict to dataclass
+        if self.multi_teacher and isinstance(self.multi_teacher, list):
+            converted = []
+            for item in self.multi_teacher:
+                if isinstance(item, dict):
+                    converted.append(MultiTeacherConfig(**item))
+                elif isinstance(item, MultiTeacherConfig):
+                    converted.append(item)
+                else:
+                    raise ValueError(
+                        f"multi_teacher entries must be dict or MultiTeacherConfig, got {type(item)}"
+                    )
+            self.multi_teacher = converted
+        super().__post_init__()
 
 
 # Import envs here to avoid circular imports

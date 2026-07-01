@@ -351,12 +351,29 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
 
         return stats
 
-    def _get_prompt(self, state, use_hint: bool = True) -> str:
+    def _get_env(self, data: dict[str, Any] | None = None) -> BaseEnv:
+        """Return the environment for the current rollout.
+
+        Subclasses may override this to route rollouts based on ``data``.
+        """
+        return self.env
+
+    def _get_sampler(self, data: dict[str, Any] | None = None) -> StateSampler | None:
+        """Return the sampler for the current rollout.
+
+        Subclasses may override this to route rollouts based on ``data``.
+        """
+        return self.sampler
+
+    def _get_prompt(
+        self, state, use_hint: bool = True, env: BaseEnv | None = None
+    ) -> str:
         """Get prompt for state, optionally appending or replacing with hint."""
-        if self.distill_mode and hasattr(self.env, "get_prompt_distill"):
-            prompt = self.env.get_prompt_distill(state)
+        env = env or self.env
+        if self.distill_mode and hasattr(env, "get_prompt_distill"):
+            prompt = env.get_prompt_distill(state)
         else:
-            prompt = self.env.get_prompt(state)
+            prompt = env.get_prompt(state)
         if use_hint and self.hint_fn is not None and state is not None:
             try:
                 hint = self.hint_fn(state)
@@ -419,8 +436,11 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         raw_score: float | None = None,
         state: State | None = None,
         breakthrough_child: State | None = None,
+        data: dict[str, Any] | None = None,
+        env: BaseEnv | None = None,
     ) -> dict[str, torch.Tensor]:
         """Create trajectory tensors from response and reward."""
+        env = env or self._get_env(data)
         seq = resp.input_tokens + resp.output_tokens
         logprobs = [0.0] * resp.input_len + resp.output_logprobs
         loss_mask = [0] * resp.input_len + [1] * resp.output_len
@@ -438,8 +458,11 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 dtype=torch.float32,
             ),
             "_student_prompts": [
-                self._get_prompt(state, use_hint=False) if state is not None else ""
+                self._get_prompt(state, use_hint=False, env=env)
+                if state is not None
+                else ""
             ],
+            "_problem_ids": [data.get("_problem_id", "")] if data is not None else [""],
         }
         # Attach breakthrough parent/child for Breakthrough-Aware OPD
         # Wrap in list so concat_padded_tensors flat-concats them correctly
@@ -468,6 +491,8 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         resp: ModelResponse | None = None,
         breakthrough_child: State | None = None,
         raw_score: float | None = None,
+        data: dict[str, Any] | None = None,
+        env: BaseEnv | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Create a trajectory for failed rollouts.
@@ -482,10 +507,12 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             fail_type: Type of failure (timeout, code_extraction_failed, execution_error, missing_state)
             error_msg: Additional error message
             resp: Optional model response containing the generated completion
+            data: Optional input data containing _problem_id for multi-problem mode.
 
         Returns:
             Dictionary with trajectory tensors
         """
+        env = env or self._get_env(data)
         if resp is not None:
             # Preserve the full generated sequence (prompt + completion) with correct masks
             seq = resp.input_tokens + resp.output_tokens
@@ -494,7 +521,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             versions = [-1] * resp.input_len + resp.output_versions
 
             # Get reward from env (may vary by fail_type)
-            result = self.env.get_failure_result(state, fail_type, error_msg)
+            result = env.get_failure_result(state, fail_type, error_msg)
 
             trajectory = {
                 "input_ids": torch.tensor(seq, dtype=torch.int32).unsqueeze(0),
@@ -510,7 +537,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             }
         else:
             # Fallback: no response available (e.g. missing state, engine exception)
-            trajectory = self.env.create_failed_trajectory(
+            trajectory = env.create_failed_trajectory(
                 state=state,
                 input_ids=input_ids,
                 tokenizer=self.tokenizer,
@@ -519,8 +546,11 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             )
 
         trajectory["_student_prompts"] = [
-            self._get_prompt(state, use_hint=False) if state is not None else ""
+            self._get_prompt(state, use_hint=False, env=env)
+            if state is not None
+            else ""
         ]
+        trajectory["_problem_ids"] = [data.get("_problem_id", "")]
 
         # Attach breakthrough parent/child for Breakthrough-Aware OPD
         # Wrap in list so concat_padded_tensors flat-concats them correctly
@@ -537,6 +567,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         resp: ModelResponse,
         task_data: dict[str, Any],
         gpu_done_time: float | None = None,
+        env: BaseEnv | None = None,
     ) -> tuple[float, EnvResult, str, float]:
         """Compute reward by executing code using AsyncRewardWrapper.
 
@@ -549,6 +580,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             resp: Model response from generation
             task_data: Task data including state object
             gpu_done_time: Timestamp when GPU inference completed (for tail latency measurement)
+            env: Environment to use (defaults to self._get_env(task_data))
 
         Returns:
             tuple: (reward_value, EnvResult, extracted_code, exec_time_ms)
@@ -556,15 +588,16 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         """
         import time
 
+        env = env or self._get_env(task_data)
         start_time = time.time()
 
         completion_str = self.tokenizer.decode(resp.output_tokens)
-        code = self.env.extract_code(completion_str)
+        code = env.extract_code(completion_str)
         state = task_data.get("_state_obj")
 
         if code is None:
             logger.warning("Code extraction failed")
-            result = self.env.get_failure_result(
+            result = env.get_failure_result(
                 state=state,
                 fail_type="code_extraction_failed",
             )
@@ -584,7 +617,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 completion_str,
                 resp.input_tokens,
                 resp.output_tokens,
-                _env=self.env,
+                _env=env,
                 _state=state,
             )
 
@@ -595,7 +628,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 logger.warning(
                     f"Reward computation timeout for state {state.id[:8] if state else 'None'}..."
                 )
-                result = self.env.get_failure_result(
+                result = env.get_failure_result(
                     state=state,
                     fail_type="timeout",
                     error_msg="Reward computation timed out",
@@ -629,7 +662,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
 
         except Exception as e:
             logger.warning(f"Execution failed: {e}")
-            result = self.env.get_failure_result(
+            result = env.get_failure_result(
                 state=state,
                 fail_type="execution_error",
                 error_msg=str(e),
@@ -652,6 +685,40 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
 
         return result.reward, result, extracted_code, exec_time_ms
 
+    def _sample_parents_for_cache_key(
+        self,
+        sampler: StateSampler,
+        data: dict[str, Any],
+        version: int,
+    ) -> tuple[list[State], list[State | None]]:
+        """Sample parent states for a lazy-sampling cache key.
+
+        Single-problem mode samples a full global batch and returns this rank's
+        slice. Subclasses (e.g. multi-problem workflows) may override to sample
+        only the parents needed for the current placeholder.
+        """
+        global_batch = self.batch_size * self.dp_world_size
+
+        if getattr(sampler, "sampling_strategy", None) == "breakthrough_parent":
+            min_improvement = getattr(self, "_breakthrough_min_improvement", 0.001)
+            all_pairs = sampler.sample_breakthrough_parents(
+                num_states=global_batch,
+                min_improvement=min_improvement,
+            )
+            all_parents = [p for p, _c in all_pairs]
+            all_children = [_c for _p, _c in all_pairs]
+        else:
+            all_parents = sampler.sample_states_for_version(
+                num_states=global_batch, target_version=version
+            )
+            all_children = [None] * len(all_parents)
+
+        # Take this rank's slice
+        start_idx = self.dp_rank * self.batch_size
+        my_parents = all_parents[start_idx : start_idx + self.batch_size]
+        my_children = all_children[start_idx : start_idx + self.batch_size]
+        return my_parents, my_children
+
     async def _do_lazy_sampling(self, data: dict[str, Any]) -> State:
         """
         Perform lazy PUCT sampling when VLLM has capacity.
@@ -669,59 +736,45 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         """
         batch_id = data["_batch_id"]
         batch_idx = data["_batch_idx"]
+        problem_id = data.get("_problem_id", "")
+
+        # Multi-problem mode: each problem has its own sampler.
+        sampler = self._get_sampler(data)
+        if sampler is None:
+            raise ValueError(
+                f"[LazySampling] No sampler available for problem_id={problem_id}"
+            )
 
         async with self._cache_lock:
             # Get version from sampler (may be assigned by this rank or synced from other rank)
-            version = self.sampler.get_batch_version(batch_id)
+            version = sampler.get_batch_version(batch_id)
 
             if version is None:
                 # First rollout of this batch: assign latest available version
-                available = sorted(self.sampler._version_snapshots.keys())
+                available = sorted(sampler._version_snapshots.keys())
                 version = available[-1] if available else -1
-                self.sampler.assign_batch_version(batch_id, version)
+                sampler.assign_batch_version(batch_id, version)
 
                 logger.info(
                     f"[LAZY_VERSION] batch_id={batch_id} rank={self.dp_rank} "
+                    f"problem_id={problem_id} "
                     f"assigned_v={version if version != -1 else 'current'} "
                     f"available_snapshots={available}"
                 )
 
+            # Multi-problem mode uses per-problem samplers; cache key includes problem_id.
+            cache_key = (batch_id, problem_id)
+
             # Sample parents (only once per batch per rank)
-            if batch_id not in self._batch_parents:
-                global_batch = self.batch_size * self.dp_world_size
-
-                # Breakthrough-parent strategy: sample parents that have breakthrough children
-                if (
-                    getattr(self.sampler, "sampling_strategy", None)
-                    == "breakthrough_parent"
-                ):
-                    min_improvement = getattr(
-                        self.config, "breakthrough_min_improvement", 0.001
-                    )
-                    all_pairs = self.sampler.sample_breakthrough_parents(
-                        num_states=global_batch,
-                        min_improvement=min_improvement,
-                    )
-                    all_parents = [p for p, _c in all_pairs]
-                    all_children = [_c for _p, _c in all_pairs]
-                else:
-                    all_parents = self.sampler.sample_states_for_version(
-                        num_states=global_batch, target_version=version
-                    )
-                    all_children = [None] * len(all_parents)
-
-                # Take this rank's slice
-                start_idx = self.dp_rank * self.batch_size
-                my_parents = all_parents[start_idx : start_idx + self.batch_size]
-                my_children = all_children[start_idx : start_idx + self.batch_size]
-                self._batch_parents[batch_id] = my_parents
-                self._batch_breakthrough_children[batch_id] = my_children
+            if cache_key not in self._batch_parents:
+                my_parents, my_children = self._sample_parents_for_cache_key(
+                    sampler, data, version
+                )
+                self._batch_parents[cache_key] = my_parents
+                self._batch_breakthrough_children[cache_key] = my_children
 
                 # Log parent-child alignment for Breakthrough-Aware OPD verification
-                if (
-                    getattr(self.sampler, "sampling_strategy", None)
-                    == "breakthrough_parent"
-                ):
+                if getattr(sampler, "sampling_strategy", None) == "breakthrough_parent":
                     pair_info = []
                     for p, c in zip(my_parents, my_children):
                         if c is not None:
@@ -741,16 +794,22 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 else:
                     logger.info(
                         f"[LAZY_SAMPLE] batch_id={batch_id} rank={self.dp_rank} "
-                        f"version={version} strategy=puct "
+                        f"problem_id={problem_id} version={version} strategy=puct "
                         f"parents={[p.id[:8] for p in my_parents]}"
                     )
 
             # Attach breakthrough child to data for trajectory/teacher logp
-            breakthrough_children = self._batch_breakthrough_children.get(batch_id, [])
+            breakthrough_children = self._batch_breakthrough_children.get(cache_key, [])
             if batch_idx < len(breakthrough_children):
                 data["_breakthrough_child"] = breakthrough_children[batch_idx]
 
-            return self._batch_parents[batch_id][batch_idx]
+            parents = self._batch_parents.get(cache_key, [])
+            if batch_idx >= len(parents):
+                raise IndexError(
+                    f"[LazySampling] batch_idx={batch_idx} out of range for "
+                    f"problem_id={problem_id} parents={len(parents)}"
+                )
+            return parents[batch_idx]
 
     def get_version_mapping_info(self) -> dict:
         """Get current version mapping state for debugging.
@@ -899,6 +958,8 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         No external metadata needed - everything is handled internally.
         """
 
+        env = self._get_env(data)
+
         # === LAZY SAMPLING MODE ===
         if self.lazy_sampling and data.get("_lazy_placeholder"):
             # Wait for VLLM capacity, then sample (ensures fresh PUCT state)
@@ -911,7 +972,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 state = await self._do_lazy_sampling(data)
 
                 # Execute VLLM generation immediately after sampling
-                return await self._execute_rollout(engine, state, data)
+                return await self._execute_rollout(engine, state, data, env=env)
 
         # === EAGER MODE (original behavior) ===
         state = data.get("_state_obj")
@@ -921,19 +982,22 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 state=None,
                 input_ids=[0],
                 fail_type="missing_state",
+                data=data,
             )
 
-        return await self._execute_rollout(engine, state, data)
+        return await self._execute_rollout(engine, state, data, env=env)
 
     async def _execute_rollout(
         self,
         engine: InferenceEngine,
         state: State,
         data: dict[str, Any],
+        env: BaseEnv | None = None,
     ) -> dict[str, torch.Tensor] | None:
         """Execute the actual rollout (VLLM + Execution)."""
         # Ensure state is available in data for _compute_reward
         data["_state_obj"] = state
+        data["_env"] = env
 
         # Get the step when this parent was sampled (from dataloader)
         # This is CRITICAL for staleness tracking with composite key
@@ -1005,9 +1069,11 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         except Exception as e:
             logger.warning(f"[PUCT_TRACK] Failed to start parent episode: {e}")
 
+        env = self._get_env(data)
+
         try:
             # Generate - Phase 1: Normal thinking
-            prompt = self._get_prompt(state)
+            prompt = self._get_prompt(state, env=env)
             messages = [{"role": "user", "content": prompt}]
             input_ids = list(
                 self.tokenizer.apply_chat_template(
@@ -1056,7 +1122,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
 
             # Check if generation was truncated or no valid code
             completion_str = self.tokenizer.decode(resp.output_tokens)
-            code = self.env.extract_code(completion_str)
+            code = env.extract_code(completion_str)
 
             logger.info(
                 f"[OUTPUT] input_len={resp.input_len} output_len={resp.output_len} "
@@ -1113,11 +1179,11 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             if self.lazy_sampling:
                 async with self._exec_sem:
                     reward, result, code, exec_time_ms = await self._compute_reward(
-                        resp, data, gpu_done_time
+                        resp, data, gpu_done_time, env=env
                     )
             else:
                 reward, result, code, exec_time_ms = await self._compute_reward(
-                    resp, data, gpu_done_time
+                    resp, data, gpu_done_time, env=env
                 )
 
             # Log validation failure (concise)
@@ -1139,6 +1205,8 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                     raw_score=raw_score,
                     state=state,
                     breakthrough_child=data.get("_breakthrough_child"),
+                    data=data,
+                    env=env,
                 )
             else:
                 # Use fail_type from result if available, otherwise default to execution_error
@@ -1156,13 +1224,15 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                     resp=resp,
                     breakthrough_child=data.get("_breakthrough_child"),
                     raw_score=raw_score,
+                    data=data,
+                    env=env,
                 )
 
             # Create child state and buffer sampler update (thread-safe)
             if result.is_valid:
                 # Success: save child state for future sampling
                 try:
-                    child = self.env.create_state(
+                    child = env.create_state(
                         parent_state=state,
                         code=code,
                         reward=reward,
@@ -1346,6 +1416,7 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 input_ids=input_ids,
                 fail_type="execution_error",
                 error_msg=str(e),
+                data=data,
             )
 
     def reset(self):
@@ -2164,3 +2235,35 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
     def __del__(self):
         """Destructor for compatibility."""
         pass
+
+
+class MultiProblemTTTDiscoverWorkflowV2(TTTDiscoverWorkflowV2):
+    """TTT-Discover workflow that routes each rollout to its problem env/sampler.
+
+    Used for multi-teacher distillation where each rollout is tagged with
+    ``_problem_id`` (set by the multi-problem dataloader) and must be executed
+    against the environment and sampler that correspond to that problem.
+    """
+
+    def __init__(
+        self,
+        *,
+        problem_envs: dict[str, BaseEnv],
+        problem_samplers: dict[str, StateSampler] | None = None,
+        **kwargs: Any,
+    ):
+        super().__init__(**kwargs)
+        self.problem_envs = problem_envs
+        self.problem_samplers = problem_samplers or {}
+
+    def _get_env(self, data: dict[str, Any] | None = None) -> BaseEnv:
+        problem_id = data.get("_problem_id") if data else None
+        if problem_id and problem_id in self.problem_envs:
+            return self.problem_envs[problem_id]
+        return super()._get_env(data)
+
+    def _get_sampler(self, data: dict[str, Any] | None = None) -> StateSampler | None:
+        problem_id = data.get("_problem_id") if data else None
+        if problem_id and problem_id in self.problem_samplers:
+            return self.problem_samplers[problem_id]
+        return super()._get_sampler(data)

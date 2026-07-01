@@ -150,14 +150,16 @@ class TTTDActor(FSDPEngine):
         # Compute Entropic Advantages.
         # TTT-Discover uses sequence-level external reward only (no KL aggregation)
         # to compute w_{beta(s)}(a), then subtracts token-level KL penalty.
-        group_ids = self._extract_group_ids(data, bs)
+        # Use globally-consistent group keys so that DP ranks can synchronize
+        # the entropic group (one parent = one group).
+        group_keys = self._extract_group_keys(data, bs)
 
         # Compute sequence-level entropic advantages: w_beta - 1
         logger.info(
             f"[TTTDActor.compute_advantages] adv_estimator={self.config.adv_estimator}"
         )
         entropic_adv_seq = self._compute_entropic_advantages(
-            reward_score, group_ids, self.config.adv_estimator
+            reward_score, group_keys, self.config.adv_estimator
         )  # [bs]
 
         # Broadcast to token level: [bs] -> [bs, seqlen]
@@ -206,41 +208,76 @@ class TTTDActor(FSDPEngine):
         # Default: entire batch as one group (standard TTT-Discover behavior)
         return torch.zeros(batch_size, device=device, dtype=torch.long)
 
+    def _extract_group_keys(self, data: dict, batch_size: int) -> list[str]:
+        """Extract per-parent group keys for entropic advantage grouping.
+
+        Each parent state defines one entropic group. The rollouts of a single
+        parent are kept together by ``GroupedRolloutWorkflow``, so grouping by
+        parent id here is sufficient and can be done locally on each DP rank.
+        """
+        parents = data.get("_breakthrough_parent")
+        if parents is not None and len(parents) == batch_size:
+            keys = []
+            for i, state in enumerate(parents):
+                sid = getattr(state, "id", None)
+                if sid is None:
+                    sid = f"unknown_{self.data_parallel_rank}_{i}"
+                keys.append(str(sid))
+            return keys
+
+        # Fallback: per-rank integer groups (may mix parents if group_size
+        # is not configured; rely on config.group_size to split correctly).
+        if dist.is_initialized() and self.data_parallel_world_size > 1:
+            logger.warning(
+                "_breakthrough_parent metadata not found in batch; "
+                "falling back to config.group_size for local grouping."
+            )
+        group_ids = self._extract_group_ids(data, batch_size)
+        rank = self.data_parallel_rank if dist.is_initialized() else 0
+        return [f"rank{rank}_group{int(gid)}" for gid in group_ids.tolist()]
+
     def _compute_entropic_advantages(
-        self, rewards: torch.Tensor, group_ids: torch.Tensor, method: str
+        self, rewards: torch.Tensor, group_keys: list[str], method: str
     ) -> torch.Tensor:
-        """Compute sequence-level entropic advantages (w_beta - 1) for each group."""
-        unique_groups = torch.unique(group_ids)
+        """Compute sequence-level entropic advantages (w_beta - 1) for each group.
+
+        Grouping is done per parent state. Because ``GroupedRolloutWorkflow``
+        concatenates all rollouts of a parent into a single trajectory dict and
+        ``DistRolloutCoordinator`` redistributes trajectory dicts atomically, each
+        parent group is wholly present on one DP rank. Therefore beta can be solved
+        locally without cross-rank communication.
+        """
         advantages = torch.zeros_like(rewards)
 
-        for gid in unique_groups:
-            mask = group_ids == gid
-            group_rewards = rewards[mask]
+        # Build local key -> index mapping.
+        key_to_indices: dict[str, list[int]] = {}
+        for i, key in enumerate(group_keys):
+            key_to_indices.setdefault(key, []).append(i)
 
-            if method == "mean_baseline":
-                # Simple mean baseline: R - mean(R)
-                adv = group_rewards - group_rewards.mean()
-            elif method == "entropic":
-                # Fixed beta entropic: w_beta - 1
-                beta = self.config.adv_estimator_beta
-                adv = self._entropic_weight_minus_one(group_rewards, beta)
-            elif method == "entropic_adaptive_beta":
-                # Adaptive beta based on KL constraint
-                delta = getattr(self.config, "adv_estimator_target_kl", 0.693)
-                beta_max = getattr(self.config, "adv_estimator_beta_max", 1e6)
-                iters = getattr(self.config, "adv_estimator_beta_iters", 60)
+        if method == "mean_baseline":
+            for idxs in key_to_indices.values():
+                group_rewards = rewards[idxs]
+                advantages[idxs] = group_rewards - group_rewards.mean()
+        elif method == "entropic":
+            beta = self.config.adv_estimator_beta
+            for idxs in key_to_indices.values():
+                advantages[idxs] = self._entropic_weight_minus_one(rewards[idxs], beta)
+        elif method == "entropic_adaptive_beta":
+            delta = getattr(self.config, "adv_estimator_target_kl", 0.693)
+            beta_max = getattr(self.config, "adv_estimator_beta_max", 1e6)
+            iters = getattr(self.config, "adv_estimator_beta_iters", 60)
 
+            for idxs in key_to_indices.values():
+                group_rewards = rewards[idxs]
                 beta = self._solve_adaptive_beta(group_rewards, delta, beta_max, iters)
                 logger.info(
                     f"[TTTDActor._compute_entropic_advantages] "
                     f"method={method}, group_size={group_rewards.shape[0]}, "
                     f"solved_beta={beta.item():.6f}"
                 )
-                adv = self._entropic_weight_minus_one(group_rewards, beta)
-            else:
-                raise ValueError(f"Unknown advantage estimator: {method}")
-
-            advantages[mask] = adv
+                advantages[idxs] = self._entropic_weight_minus_one(group_rewards, beta)
+        else:
+            raise ValueError(f"Unknown advantage estimator: {method}")
 
         return advantages
 

@@ -1465,6 +1465,7 @@ class PUCTSampler(StateSampler):
         self,
         num_transitions: int,
         min_improvement: float = 0.001,
+        deterministic: bool = False,
     ) -> list[tuple[State, State]]:
         """Sample breakthrough (parent, child) transitions.
 
@@ -1480,6 +1481,9 @@ class PUCTSampler(StateSampler):
         min_improvement : float
             Minimum absolute value improvement (child.value - parent.value) for a
             transition to be considered a breakthrough.
+        deterministic : bool
+            If True, return the top ``num_transitions`` transitions by improvement
+            instead of weighted random sampling.  Useful for stable testing.
 
         Returns
         -------
@@ -1531,6 +1535,9 @@ class PUCTSampler(StateSampler):
             )
 
             if len(pool) >= num_transitions:
+                if deterministic:
+                    # Deterministic: take the top transitions by improvement.
+                    return [(pool[i][1], pool[i][2]) for i in range(num_transitions)]
                 # Weighted sampling by improvement
                 weights = np.array([t[0] for t in pool])
                 weights = weights + 1e-6
@@ -1638,6 +1645,190 @@ class PUCTSampler(StateSampler):
                 f"{len(breakthroughs)} breakthroughs (min_improvement={min_improvement})"
             )
             return result
+
+    def get_best_state(self, k: int = 1) -> list[State]:
+        """Return the top-k highest-value states from the buffer.
+
+        Parameters
+        ----------
+        k : int
+            Number of states to return.
+
+        Returns
+        -------
+        list[State]
+            Top-k states sorted by value descending.
+        """
+        with self._lock:
+            candidates = [s for s in self._states if s.value is not None]
+            if not candidates:
+                return []
+            candidates.sort(key=lambda s: s.value, reverse=True)
+            return candidates[:k]
+
+    def get_worst_nonzero_state(self, k: int = 1) -> list[State]:
+        """Return the lowest-value states whose value is strictly positive.
+
+        For ALE-Bench higher value is better; positive but low rewards represent
+        poor-but-valid solutions that are still informative as negative examples.
+
+        Parameters
+        ----------
+        k : int
+            Number of states to return.
+
+        Returns
+        -------
+        list[State]
+            Worst non-zero states sorted by value ascending.
+        """
+        with self._lock:
+            candidates = [
+                s for s in self._states if s.value is not None and s.value > 0
+            ]
+            if not candidates:
+                return []
+            candidates.sort(key=lambda s: s.value, reverse=False)
+            return candidates[:k]
+
+    def _diverse_top_k(self, candidates: list[State], k: int) -> list[State]:
+        """Greedy select top-k candidates from different PUCT branches.
+
+        Two states are considered to be from the same branch if one is an
+        ancestor or descendant of the other.  This avoids returning multiple
+        hints that are nearly identical refinements of the same root idea.
+        """
+        if not candidates or k <= 0:
+            return []
+        children_map = self._build_children_map()
+        selected: list[State] = []
+        selected_lineages: list[set[str]] = []
+        for s in candidates:
+            if len(selected) >= k:
+                break
+            s_lineage = self._get_full_lineage(s, children_map)
+            if any(
+                s.id in sel_lineage or sel.id in s_lineage
+                for sel, sel_lineage in zip(selected, selected_lineages)
+            ):
+                continue
+            selected.append(s)
+            selected_lineages.append(s_lineage)
+        return selected
+
+    def get_diverse_best_states(self, k: int = 1) -> list[State]:
+        """Return top-k highest-value states from different PUCT branches."""
+        with self._lock:
+            candidates = [s for s in self._states if s.value is not None]
+            if not candidates:
+                return []
+            candidates.sort(key=lambda s: s.value, reverse=True)
+            return self._diverse_top_k(candidates, k)
+
+    def get_diverse_worst_nonzero_states(self, k: int = 1) -> list[State]:
+        """Return k worst positive-reward states from different PUCT branches."""
+        with self._lock:
+            candidates = [
+                s for s in self._states if s.value is not None and s.value > 0
+            ]
+            if not candidates:
+                return []
+            candidates.sort(key=lambda s: s.value, reverse=False)
+            return self._diverse_top_k(candidates, k)
+
+    def get_hint_states(
+        self,
+        mode: str = "best_worst_combined",
+        k: int = 1,
+        min_improvement: float = 0.001,
+        deterministic: bool = False,
+    ) -> list[tuple[str, State | tuple[State, State]]]:
+        """Extract a pool of privileged hint states for multi-teacher distillation.
+
+        Parameters
+        ----------
+        mode : str
+            One of:
+            - 'best': best reward state(s).
+            - 'worst_nonzero': worst positive-reward state(s).
+            - 'breakthrough': largest parent->child improvement transitions.
+            - 'best_worst_combined': combined hint with the top-k best and top-k
+              worst_nonzero states (few-shot reference).
+            - 'diverse_best': best states from different PUCT branches.
+            - 'diverse_worst_nonzero': worst non-zero states from different branches.
+            - 'diverse_best_worst': combined hint with k diverse best and k diverse
+              worst states (few-shot reference).
+            'breakthrough' and combined best/worst modes are independent and are
+            never mixed within a single hint.
+        k : int
+            Number of reference examples per category for combined/few-shot modes.
+        min_improvement : float
+            Minimum improvement for a breakthrough transition.
+        deterministic : bool
+            If True, breakthrough transitions are selected deterministically
+            by improvement magnitude.  Best/worst hints are already deterministic.
+
+        Returns
+        -------
+        list[tuple[str, State | tuple[State, State]]]
+            List of (hint_type, hint_state_or_pair). The trainer cycles through
+            these hints so different rollouts for the same problem can see
+            different privileged information.
+        """
+        import logging
+
+        logger = logging.getLogger("PUCTSampler")
+
+        hints: list[tuple[str, State | tuple[State, State]]] = []
+        if mode == "best":
+            for s in self.get_best_state(k=k):
+                hints.append(("best", s))
+        if mode == "worst_nonzero":
+            for s in self.get_worst_nonzero_state(k=k):
+                hints.append(("worst_nonzero", s))
+        if mode == "breakthrough":
+            pairs = self.sample_breakthrough_transitions(
+                num_transitions=k,
+                min_improvement=min_improvement,
+                deterministic=deterministic,
+            )
+            for pair in pairs:
+                hints.append(("breakthrough", pair))
+        if mode == "best_worst_combined":
+            best_states = self.get_best_state(k=k)
+            worst_states = self.get_worst_nonzero_state(k=k)
+            if best_states and worst_states:
+                hints.append(("best_worst_combined", (best_states, worst_states)))
+            elif best_states:
+                for s in best_states:
+                    hints.append(("best", s))
+            elif worst_states:
+                for s in worst_states:
+                    hints.append(("worst_nonzero", s))
+        if mode == "diverse_best":
+            for s in self.get_diverse_best_states(k=k):
+                hints.append(("diverse_best", s))
+        if mode == "diverse_worst_nonzero":
+            for s in self.get_diverse_worst_nonzero_states(k=k):
+                hints.append(("diverse_worst_nonzero", s))
+        if mode == "diverse_best_worst":
+            best_states = self.get_diverse_best_states(k=k)
+            worst_states = self.get_diverse_worst_nonzero_states(k=k)
+            if best_states or worst_states:
+                hints.append(("diverse_best_worst", (best_states, worst_states)))
+
+        if not hints:
+            logger.warning(
+                f"[HintStates] No hints found for mode={mode}. Falling back to best states."
+            )
+            for s in self.get_best_state(k=max(1, k)):
+                hints.append(("best", s))
+
+        logger.info(
+            f"[HintStates] mode={mode} generated {len(hints)} hints "
+            f"(categories={[h[0] for h in hints]})"
+        )
+        return hints
 
     def deserialize_full_state(self, state_data: dict) -> None:
         """
