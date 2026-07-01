@@ -29,29 +29,29 @@ ale_bench_eval_n_parallel_problems: 2
 # one group per problem (8 problems x 8 rollouts = 64 total rollouts per step).
 multi_teacher:
   - problem_id: ahc025
-    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench-ahc025/trial0/sampler
-    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench-ahc025/trial0/default/epoch29epochstep29globalstep29
+    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc025/trial0/sampler
+    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc025/trial0/default/epoch29epochstep29globalstep29
   - problem_id: ahc026
-    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench-ahc026/trial0/sampler
-    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench-ahc026/trial0/default/epoch29epochstep29globalstep29
+    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc026/trial0/sampler
+    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc026/trial0/default/epoch29epochstep29globalstep29
   - problem_id: ahc027
-    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench-ahc027/trial0/sampler
-    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench-ahc027/trial0/default/epoch29epochstep29globalstep29
+    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc027/trial0/sampler
+    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc027/trial0/default/epoch29epochstep29globalstep29
   - problem_id: ahc039
-    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench-ahc039/trial0/sampler
-    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench-ahc039/trial0/default/epoch29epochstep29globalstep29
+    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc039/trial0/sampler
+    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc039/trial0/default/epoch29epochstep29globalstep29
   - problem_id: ahc046
-    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench-ahc046/trial0/sampler
-    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench-ahc046/trial0/default/epoch29epochstep29globalstep29
+    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc046/trial0/sampler
+    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc046/trial0/default/epoch29epochstep29globalstep29
   - problem_id: ahc011
-    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench-ahc011/trial0/sampler
-    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench-ahc011/trial0/default/epoch29epochstep29globalstep29
+    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc011/trial0/sampler
+    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc011/trial0/default/epoch29epochstep29globalstep29
   - problem_id: ahc015
-    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench-ahc015/trial0/sampler
-    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench-ahc015/trial0/default/epoch29epochstep29globalstep29
+    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc015/trial0/sampler
+    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc015/trial0/default/epoch29epochstep29globalstep29
   - problem_id: ahc016
-    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench-ahc016/trial0/sampler
-    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench-ahc016/trial0/default/epoch29epochstep29globalstep29
+    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc016/trial0/sampler
+    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc016/trial0/default/epoch29epochstep29globalstep29
 
 # Shared teacher engine uses the base model with LoRA structure so the trainer
 # can load each problem's adapter before computing teacher_logp.
