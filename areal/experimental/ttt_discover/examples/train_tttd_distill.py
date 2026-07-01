@@ -2402,9 +2402,10 @@ class TTTDDistillTrainer(PPOTrainer):
                     f"[AleBenchEval][Step {global_step}] Submitting {len(data_list)} "
                     f"problems x {n_candidates} candidates to rollout"
                 )
-                eval_rollout = self.eval_rollout or self.rollout
+                # TTTDDistillTrainer only initializes a training rollout; reuse it
+                # for eval since ALE-Bench eval already runs only on global rank 0.
                 for data in data_list:
-                    eval_rollout.submit(
+                    self.rollout.submit(
                         data,
                         eval_workflow_cls,
                         workflow_kwargs=eval_workflow_kwargs,
@@ -2416,7 +2417,7 @@ class TTTDDistillTrainer(PPOTrainer):
                     f"[AleBenchEval][Step {global_step}] "
                     f"Waiting for {len(data_list)} grouped rollout results"
                 )
-                results = eval_rollout.wait(len(data_list), timeout=None)
+                results = self.rollout.wait(len(data_list), timeout=None)
                 logger.info(
                     f"[AleBenchEval][Step {global_step}] Got {len(results)} rollout results"
                 )
