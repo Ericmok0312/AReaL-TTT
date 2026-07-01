@@ -1099,7 +1099,7 @@ class TTTDDistillTrainer(PPOTrainer):
             self.evaluator.evaluate(
                 functools.partial(_ale_bench_evaluate_fn, start_step),
                 epoch=0,
-                epoch_step=start_step,
+                step=start_step,
                 global_step=start_step,
             )
 
@@ -1433,7 +1433,7 @@ class TTTDDistillTrainer(PPOTrainer):
                 self.evaluator.evaluate(
                     functools.partial(_ale_bench_evaluate_fn, global_step + 1),
                     epoch=0,
-                    epoch_step=global_step + 1,
+                    step=global_step + 1,
                     global_step=global_step + 1,
                 )
 
