@@ -130,6 +130,31 @@ class BaseEnv(ABC):
         """
         raise NotImplementedError
 
+    def truncate_prompt(
+        self, prompt: str, tokenizer: PreTrainedTokenizerFast, max_tokens: int
+    ) -> str:
+        """
+        Truncate a prompt string to fit within ``max_tokens``.
+
+        The default implementation simply truncates token IDs from the end.
+        Subclasses can override this to perform domain-aware truncation
+        (e.g., drop verbose tool usage sections while preserving the core
+        problem statement).
+
+        Args:
+            prompt: Prompt string to truncate.
+            tokenizer: Tokenizer used to count tokens.
+            max_tokens: Maximum number of tokens allowed.
+
+        Returns:
+            Truncated prompt string.
+        """
+        input_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        if len(input_ids) <= max_tokens:
+            return prompt
+        truncated_ids = input_ids[:max_tokens]
+        return tokenizer.decode(truncated_ids)
+
     def extract_code(self, completion: str) -> str | None:
         """
         Extract executable code from raw LLM completion.

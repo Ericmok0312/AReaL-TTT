@@ -1093,6 +1093,11 @@ class TTTDDistillTrainer(PPOTrainer):
             if self.actor.rank != 0:
                 return
             self._run_ale_bench_eval(global_step=eval_global_step)
+            # Internal barrier matching standard AReaL _evaluate_fn: all ranks
+            # wait for the DP head's eval rollouts to finish.
+            if dist.is_initialized():
+                dist.barrier(group=self.actor.cpu_group)
+                current_platform.synchronize()
 
         if self._ale_bench_eval_enabled:
             # Before-train eval (if configured)
@@ -1102,6 +1107,11 @@ class TTTDDistillTrainer(PPOTrainer):
                 step=start_step,
                 global_step=start_step,
             )
+            # External barrier matching standard AReaL _evaluate: all ranks wait
+            # before entering the training loop.
+            if dist.is_initialized():
+                dist.barrier(group=self.actor.cpu_group)
+                current_platform.synchronize()
 
         # =====================================================================
         # Phase 1: Distillation steps (no verification)
@@ -1125,27 +1135,20 @@ class TTTDDistillTrainer(PPOTrainer):
             if hasattr(distill_workflow, "set_current_version"):
                 distill_workflow.set_current_version(global_step)
 
-            # Wrap with GroupedRolloutWorkflow so that prepare_batch respects
-            # group_size even when a workflow instance is passed.  Without this,
-            # RemoteInfEngine._resolve_workflow ignores group_size for instances,
-            # causing only 1 child per parent to be generated while the workflow
-            # expects n_samples children.
-            from areal.infra.remote_inf_engine import GroupedRolloutWorkflow
-
-            grouped_distill_workflow = GroupedRolloutWorkflow(
-                distill_workflow, group_size, logger
-            )
-
             # Clear workflow cache to ensure the new workflow instance is used
             self._clear_workflow_cache()
 
             # Rollout
+            # Pass the workflow instance directly; RemoteInfEngine._resolve_workflow
+            # will wrap it with GroupedRolloutWorkflow using group_size.  Manual
+            # double-wrapping is no longer needed and would create 8x8=64 children
+            # per parent instead of the intended 8.
             rollout_start = time.perf_counter()
             with stats_tracker.record_timing("rollout"):
                 rollout_batch = self.actor.prepare_batch(
                     self.train_dataloader,
-                    workflow=grouped_distill_workflow,
-                    workflow_kwargs=None,  # Already resolved & grouped workflow instance
+                    workflow=distill_workflow,
+                    workflow_kwargs=None,
                     should_accept_fn=None,
                     group_size=group_size,
                     dynamic_bs=config.dynamic_bs,
@@ -1436,6 +1439,11 @@ class TTTDDistillTrainer(PPOTrainer):
                     step=global_step + 1,
                     global_step=global_step + 1,
                 )
+                # External barrier matching standard AReaL _evaluate: all ranks wait
+                # for the eval to finish before starting the next training step.
+                if dist.is_initialized():
+                    dist.barrier(group=self.actor.cpu_group)
+                    current_platform.synchronize()
 
             step_total = time.perf_counter() - step_start_time
             logger.info(

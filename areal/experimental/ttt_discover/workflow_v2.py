@@ -368,14 +368,38 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
         return self.sampler
 
     def _get_prompt(
-        self, state, use_hint: bool = True, env: BaseEnv | None = None
+        self,
+        state,
+        use_hint: bool = True,
+        env: BaseEnv | None = None,
+        max_tokens: int | None = None,
     ) -> str:
-        """Get prompt for state, optionally appending or replacing with hint."""
+        """Get prompt for state, optionally appending or replacing with hint.
+
+        Args:
+            state: The state to build the prompt for.
+            use_hint: Whether to apply the hint function.
+            env: Optional environment override.
+            max_tokens: If provided, truncate the prompt to fit within this many
+                tokens using the environment's ``truncate_prompt`` method (if
+                available) or end-truncation otherwise.
+        """
         env = env or self.env
         if self.distill_mode and hasattr(env, "get_prompt_distill"):
             prompt = env.get_prompt_distill(state)
         else:
             prompt = env.get_prompt(state)
+
+        if max_tokens is not None and len(prompt) > 0:
+            original_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+            if len(original_ids) > max_tokens:
+                prompt = env.truncate_prompt(prompt, self.tokenizer, max_tokens)
+                truncated_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+                logger.warning(
+                    f"[_get_prompt] Prompt truncated from {len(original_ids)} to "
+                    f"{len(truncated_ids)} tokens (max_tokens={max_tokens})"
+                )
+
         if use_hint and self.hint_fn is not None and state is not None:
             try:
                 hint = self.hint_fn(state)
@@ -1085,7 +1109,9 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
 
         try:
             # Generate - Phase 1: Normal thinking
-            prompt = self._get_prompt(state, env=env)
+            prompt = self._get_prompt(
+                state, env=env, max_tokens=self.max_prompt_thinking_tokens
+            )
             messages = [{"role": "user", "content": prompt}]
             input_ids = list(
                 self.tokenizer.apply_chat_template(
@@ -1100,12 +1126,21 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             prompt_length = len(input_ids)
             # Respect the configured total token budget instead of hard-coding 32768.
             max_context = getattr(self.gconfig, "max_tokens", None) or 32768
-            max_thinking_tokens = self.max_prompt_thinking_tokens - prompt_length
             logger.info(
                 f"[PROMPT_LEN] prompt_length={prompt_length} "
                 f"max_context={max_context} "
                 f"max_prompt_thinking_tokens={self.max_prompt_thinking_tokens}"
             )
+
+            # Truncate before computing max_new_tokens so the budget is always non-negative.
+            if prompt_length > self.max_prompt_thinking_tokens:
+                logger.warning(
+                    f"Prompt length {prompt_length} exceeds limit {self.max_prompt_thinking_tokens}, truncating"
+                )
+                input_ids = input_ids[: self.max_prompt_thinking_tokens]
+                prompt_length = len(input_ids)
+
+            max_thinking_tokens = self.max_prompt_thinking_tokens - prompt_length
             max_new_tokens_phase1 = min(
                 self.gconfig.max_new_tokens,
                 max_context - prompt_length,
@@ -1113,12 +1148,6 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                     2048, max_thinking_tokens
                 ),  # Leave at least 2048 for final response
             )
-
-            if prompt_length > self.max_prompt_thinking_tokens:
-                logger.warning(
-                    f"Prompt length {prompt_length} exceeds limit {self.max_prompt_thinking_tokens}, truncating"
-                )
-                input_ids = input_ids[: self.max_prompt_thinking_tokens]
 
             req = ModelRequest(
                 rid=uuid.uuid4().hex,
@@ -1162,26 +1191,33 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
 
                 # Second generation with remaining tokens
                 remaining_tokens = max_context - len(input_ids_force)
+                if remaining_tokens <= 0:
+                    logger.warning(
+                        f"[Teacher Forcing] No room for forced generation "
+                        f"(input_ids_force={len(input_ids_force)}, max_context={max_context}), skipping"
+                    )
+                    forced_completion_str = ""
+                    forced_code = None
+                else:
+                    req_force = ModelRequest(
+                        rid=uuid.uuid4().hex + "_force",
+                        input_ids=input_ids_force,
+                        gconfig=self.gconfig.new(
+                            n_samples=1, max_new_tokens=remaining_tokens
+                        ),
+                        tokenizer=self.tokenizer,
+                    )
 
-                req_force = ModelRequest(
-                    rid=uuid.uuid4().hex + "_force",
-                    input_ids=input_ids_force,
-                    gconfig=self.gconfig.new(
-                        n_samples=1, max_new_tokens=remaining_tokens
-                    ),
-                    tokenizer=self.tokenizer,
-                )
+                    async with atrace_session_phase("generate_forced"):
+                        resp = await engine.agenerate(req_force)
 
-                async with atrace_session_phase("generate_forced"):
-                    resp = await engine.agenerate(req_force)
-
-                forced_completion_str = self.tokenizer.decode(resp.output_tokens)
-                forced_code = env.extract_code(forced_completion_str)
-                logger.info(
-                    f"[Teacher Forcing] Forced generation completed: "
-                    f"input_len={resp.input_len} output_len={resp.output_len} "
-                    f"output_tokens={len(resp.output_tokens)} has_code={forced_code is not None}"
-                )
+                    forced_completion_str = self.tokenizer.decode(resp.output_tokens)
+                    forced_code = env.extract_code(forced_completion_str)
+                    logger.info(
+                        f"[Teacher Forcing] Forced generation completed: "
+                        f"input_len={resp.input_len} output_len={resp.output_len} "
+                        f"output_tokens={len(resp.output_tokens)} has_code={forced_code is not None}"
+                    )
 
             # Record GPU completion time for tail latency measurement
             gpu_done_time = time.perf_counter()
@@ -1410,7 +1446,9 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             logger.error(f"arun_episode failed: {e}", exc_info=True)
             # Return failed trajectory - let env decide reward and loss_mask
             if state:
-                prompt = self._get_prompt(state)
+                prompt = self._get_prompt(
+                    state, max_tokens=self.max_prompt_thinking_tokens
+                )
                 messages = [{"role": "user", "content": prompt}]
                 try:
                     input_ids = list(
@@ -1421,6 +1459,8 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                             enable_thinking=self.enable_thinking,
                         )
                     )
+                    if len(input_ids) > self.max_prompt_thinking_tokens:
+                        input_ids = input_ids[: self.max_prompt_thinking_tokens]
                 except Exception:
                     input_ids = [self.tokenizer.bos_token_id or 0]
             else:
