@@ -15,6 +15,7 @@ paper:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import traceback
 from collections.abc import Sequence
@@ -24,6 +25,8 @@ from datetime import timedelta
 from typing import Any
 
 import numpy as np
+
+logger = logging.getLogger("AleBenchEval")
 
 
 def list_ale_bench_problem_ids(lite_version: bool = False) -> list[str]:
@@ -66,6 +69,11 @@ def _eval_one_problem(
 
     session = None
     try:
+        logger.info(
+            f"[_eval_one_problem][{problem_id}] Starting eval with "
+            f"{len(candidate_codes)} candidates (lite={lite_version}, "
+            f"num_workers={ale_bench_num_workers})"
+        )
         session = start(
             problem_id=problem_id,
             lite_version=lite_version,
@@ -77,6 +85,9 @@ def _eval_one_problem(
 
         candidate_medians: list[float] = []
         for idx, code in enumerate(candidate_codes):
+            logger.info(
+                f"[_eval_one_problem][{problem_id}] public_eval candidate {idx}/{len(candidate_codes)}"
+            )
             public_result = session.public_eval(
                 code=code,
                 code_language=CodeLanguage.CPP20,
@@ -108,9 +119,16 @@ def _eval_one_problem(
         result["best_candidate_idx"] = best_idx
         best_code = candidate_codes[best_idx]
 
+        logger.info(
+            f"[_eval_one_problem][{problem_id}] private_eval best candidate {best_idx}"
+        )
         private_result, rank, performance = session.private_eval(
             code=best_code,
             code_language=CodeLanguage.CPP20,
+        )
+        logger.info(
+            f"[_eval_one_problem][{problem_id}] eval done: "
+            f"private_abs={getattr(private_result, 'overall_absolute_score', 0.0):.2f}"
         )
         result["private"] = {
             "absolute_score": float(
@@ -128,10 +146,14 @@ def _eval_one_problem(
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
         result["traceback"] = traceback.format_exc()
+        logger.error(
+            f"[_eval_one_problem][{problem_id}] eval failed: {result['error']}"
+        )
     finally:
         if session is not None:
             try:
                 session.close()
+                logger.info(f"[_eval_one_problem][{problem_id}] session closed")
             except Exception:
                 pass
 
@@ -209,9 +231,16 @@ def evaluate_problem_subset(
         List of per-problem result dictionaries in the same order as
         ``problem_ids``.
     """
+    total_candidates = sum(
+        len(candidates_by_problem.get(pid, [])) for pid in problem_ids
+    )
+    logger.info(
+        f"[evaluate_problem_subset] Starting {len(problem_ids)} problems, "
+        f"{total_candidates} total candidates, n_parallel={n_parallel_problems}"
+    )
     if n_parallel_problems > 1:
         with ProcessPoolExecutor(max_workers=n_parallel_problems) as executor:
-            futures = [
+            futures = {
                 executor.submit(
                     _eval_one_problem,
                     problem_id,
@@ -219,21 +248,35 @@ def evaluate_problem_subset(
                     lite_version,
                     session_duration_hours,
                     ale_bench_num_workers,
-                )
+                ): problem_id
                 for problem_id in problem_ids
-            ]
-        return [future.result() for future in futures]
+            }
+            results = []
+            for future in futures:
+                problem_id = futures[future]
+                logger.info(
+                    f"[evaluate_problem_subset] Waiting for problem {problem_id}"
+                )
+                results.append(future.result())
+                logger.info(f"[evaluate_problem_subset] Finished problem {problem_id}")
+        logger.info("[evaluate_problem_subset] All parallel problems done")
+        return results
 
-    return [
-        _eval_one_problem(
-            problem_id,
-            candidates_by_problem.get(problem_id, []),
-            lite_version,
-            session_duration_hours,
-            ale_bench_num_workers,
+    results = []
+    for problem_id in problem_ids:
+        logger.info(f"[evaluate_problem_subset] Evaluating problem {problem_id}")
+        results.append(
+            _eval_one_problem(
+                problem_id,
+                candidates_by_problem.get(problem_id, []),
+                lite_version,
+                session_duration_hours,
+                ale_bench_num_workers,
+            )
         )
-        for problem_id in problem_ids
-    ]
+        logger.info(f"[evaluate_problem_subset] Finished problem {problem_id}")
+    logger.info("[evaluate_problem_subset] All problems done")
+    return results
 
 
 def combine_ale_bench_results(

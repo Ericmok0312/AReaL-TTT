@@ -2383,6 +2383,10 @@ class TTTDDistillTrainer(PPOTrainer):
                     f"for {len(data_list)} problems"
                 )
 
+                logger.info(
+                    f"[AleBenchEval][Step {global_step}] Submitting {len(data_list)} "
+                    f"problems x {n_candidates} candidates to rollout"
+                )
                 for data in data_list:
                     self.rollout.submit(
                         data,
@@ -2392,7 +2396,13 @@ class TTTDDistillTrainer(PPOTrainer):
                         is_eval=True,
                     )
 
+                logger.info(
+                    f"[AleBenchEval][Step {global_step}] Waiting for {len(data_list)} rollout results"
+                )
                 results = self.rollout.wait(len(data_list), timeout=None)
+                logger.info(
+                    f"[AleBenchEval][Step {global_step}] Got {len(results)} rollout results"
+                )
                 batch = self._normalize_rollout_batch(results)
 
                 # Decode completions and extract code per problem.
@@ -2447,7 +2457,9 @@ class TTTDDistillTrainer(PPOTrainer):
         dp_world_size = getattr(self.actor, "data_parallel_world_size", 1)
 
         # Generate candidates in parallel across DP ranks.
+        logger.info(f"[AleBenchEval][Step {global_step}] Starting candidate generation")
         candidates_by_problem = self._generate_ale_bench_eval_candidates(global_step)
+        logger.info(f"[AleBenchEval][Step {global_step}] Candidate generation done")
 
         # Each rank evaluates a deterministic slice of the problem list.
         local_problem_ids = self._ale_bench_eval_problem_ids[dp_rank::dp_world_size]
@@ -2463,6 +2475,10 @@ class TTTDDistillTrainer(PPOTrainer):
             session_duration_hours=4.0,
             ale_bench_num_workers=config.ale_bench_eval_num_workers,
             n_parallel_problems=config.ale_bench_eval_n_parallel_problems,
+        )
+        logger.info(
+            f"[AleBenchEval][Step {global_step}] "
+            f"Rank {dp_rank} local evaluation done, {len(local_results)} results"
         )
 
         # Gather per-rank results onto the DP head for aggregation and logging.
