@@ -124,6 +124,7 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             temperature=getattr(config.sampler, "temperature", 1.0),
             max_version_history=max_version_history,
             sampling_strategy="puct",
+            problem_id=getattr(config.sampler, "problem_id", ""),
         )
         logger.info(
             f"[EvalSampler] Fresh sampler created with {len(self.sampler._states)} states"
