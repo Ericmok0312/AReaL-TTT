@@ -82,7 +82,7 @@ def ale_bench_public_reward_fn(
     prompt_ids: list[int],
     completion_ids: list[int],
     lite_version: bool = False,
-    session_duration_hours: float = 4.0,
+    session_duration_hours: float = 12.0,
     ale_bench_num_workers: int = 1,
     **_kwargs: Any,
 ) -> tuple[float, Any, str, float]:
@@ -207,85 +207,6 @@ def ale_bench_public_reward_fn(
             f"[ale_bench_public_reward_fn][{problem_id}] public_eval failed: "
             f"{type(e).__name__}: {e}"
         )
-        result = EnvResult(
-            reward=0.0,
-            is_valid=False,
-            observation="",
-            metadata={
-                "error": f"{type(e).__name__}: {e}",
-                "problem_id": problem_id,
-                "traceback": traceback.format_exc(),
-            },
-            fail_type="execution_error",
-        )
-        return 0.0, result, code if code is not None else "", 0.0
-
-    if env is not None:
-        code = env.extract_code(completions)
-    else:
-        # Fallback: try to extract a code block heuristically.
-        import re
-
-        match = re.search(
-            r"```(?:cpp|c\+\+|python)?\n(.*?)\n```", completions, re.DOTALL
-        )
-        code = match.group(1) if match else completions
-
-    if code is None or not code.strip():
-        result = EnvResult(
-            reward=0.0,
-            is_valid=False,
-            observation="",
-            metadata={"error": "no_code", "problem_id": problem_id},
-            fail_type="code_extraction_failed",
-        )
-        return 0.0, result, "", 0.0
-
-    try:
-        session = _get_ale_bench_session(
-            problem_id=problem_id,
-            lite_version=lite_version,
-            session_duration_hours=session_duration_hours,
-            ale_bench_num_workers=ale_bench_num_workers,
-        )
-        public_result = session.public_eval(
-            code=code,
-            code_language=CodeLanguage.CPP20,
-        )
-        case_scores = [_case_absolute_score(c) for c in public_result.case_results]
-        median_score = float(np.median(case_scores)) if case_scores else 0.0
-        public_rank = -1
-        public_perf = -1
-        if hasattr(public_result, "rank"):
-            public_rank = int(public_result.rank)
-        if hasattr(public_result, "performance"):
-            public_perf = int(public_result.performance)
-
-        result = EnvResult(
-            reward=median_score,
-            is_valid=True,
-            observation="",
-            metadata={
-                "problem_id": problem_id,
-                "code": code,
-                "public_median": median_score,
-                "public_overall_absolute": float(
-                    getattr(public_result, "overall_absolute_score", 0.0)
-                ),
-                "public_overall_relative": float(
-                    getattr(public_result, "overall_relative_score", 0.0) or 0.0
-                ),
-                "public_judge_result": str(
-                    getattr(public_result, "overall_judge_result", "UNKNOWN")
-                ),
-                "public_num_cases": len(case_scores),
-                "public_rank": public_rank,
-                "public_performance": public_perf,
-            },
-        )
-        exec_time_ms = (time.time() - start_time) * 1000.0
-        return median_score, result, code, exec_time_ms
-    except Exception as e:
         result = EnvResult(
             reward=0.0,
             is_valid=False,
