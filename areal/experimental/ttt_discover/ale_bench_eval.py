@@ -161,17 +161,27 @@ def ale_bench_public_reward_fn(
     try:
         from ale_bench.session import CodeLanguage
 
-        _p(f"Getting session lite={lite_version} workers={ale_bench_num_workers}")
-        logger.info(
-            f"[ale_bench_public_reward_fn][{problem_id}] Getting session "
-            f"(lite={lite_version}, workers={ale_bench_num_workers})"
-        )
-        session = _get_ale_bench_session(
-            problem_id=problem_id,
-            lite_version=lite_version,
-            session_duration_hours=session_duration_hours,
-            ale_bench_num_workers=ale_bench_num_workers,
-        )
+        # Prefer the env's already-built session; creating a fresh session inside
+        # a ProcessPoolExecutor worker re-extracts the problem data and rebuilds
+        # the Rust tools, which is very slow.
+        if env is not None and hasattr(env, "session") and env.session is not None:
+            session = env.session
+            _p(f"Reusing env.session (tool_dir={session.tool_dir})")
+            logger.info(
+                f"[ale_bench_public_reward_fn][{problem_id}] Reusing env.session"
+            )
+        else:
+            _p(f"Getting session lite={lite_version} workers={ale_bench_num_workers}")
+            logger.info(
+                f"[ale_bench_public_reward_fn][{problem_id}] Getting session "
+                f"(lite={lite_version}, workers={ale_bench_num_workers})"
+            )
+            session = _get_ale_bench_session(
+                problem_id=problem_id,
+                lite_version=lite_version,
+                session_duration_hours=session_duration_hours,
+                ale_bench_num_workers=ale_bench_num_workers,
+            )
         _p(f"Running public_eval code_len={len(code)} workers={ale_bench_num_workers}")
         logger.info(
             f"[ale_bench_public_reward_fn][{problem_id}] Running public_eval "
