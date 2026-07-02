@@ -545,10 +545,11 @@ class TTTDDistillConfig(TTTDPPOConfig):
             "smaller values include refinement transitions as well."
         },
     )
-    eval_models: dict[str, str] | None = field(
+    eval_models: dict[str, str | None] | None = field(
         default=None,
         metadata={
             "help": "Explicit dict of {label: lora_path} for eval_tttd_multi_v2. "
+            "Use null/empty value for the 'baseline' entry to evaluate the pure base model. "
             "If None, auto-discovers baseline/teacher/student. "
             "If set, only evaluates the specified models."
         },
