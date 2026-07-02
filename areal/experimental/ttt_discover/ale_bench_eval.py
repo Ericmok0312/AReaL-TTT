@@ -117,9 +117,13 @@ def ale_bench_public_reward_fn(
     start_time = time.time()
     problem_id = _kwargs.get("_problem_id", "")
     env = _kwargs.get("_env")
-    logger.info(
-        f"[ale_bench_public_reward_fn][{problem_id}] Called with "
-        f"completion_len={len(completions)} env={type(env).__name__ if env else None}"
+
+    def _p(msg: str) -> None:
+        """Print from ProcessPoolExecutor workers; may appear in parent stdout."""
+        print(f"[ale_bench_public_reward_fn][{problem_id}] {msg}", flush=True)
+
+    _p(
+        f"Called completion_len={len(completions)} env={type(env).__name__ if env else None}"
     )
 
     if env is not None:
@@ -134,6 +138,7 @@ def ale_bench_public_reward_fn(
         code = match.group(1) if match else completions
 
     if code is None or not code.strip():
+        _p("No code extracted")
         logger.warning(f"[ale_bench_public_reward_fn][{problem_id}] No code extracted")
         result = EnvResult(
             reward=0.0,
@@ -147,6 +152,7 @@ def ale_bench_public_reward_fn(
     try:
         from ale_bench.session import CodeLanguage
 
+        _p(f"Getting session lite={lite_version} workers={ale_bench_num_workers}")
         logger.info(
             f"[ale_bench_public_reward_fn][{problem_id}] Getting session "
             f"(lite={lite_version}, workers={ale_bench_num_workers})"
@@ -157,7 +163,11 @@ def ale_bench_public_reward_fn(
             session_duration_hours=session_duration_hours,
             ale_bench_num_workers=ale_bench_num_workers,
         )
-        logger.info(f"[ale_bench_public_reward_fn][{problem_id}] Running public_eval")
+        _p(f"Running public_eval code_len={len(code)} workers={ale_bench_num_workers}")
+        logger.info(
+            f"[ale_bench_public_reward_fn][{problem_id}] Running public_eval "
+            f"(code_len={len(code)}, session_workers={ale_bench_num_workers})"
+        )
         public_result = session.public_eval(
             code=code,
             code_language=CodeLanguage.CPP20,
@@ -171,6 +181,12 @@ def ale_bench_public_reward_fn(
         if hasattr(public_result, "performance"):
             public_perf = int(public_result.performance)
 
+        elapsed_ms = (time.time() - start_time) * 1000.0
+        _p(
+            f"public_eval done median={median_score:.2f} "
+            f"abs={getattr(public_result, 'overall_absolute_score', 0.0):.2f} "
+            f"cases={len(case_scores)} elapsed_ms={elapsed_ms:.0f}"
+        )
         logger.info(
             f"[ale_bench_public_reward_fn][{problem_id}] public_eval done: "
             f"median={median_score:.2f} "
@@ -203,6 +219,7 @@ def ale_bench_public_reward_fn(
         exec_time_ms = (time.time() - start_time) * 1000.0
         return median_score, result, code, exec_time_ms
     except Exception as e:
+        _p(f"public_eval FAILED {type(e).__name__}: {e}")
         logger.error(
             f"[ale_bench_public_reward_fn][{problem_id}] public_eval failed: "
             f"{type(e).__name__}: {e}"

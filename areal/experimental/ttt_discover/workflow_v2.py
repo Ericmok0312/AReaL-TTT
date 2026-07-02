@@ -641,6 +641,12 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
             # tttd_reward_fn normally returns (reward, EnvResult, code, exec_time_ms) tuple
             # but AsyncRewardWrapper returns 0 (int) on timeout
             prompt_str = self.tokenizer.decode(resp.input_tokens)
+            problem_id = task_data.get("_problem_id", "")
+            state_id = state.id[:8] if state else "None"
+            logger.info(
+                f"[RewardCall][problem={problem_id}] state={state_id} "
+                f"code_len={len(code)} -> calling async_reward_fn"
+            )
 
             reward_result = await self.async_reward_fn(
                 prompt_str,
@@ -649,7 +655,12 @@ class TTTDiscoverWorkflowV2(RolloutWorkflow):
                 resp.output_tokens,
                 _env=env,
                 _state=state,
-                _problem_id=task_data.get("_problem_id"),
+                _problem_id=problem_id,
+            )
+
+            logger.info(
+                f"[RewardCall][problem={problem_id}] state={state_id} "
+                f"async_reward_fn returned type={type(reward_result).__name__}"
             )
 
             # Handle both timeout (int) and normal (tuple) return values

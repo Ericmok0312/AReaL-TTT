@@ -485,6 +485,12 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             ale_bench_num_workers=config.ale_bench_eval_num_workers,
         )
 
+        # Public eval can be CPU/Docker heavy; allow concurrent reward workers so
+        # multiple problems' public evaluations overlap.  Cap at n_parallel_problems
+        # to avoid oversubscribing the CPU pool used by each ALE-Bench session.
+        max_reward_workers = max(
+            1, config.ale_bench_eval_n_parallel_problems
+        )
         eval_workflow_kwargs = dict(
             env=self.env,
             problem_envs=self._ale_bench_eval_envs,
@@ -496,7 +502,7 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             group_size=n_candidates,
             lazy_sampling=False,
             reward_fn=public_reward_fn,
-            max_reward_workers=1,
+            max_reward_workers=max_reward_workers,
             distill_mode=True,
         )
         eval_workflow_cls = MultiProblemTTTDiscoverWorkflowV2
@@ -554,6 +560,10 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
         comp_lens = loss_mask.sum(dim=1).cpu().numpy()
 
         for i in range(input_ids.shape[0]):
+            if i > 0 and i % 10 == 0:
+                logger.info(
+                    f"[AleBenchEval-{label}] Processed {i}/{input_ids.shape[0]} rollout results"
+                )
             problem_id = problem_ids[i] if i < len(problem_ids) else ""
             env = self._ale_bench_eval_envs.get(problem_id)
             if env is None:
