@@ -1133,11 +1133,21 @@ class TTTDDistillTrainer(PPOTrainer):
 
         if self._ale_bench_eval_enabled:
             # Before-train eval (if configured)
+            logger.info(
+                "=" * 60 + "\n"
+                f"[AleBenchEval] Running pre-training evaluation at step {start_step}\n"
+                "=" * 60
+            )
             self.evaluator.evaluate(
                 functools.partial(_ale_bench_evaluate_fn, start_step),
                 epoch=0,
                 step=start_step,
                 global_step=start_step,
+            )
+            logger.info(
+                "=" * 60 + "\n"
+                f"[AleBenchEval] Pre-training evaluation at step {start_step} finished\n"
+                "=" * 60
             )
             # External barrier matching standard AReaL _evaluate: all ranks wait
             # before entering the training loop.
@@ -1148,6 +1158,9 @@ class TTTDDistillTrainer(PPOTrainer):
         # =====================================================================
         # Phase 1: Distillation steps (no verification)
         # =====================================================================
+        logger.info(
+            "=" * 60 + "\n[Distill] Starting distillation training loop\n=" * 60
+        )
         for global_step in range(start_step, config.max_steps):
             logger.info(f"[Distill][Step {global_step}] Starting distill step")
 
@@ -1465,11 +1478,21 @@ class TTTDDistillTrainer(PPOTrainer):
 
             # Periodic ALE-Bench full-corpus evaluation via standard Evaluator API
             if self._ale_bench_eval_enabled:
+                logger.info(
+                    "=" * 60 + "\n"
+                    f"[AleBenchEval] Running periodic evaluation at step {global_step + 1}\n"
+                    "=" * 60
+                )
                 self.evaluator.evaluate(
                     functools.partial(_ale_bench_evaluate_fn, global_step + 1),
                     epoch=0,
                     step=global_step + 1,
                     global_step=global_step + 1,
+                )
+                logger.info(
+                    "=" * 60 + "\n"
+                    f"[AleBenchEval] Periodic evaluation at step {global_step + 1} finished\n"
+                    "=" * 60
                 )
                 # External barrier matching standard AReaL _evaluate: all ranks wait
                 # for the eval to finish before starting the next training step.
@@ -2471,7 +2494,7 @@ class TTTDDistillTrainer(PPOTrainer):
                 lazy_sampling=False,
                 reward_fn=public_reward_fn,
                 max_reward_workers=max(
-                    1, getattr(self._config, "ale_bench_eval_n_parallel_problems", 1)
+                    1, getattr(self.config, "ale_bench_eval_n_parallel_problems", 1)
                 ),
                 # Use the stateless distillation prompt for eval, matching training.
                 distill_mode=True,

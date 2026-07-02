@@ -207,7 +207,7 @@ vllm:
   model: ${actor.path}
   seed: ${seed}
   skip_tokenizer_init: false
-  max_num_seqs: 128
+  max_num_seqs: 256
   no_enable_prefix_caching: false
   dtype: ${actor.dtype}
   max_model_len: 32768
