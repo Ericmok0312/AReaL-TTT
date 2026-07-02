@@ -6,7 +6,7 @@ Usage:
     ./predownload_ale_bench.py
 
 If ALE_BENCH_DATA is not set, the script will clone the HuggingFace dataset
-into /tmp/data/ALE-Bench and use it automatically.
+into ~/.cache/areal/ale-bench and use it automatically.
 """
 
 import os
@@ -22,7 +22,7 @@ def ensure_ale_bench_data() -> str:
         print(f"Using existing ALE_BENCH_DATA={data_dir}")
         return data_dir
 
-    target = Path("/tmp/data/ALE-Bench")
+    target = Path.home() / ".cache" / "areal" / "ale-bench"
     if target.exists():
         print(f"Using existing local clone: {target}")
         return str(target)
