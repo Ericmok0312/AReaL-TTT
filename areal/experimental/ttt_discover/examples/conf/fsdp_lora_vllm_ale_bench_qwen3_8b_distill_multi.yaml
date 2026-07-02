@@ -22,8 +22,8 @@ ale_bench_eval_before_train: true
 ale_bench_eval_freq_steps: 10
 ale_bench_eval_n_candidates: 15
 ale_bench_eval_lite_version: false
-ale_bench_eval_num_workers: 32
-ale_bench_eval_n_parallel_problems: 40
+ale_bench_eval_num_workers: 16
+ale_bench_eval_n_parallel_problems: 8
 
 # One entry per trained ALE-Bench problem.  The trainer builds a mixed batch with
 # one group per problem (8 problems x 8 rollouts = 64 total rollouts per step).
