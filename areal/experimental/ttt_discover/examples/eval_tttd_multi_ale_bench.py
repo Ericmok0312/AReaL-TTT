@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+
 """
 TTT-Discover Multi-Model ALE-Bench Evaluation.
 
@@ -488,9 +490,7 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
         # Public eval can be CPU/Docker heavy; allow concurrent reward workers so
         # multiple problems' public evaluations overlap.  Cap at n_parallel_problems
         # to avoid oversubscribing the CPU pool used by each ALE-Bench session.
-        max_reward_workers = max(
-            1, config.ale_bench_eval_n_parallel_problems
-        )
+        max_reward_workers = max(1, config.ale_bench_eval_n_parallel_problems)
         eval_workflow_kwargs = dict(
             env=self.env,
             problem_envs=self._ale_bench_eval_envs,
@@ -544,7 +544,9 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
                 is_eval=True,
             )
 
-        logger.info(f"[AleBenchEval-{label}] Submitted {len(data_list)} rollout requests")
+        logger.info(
+            f"[AleBenchEval-{label}] Submitted {len(data_list)} rollout requests"
+        )
         results = self.eval_rollout.wait(len(data_list), timeout=None)
         logger.info(f"[AleBenchEval-{label}] Got {len(results)} rollout results")
 
@@ -640,6 +642,7 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             for problem_id, env in self._ale_bench_eval_envs.items()
             if hasattr(env, "session") and env.session is not None
         }
+        selection_method = getattr(config, "ale_bench_eval_selection_method", "median")
         local_results = evaluate_problem_subset_with_public_scores(
             eval_problem_ids,
             public_results_by_problem,
@@ -648,9 +651,11 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             ale_bench_num_workers=config.ale_bench_eval_num_workers,
             n_parallel_problems=config.ale_bench_eval_n_parallel_problems,
             problem_sessions=problem_sessions,
+            selection_method=selection_method,
         )
         logger.info(
-            f"[AleBenchEval-{label}] Private eval done, {len(local_results)} results"
+            f"[AleBenchEval-{label}] Private eval done, {len(local_results)} results, "
+            f"selection={selection_method}"
         )
 
         training_problem_ids = {mt.problem_id for mt in config.multi_teacher}
@@ -668,6 +673,7 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
                 "session_duration_hours": 4.0,
                 "ale_bench_num_workers": config.ale_bench_eval_num_workers,
                 "n_parallel_problems": config.ale_bench_eval_n_parallel_problems,
+                "selection_method": selection_method,
             }
         )
 
@@ -777,6 +783,8 @@ def main(args):
         config.ale_bench_eval_num_workers = 1
     if getattr(config, "ale_bench_eval_n_parallel_problems", 0) <= 0:
         config.ale_bench_eval_n_parallel_problems = 1
+    if not getattr(config, "ale_bench_eval_selection_method", ""):
+        config.ale_bench_eval_selection_method = "median"
 
     with TTTDAleBenchMultiEvalTrainer(config) as trainer:
         trainer.run_eval()

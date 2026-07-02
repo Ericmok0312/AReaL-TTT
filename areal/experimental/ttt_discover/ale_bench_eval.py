@@ -45,6 +45,55 @@ def _case_absolute_score(case) -> float:
     return 0.0
 
 
+def _select_best_candidate_index(
+    candidate_results: list[dict[str, Any]],
+    selection_method: str = "median",
+) -> int:
+    """Select the best candidate index using the official ALE-Bench strategy.
+
+    Args:
+        candidate_results: List of candidate result dicts. Each dict must contain
+            a ``public`` entry with ``overall_absolute_score`` (official median)
+            or ``median_case_score`` (legacy).
+        selection_method: ``"median"`` for the official ALE-Bench leaderboard
+            protocol (closest to median of ``overall_absolute_score``), or
+            ``"median_case_score"`` for the legacy highest per-candidate median
+            case score.
+
+    Returns:
+        Index of the selected candidate in ``candidate_results``.
+    """
+    if not candidate_results:
+        return 0
+
+    if selection_method == "median_case_score":
+        medians = [
+            c.get("public", {}).get("median_case_score", float("-inf"))
+            for c in candidate_results
+        ]
+        return int(np.argmax(medians))
+
+    # Official ALE-Bench "median" selection: from the 15 repeated samples,
+    # pick the candidate whose overall_absolute_score is closest to the median
+    # of all candidates' overall_absolute_scores.
+    scores = [
+        c.get("public", {}).get("overall_absolute_score", float("nan"))
+        for c in candidate_results
+    ]
+    valid_scores = [s for s in scores if not np.isnan(s)]
+    if not valid_scores:
+        # Fall back to legacy behavior if overall_absolute_score is missing.
+        return _select_best_candidate_index(
+            candidate_results, selection_method="median_case_score"
+        )
+
+    median_score = float(np.median(valid_scores))
+    distances = [
+        abs(s - median_score) if not np.isnan(s) else float("inf") for s in scores
+    ]
+    return int(np.argmin(distances))
+
+
 # Module-level session cache used by ale_bench_public_reward_fn.  Each worker
 # process (AsyncRewardWrapper ProcessPoolExecutor) keeps its own cache, keyed by
 # the full evaluation configuration so that sessions are reused across candidates
@@ -237,16 +286,20 @@ def _private_eval_one_problem(
     session_duration_hours: float,
     ale_bench_num_workers: int,
     session: Any | None = None,
+    selection_method: str = "median",
 ) -> dict[str, Any]:
     """Run only the private evaluation for the best candidate of a problem.
 
     ``candidate_results`` must already contain the public evaluation scores
     (e.g. produced by ``ale_bench_public_reward_fn``).  The best candidate is
-    selected by the highest public median case score.
+    selected according to ``selection_method``.
 
     Args:
         session: Optional pre-built ALE-Bench session to reuse. If provided,
             the caller retains ownership and this function will not close it.
+        selection_method: ``"median"`` for official ALE-Bench median selection
+            (closest to median of ``overall_absolute_score``) or
+            ``"median_case_score"`` for legacy highest per-candidate median.
     """
     from ale_bench.session import CodeLanguage
 
@@ -261,12 +314,9 @@ def _private_eval_one_problem(
         result["error"] = "no candidates"
         return result
 
-    medians = [
-        c.get("public", {}).get("median_case_score", float("-inf"))
-        for c in candidate_results
-    ]
-    best_idx = int(np.argmax(medians))
+    best_idx = _select_best_candidate_index(candidate_results, selection_method)
     result["best_candidate_idx"] = best_idx
+    result["selection_method"] = selection_method
     best_code = candidate_results[best_idx].get("code", best_code)
 
     owns_session = session is None
@@ -610,6 +660,7 @@ def evaluate_problem_subset_with_public_scores(
     ale_bench_num_workers: int,
     n_parallel_problems: int = 1,
     problem_sessions: dict[str, Any] | None = None,
+    selection_method: str = "median",
 ) -> list[dict[str, Any]]:
     """Run only private evaluation after public scores are already known.
 
@@ -621,7 +672,8 @@ def evaluate_problem_subset_with_public_scores(
         problem_ids: Problems to evaluate on this rank.
         public_results_by_problem: Mapping from problem_id to list of public
             result dicts (one per candidate).  Each dict must contain a
-            ``public`` entry with ``median_case_score``.
+            ``public`` entry with ``overall_absolute_score`` (for ``median``)
+            or ``median_case_score`` (for ``median_case_score``).
         lite_version: Whether to use ALE-Bench lite sessions.
         session_duration_hours: Time budget passed to ``ale_bench.start``.
         ale_bench_num_workers: ``num_workers`` passed to ``ale_bench.start``.
@@ -630,6 +682,8 @@ def evaluate_problem_subset_with_public_scores(
         problem_sessions: Optional mapping from problem_id to pre-built
             ALE-Bench session. If provided, sessions are reused instead of
             creating new ones inside each worker.
+        selection_method: ``"median"`` for official ALE-Bench median selection
+            or ``"median_case_score"`` for legacy highest per-candidate median.
 
     Returns:
         List of per-problem result dictionaries in the same order as
@@ -638,7 +692,7 @@ def evaluate_problem_subset_with_public_scores(
     logger.info(
         f"[evaluate_problem_subset_with_public_scores] "
         f"Starting private eval for {len(problem_ids)} problems, "
-        f"n_parallel={n_parallel_problems}"
+        f"n_parallel={n_parallel_problems}, selection={selection_method}"
     )
 
     problem_sessions = problem_sessions or {}
@@ -655,6 +709,7 @@ def evaluate_problem_subset_with_public_scores(
                     session_duration_hours,
                     ale_bench_num_workers,
                     problem_sessions.get(problem_id),
+                    selection_method,
                 ): problem_id
                 for problem_id in problem_ids
             }
@@ -691,6 +746,7 @@ def evaluate_problem_subset_with_public_scores(
             session_duration_hours,
             ale_bench_num_workers,
             problem_sessions.get(problem_id),
+            selection_method,
         )
         _log_problem_result(result)
         results.append(result)

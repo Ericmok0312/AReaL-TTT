@@ -648,6 +648,16 @@ class TTTDDistillConfig(TTTDPPOConfig):
             "Defaults to <saver.fileroot>/<experiment>/<trial>/ale_bench_eval."
         },
     )
+    ale_bench_eval_selection_method: str = field(
+        default="median",
+        metadata={
+            "help": "How to select the best candidate from public scores for private eval. "
+            "'median' (official ALE-Bench leaderboard): pick the candidate whose "
+            "overall_absolute_score is closest to the median across candidates. "
+            "'median_case_score' (legacy): pick the candidate with the highest "
+            "median case score."
+        },
+    )
 
     def __post_init__(self):
         # Convert multi_teacher entries from dict to dataclass
