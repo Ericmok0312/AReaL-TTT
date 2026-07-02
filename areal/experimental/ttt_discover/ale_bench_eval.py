@@ -64,6 +64,11 @@ def _get_ale_bench_session(
     key = (problem_id, lite_version, session_duration_hours, ale_bench_num_workers)
     session = _ale_bench_sessions.get(key)
     if session is None:
+        print(
+            f"[ale_bench_session][{problem_id}] Creating new session via ale_bench.start() "
+            f"(lite={lite_version}, workers={ale_bench_num_workers})",
+            flush=True,
+        )
         session = start(
             problem_id=problem_id,
             lite_version=lite_version,
@@ -71,6 +76,10 @@ def _get_ale_bench_session(
             session_duration=timedelta(hours=session_duration_hours),
             num_workers=ale_bench_num_workers,
             run_visualization_server=False,
+        )
+        print(
+            f"[ale_bench_session][{problem_id}] Session created successfully",
+            flush=True,
         )
         _ale_bench_sessions[key] = session
     return session
