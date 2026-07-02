@@ -19,7 +19,7 @@ import logging
 import os
 import traceback
 from collections.abc import Sequence
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -697,6 +697,9 @@ def evaluate_problem_subset_with_public_scores(
 
     problem_sessions = problem_sessions or {}
 
+    results_by_problem: dict[str, dict[str, Any]] = {}
+    total = len(problem_ids)
+
     if n_parallel_problems > 1:
         with ProcessPoolExecutor(max_workers=n_parallel_problems) as executor:
             futures = {
@@ -713,49 +716,45 @@ def evaluate_problem_subset_with_public_scores(
                 ): problem_id
                 for problem_id in problem_ids
             }
-            results = []
-            for future in futures:
+            completed = 0
+            for future in as_completed(futures):
                 problem_id = futures[future]
-                logger.info(
-                    f"[evaluate_problem_subset_with_public_scores] "
-                    f"Waiting for problem {problem_id}"
-                )
                 result = future.result()
-                _log_problem_result(result)
-                results.append(result)
+                results_by_problem[problem_id] = result
+                completed += 1
+                private = result.get("private", {})
                 logger.info(
-                    f"[evaluate_problem_subset_with_public_scores] "
-                    f"Finished problem {problem_id}"
+                    f"[PrivateEval][{completed}/{total}] {problem_id} done: "
+                    f"abs={private.get('absolute_score', 0.0):.2f} "
+                    f"rank={private.get('rank', -1)} perf={private.get('performance', -1)}"
                 )
         logger.info(
             "[evaluate_problem_subset_with_public_scores] All parallel problems done"
         )
-        return results
+    else:
+        for idx, problem_id in enumerate(problem_ids, start=1):
+            logger.info(f"[PrivateEval][{idx}/{total}] Evaluating problem {problem_id}")
+            result = _private_eval_one_problem(
+                problem_id,
+                "",
+                public_results_by_problem.get(problem_id, []),
+                lite_version,
+                session_duration_hours,
+                ale_bench_num_workers,
+                problem_sessions.get(problem_id),
+                selection_method,
+            )
+            results_by_problem[problem_id] = result
+            private = result.get("private", {})
+            logger.info(
+                f"[PrivateEval][{idx}/{total}] {problem_id} done: "
+                f"abs={private.get('absolute_score', 0.0):.2f} "
+                f"rank={private.get('rank', -1)} perf={private.get('performance', -1)}"
+            )
+        logger.info("[evaluate_problem_subset_with_public_scores] All problems done")
 
-    results = []
-    for problem_id in problem_ids:
-        logger.info(
-            f"[evaluate_problem_subset_with_public_scores] "
-            f"Evaluating problem {problem_id}"
-        )
-        result = _private_eval_one_problem(
-            problem_id,
-            "",
-            public_results_by_problem.get(problem_id, []),
-            lite_version,
-            session_duration_hours,
-            ale_bench_num_workers,
-            problem_sessions.get(problem_id),
-            selection_method,
-        )
-        _log_problem_result(result)
-        results.append(result)
-        logger.info(
-            f"[evaluate_problem_subset_with_public_scores] "
-            f"Finished problem {problem_id}"
-        )
-    logger.info("[evaluate_problem_subset_with_public_scores] All problems done")
-    return results
+    # Preserve the caller's problem order.
+    return [results_by_problem[pid] for pid in problem_ids]
 
 
 def combine_ale_bench_results(
