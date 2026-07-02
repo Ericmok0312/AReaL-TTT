@@ -30,9 +30,11 @@ import argparse
 import json
 import os
 import sys
+import time
 from typing import Any
 
 from areal.experimental.ttt_discover.ale_bench_eval import (
+    _get_ale_bench_session,
     combine_ale_bench_results,
     evaluate_problem_subset_with_public_scores,
 )
@@ -87,6 +89,7 @@ def reprocess_single_file(
     Returns:
         The new combined output dictionary.
     """
+    file_start = time.time()
     logger.info(f"Loading saved results from {input_path}")
     with open(input_path) as f:
         saved = json.load(f)
@@ -104,6 +107,7 @@ def reprocess_single_file(
 
     # Only reprocess problems for which we have candidate public scores.
     eval_problem_ids = [pid for pid in problem_ids if pid in public_results_by_problem]
+    total_candidates = sum(len(v) for v in public_results_by_problem.values())
     if len(eval_problem_ids) != len(problem_ids):
         logger.warning(
             f"Dropping {len(problem_ids) - len(eval_problem_ids)} problems "
@@ -113,11 +117,41 @@ def reprocess_single_file(
     lite_version = bool(saved.get("lite_version", False))
 
     logger.info(
-        f"Re-running private eval for {len(eval_problem_ids)} problems, "
-        f"selection={selection_method}, n_parallel={n_parallel_problems}, "
-        f"workers={ale_bench_num_workers}"
+        f"Loaded {len(eval_problem_ids)} problems, {total_candidates} total candidates"
+    )
+    logger.info(
+        f"Re-running private eval: selection={selection_method}, "
+        f"n_parallel={n_parallel_problems}, workers={ale_bench_num_workers}"
     )
 
+    # Pre-build sessions in the main process so compilation logs are visible
+    # and workers do not fight over Docker/toolchain resources.
+    logger.info(
+        f"Pre-building ALE-Bench sessions for {len(eval_problem_ids)} problems..."
+    )
+    problem_sessions: dict[str, Any] = {}
+    session_build_start = time.time()
+    for i, problem_id in enumerate(eval_problem_ids, start=1):
+        logger.info(
+            f"[{i}/{len(eval_problem_ids)}] Building ALE-Bench session for {problem_id}"
+        )
+        try:
+            problem_sessions[problem_id] = _get_ale_bench_session(
+                problem_id=problem_id,
+                lite_version=lite_version,
+                session_duration_hours=session_duration_hours,
+                ale_bench_num_workers=ale_bench_num_workers,
+            )
+        except Exception:
+            logger.exception(
+                f"Failed to build session for {problem_id}; continuing without it"
+            )
+    logger.info(
+        f"Built {len(problem_sessions)}/{len(eval_problem_ids)} sessions in "
+        f"{time.time() - session_build_start:.1f}s"
+    )
+
+    private_start = time.time()
     local_results = evaluate_problem_subset_with_public_scores(
         eval_problem_ids,
         public_results_by_problem,
@@ -125,9 +159,29 @@ def reprocess_single_file(
         session_duration_hours=session_duration_hours,
         ale_bench_num_workers=ale_bench_num_workers,
         n_parallel_problems=n_parallel_problems,
-        problem_sessions=None,  # Workers create their own sessions.
+        problem_sessions=problem_sessions,
         selection_method=selection_method,
     )
+    private_elapsed = time.time() - private_start
+    logger.info(
+        f"Private eval finished in {private_elapsed:.1f}s "
+        f"({private_elapsed / max(len(eval_problem_ids), 1):.1f}s per problem)"
+    )
+
+    # Log the selected candidate per problem so the user can verify the new
+    # selection method took effect.
+    for r in local_results:
+        problem_id = r.get("problem_id", "unknown")
+        best_idx = r.get("best_candidate_idx")
+        private = r.get("private", {})
+        if best_idx is not None:
+            logger.info(
+                f"[{problem_id}] selected candidate {best_idx}, "
+                f"private_abs={private.get('absolute_score', 0.0):.2f} "
+                f"rank={private.get('rank', -1)} perf={private.get('performance', -1)}"
+            )
+        elif r.get("error"):
+            logger.warning(f"[{problem_id}] private eval failed: {r['error']}")
 
     output = combine_ale_bench_results(
         local_results, eval_problem_ids, training_problem_ids
@@ -156,13 +210,15 @@ def reprocess_single_file(
 
     avg_all = output.get("average_all", {})
     avg_oot = output.get("average_out_of_training", {})
+    total_elapsed = time.time() - file_start
     logger.info(f"Saved reprocessed results to {output_path}")
     logger.info(
         f"all_abs={avg_all.get('absolute_score', 0.0):.2f} "
         f"all_perf={avg_all.get('performance', 0.0):.2f} "
         f"oot_abs={avg_oot.get('absolute_score', 0.0):.2f} "
         f"oot_perf={avg_oot.get('performance', 0.0):.2f} "
-        f"success={avg_all.get('count', 0)}/{len(eval_problem_ids)}"
+        f"success={avg_all.get('count', 0)}/{len(eval_problem_ids)} "
+        f"total_time={total_elapsed:.1f}s"
     )
     return output
 
@@ -240,12 +296,15 @@ def main(argv: list[str]) -> None:
         logger.error(f"No ale_bench_eval_results_*.json files found in {args.input}")
         sys.exit(1)
 
+    logger.info(f"Found {len(input_paths)} result file(s) to reprocess")
+
     output_is_dir = args.output is not None and os.path.isdir(args.output)
     if args.output is not None and len(input_paths) > 1 and not output_is_dir:
         os.makedirs(args.output, exist_ok=True)
         output_is_dir = True
 
-    for input_path in input_paths:
+    for i, input_path in enumerate(input_paths, start=1):
+        logger.info(f"[{i}/{len(input_paths)}] Reprocessing {input_path}")
         if output_is_dir:
             output_path = os.path.join(
                 args.output,
