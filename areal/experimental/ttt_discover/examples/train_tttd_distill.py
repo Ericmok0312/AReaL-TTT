@@ -635,6 +635,13 @@ class TTTDDistillTrainer(PPOTrainer):
             f"(lite={config.ale_bench_eval_lite_version})"
         )
 
+        if getattr(config, "ale_bench_eval_num_workers", 0) <= 0:
+            config.ale_bench_eval_num_workers = 1
+        if getattr(config, "ale_bench_eval_n_parallel_problems", 0) <= 0:
+            config.ale_bench_eval_n_parallel_problems = 1
+        if not getattr(config, "ale_bench_eval_selection_method", ""):
+            config.ale_bench_eval_selection_method = "median"
+
         output_dir = config.ale_bench_eval_output_dir
         if not output_dir:
             output_dir = os.path.join(
@@ -652,6 +659,28 @@ class TTTDDistillTrainer(PPOTrainer):
             return
 
         original_problem_id = getattr(config.sampler, "problem_id", "")
+        original_num_cpus = getattr(config.sampler, "num_cpus", 2)
+        # Use the eval-specific worker count for ALE-Bench sessions; the training
+        # sampler may use a much smaller num_cpus which would make public eval slow.
+        config.sampler.num_cpus = config.ale_bench_eval_num_workers
+        cpu_count = os.cpu_count() or 1
+        total_workers = (
+            config.ale_bench_eval_num_workers
+            * config.ale_bench_eval_n_parallel_problems
+        )
+        if total_workers > cpu_count:
+            logger.warning(
+                f"[AleBenchEval] Eval may oversubscribe CPU: "
+                f"num_workers({config.ale_bench_eval_num_workers}) × "
+                f"n_parallel_problems({config.ale_bench_eval_n_parallel_problems}) = "
+                f"{total_workers} > cpu_count({cpu_count}). "
+                f"Consider reducing ale_bench_eval_num_workers or "
+                f"ale_bench_eval_n_parallel_problems."
+            )
+        logger.info(
+            f"[AleBenchEval] Creating {len(self._ale_bench_eval_problem_ids)} envs "
+            f"with num_workers={config.ale_bench_eval_num_workers}"
+        )
         for problem_id in self._ale_bench_eval_problem_ids:
             config.sampler.problem_id = problem_id
             config.sampler.env_type = "ale_bench"
@@ -663,6 +692,7 @@ class TTTDDistillTrainer(PPOTrainer):
                     f"[AleBenchEval] Failed to create env for {problem_id}: {e}"
                 )
         config.sampler.problem_id = original_problem_id
+        config.sampler.num_cpus = original_num_cpus
 
     def _initialize_engines(self):
         """Initialize training engines."""
@@ -2440,7 +2470,9 @@ class TTTDDistillTrainer(PPOTrainer):
                 group_size=n_candidates,
                 lazy_sampling=False,
                 reward_fn=public_reward_fn,
-                max_reward_workers=1,
+                max_reward_workers=max(
+                    1, getattr(self._config, "ale_bench_eval_n_parallel_problems", 1)
+                ),
                 # Use the stateless distillation prompt for eval, matching training.
                 distill_mode=True,
             )
@@ -2604,6 +2636,14 @@ class TTTDDistillTrainer(PPOTrainer):
             f"DP head running private eval for {len(eval_problem_ids)} problems"
         )
 
+        # Reuse the env sessions created in _setup_ale_bench_eval so private
+        # eval does not rebuild Rust tools in each worker.
+        problem_sessions = {
+            problem_id: env.session
+            for problem_id, env in self._ale_bench_eval_envs.items()
+            if hasattr(env, "session") and env.session is not None
+        }
+        selection_method = getattr(config, "ale_bench_eval_selection_method", "median")
         local_results = evaluate_problem_subset_with_public_scores(
             eval_problem_ids,
             public_results_by_problem,
@@ -2611,6 +2651,8 @@ class TTTDDistillTrainer(PPOTrainer):
             session_duration_hours=4.0,
             ale_bench_num_workers=config.ale_bench_eval_num_workers,
             n_parallel_problems=config.ale_bench_eval_n_parallel_problems,
+            problem_sessions=problem_sessions,
+            selection_method=selection_method,
         )
         logger.info(
             f"[AleBenchEval][Step {global_step}] "
@@ -2632,6 +2674,7 @@ class TTTDDistillTrainer(PPOTrainer):
                 "session_duration_hours": 4.0,
                 "ale_bench_num_workers": config.ale_bench_eval_num_workers,
                 "n_parallel_problems": config.ale_bench_eval_n_parallel_problems,
+                "selection_method": selection_method,
             }
         )
 
@@ -2651,8 +2694,11 @@ class TTTDDistillTrainer(PPOTrainer):
         logger.info(
             f"[AleBenchEval][Step {global_step}] "
             f"all_abs={avg_all.get('absolute_score', 0.0):.2f} "
+            f"all_perf={avg_all.get('performance', 0.0):.2f} "
             f"oot_abs={avg_oot.get('absolute_score', 0.0):.2f} "
-            f"success={avg_all.get('count', 0)}/{len(self._ale_bench_eval_problem_ids)}"
+            f"oot_perf={avg_oot.get('performance', 0.0):.2f} "
+            f"success={avg_all.get('count', 0)}/{len(self._ale_bench_eval_problem_ids)} "
+            f"selection={selection_method}"
         )
 
     def _compute_dynamic_metrics(

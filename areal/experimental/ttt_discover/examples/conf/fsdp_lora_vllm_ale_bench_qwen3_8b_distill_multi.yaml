@@ -1,4 +1,4 @@
-experiment_name: tttd-distill-qwen3-8b-ale-bench-multi
+experiment_name: tttd-distill-qwen3-8b-ale-bench-multi-diverse-best-worst
 trial_name: trial0
 is_tttd_config: true
 seed: 1
@@ -14,16 +14,20 @@ privileged_prompt_mode: hint
 use_breakthrough_opd: false
 distill_from_scratch: true
 run_eval_step: false
-total_rollouts_per_step: 64
+total_rollouts_per_step: 256
 
 # ALE-Bench full-corpus evaluation (public→private, median selection)
-ale_bench_eval_enabled: false
+ale_bench_eval_enabled: true
 ale_bench_eval_before_train: true
 ale_bench_eval_freq_steps: 10
 ale_bench_eval_n_candidates: 15
 ale_bench_eval_lite_version: false
 ale_bench_eval_num_workers: 16
 ale_bench_eval_n_parallel_problems: 8
+
+# Multi-teacher hint selection: diverse best + diverse worst from different PUCT branches
+multi_teacher_hint_mode: "diverse_best_worst"
+multi_teacher_hint_k: 3
 
 # One entry per trained ALE-Bench problem.  The trainer builds a mixed batch with
 # one group per problem (8 problems x 8 rollouts = 64 total rollouts per step).
@@ -100,7 +104,7 @@ actor:
   gradient_checkpointing: true
   optimizer:
     type: adam
-    lr: 1e-6
+    lr: 1e-5
     weight_decay: 0.01
     beta1: 0.9
     beta2: 0.999
@@ -169,7 +173,7 @@ rollout:
   backend: vllm:d7p1t1
 
 gconfig:
-  n_samples: 8
+  n_samples: 32
   min_new_tokens: 0
   max_new_tokens: 32768
   max_tokens: 32768
@@ -265,8 +269,8 @@ evaluator:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
-  freq_epochs: 1
-  freq_steps: null
+  freq_epochs: 10
+  freq_steps: 10
   freq_secs: null
 
 stats_logger:
