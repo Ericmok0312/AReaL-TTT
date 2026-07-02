@@ -28,7 +28,7 @@ ale_bench_eval_n_parallel_problems: 8
 
 # Multi-teacher hint selection: diverse best + diverse worst from different PUCT branches
 multi_teacher_hint_mode: "diverse_best_worst"
-multi_teacher_hint_k: 3
+multi_teacher_hint_k: 2
 
 # One entry per trained ALE-Bench problem.  The trainer builds a mixed batch with
 # one group per problem (8 problems x 8 rollouts = 64 total rollouts per step).
