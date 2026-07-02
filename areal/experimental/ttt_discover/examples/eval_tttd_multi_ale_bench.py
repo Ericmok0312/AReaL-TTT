@@ -685,7 +685,9 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
         logger.info(
             f"[AleBenchEval-{label}] "
             f"all_abs={avg_all.get('absolute_score', 0.0):.2f} "
+            f"all_perf={avg_all.get('performance', 0.0):.2f} "
             f"oot_abs={avg_oot.get('absolute_score', 0.0):.2f} "
+            f"oot_perf={avg_oot.get('performance', 0.0):.2f} "
             f"success={avg_all.get('count', 0)}/{len(self._ale_bench_eval_problem_ids)}"
         )
         return output
