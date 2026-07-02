@@ -64,11 +64,6 @@ def _get_ale_bench_session(
     key = (problem_id, lite_version, session_duration_hours, ale_bench_num_workers)
     session = _ale_bench_sessions.get(key)
     if session is None:
-        print(
-            f"[ale_bench_session][{problem_id}] Creating new session via ale_bench.start() "
-            f"(lite={lite_version}, workers={ale_bench_num_workers})",
-            flush=True,
-        )
         session = start(
             problem_id=problem_id,
             lite_version=lite_version,
@@ -76,10 +71,6 @@ def _get_ale_bench_session(
             session_duration=timedelta(hours=session_duration_hours),
             num_workers=ale_bench_num_workers,
             run_visualization_server=False,
-        )
-        print(
-            f"[ale_bench_session][{problem_id}] Session created successfully",
-            flush=True,
         )
         _ale_bench_sessions[key] = session
     return session
@@ -127,14 +118,6 @@ def ale_bench_public_reward_fn(
     problem_id = _kwargs.get("_problem_id", "")
     env = _kwargs.get("_env")
 
-    def _p(msg: str) -> None:
-        """Print from ProcessPoolExecutor workers; may appear in parent stdout."""
-        print(f"[ale_bench_public_reward_fn][{problem_id}] {msg}", flush=True)
-
-    _p(
-        f"Called completion_len={len(completions)} env={type(env).__name__ if env else None}"
-    )
-
     if env is not None:
         code = env.extract_code(completions)
     else:
@@ -147,7 +130,6 @@ def ale_bench_public_reward_fn(
         code = match.group(1) if match else completions
 
     if code is None or not code.strip():
-        _p("No code extracted")
         logger.warning(f"[ale_bench_public_reward_fn][{problem_id}] No code extracted")
         result = EnvResult(
             reward=0.0,
@@ -166,12 +148,10 @@ def ale_bench_public_reward_fn(
         # the Rust tools, which is very slow.
         if env is not None and hasattr(env, "session") and env.session is not None:
             session = env.session
-            _p(f"Reusing env.session (tool_dir={session.tool_dir})")
             logger.info(
                 f"[ale_bench_public_reward_fn][{problem_id}] Reusing env.session"
             )
         else:
-            _p(f"Getting session lite={lite_version} workers={ale_bench_num_workers}")
             logger.info(
                 f"[ale_bench_public_reward_fn][{problem_id}] Getting session "
                 f"(lite={lite_version}, workers={ale_bench_num_workers})"
@@ -182,7 +162,6 @@ def ale_bench_public_reward_fn(
                 session_duration_hours=session_duration_hours,
                 ale_bench_num_workers=ale_bench_num_workers,
             )
-        _p(f"Running public_eval code_len={len(code)} workers={ale_bench_num_workers}")
         logger.info(
             f"[ale_bench_public_reward_fn][{problem_id}] Running public_eval "
             f"(code_len={len(code)}, session_workers={ale_bench_num_workers})"
@@ -200,12 +179,6 @@ def ale_bench_public_reward_fn(
         if hasattr(public_result, "performance"):
             public_perf = int(public_result.performance)
 
-        elapsed_ms = (time.time() - start_time) * 1000.0
-        _p(
-            f"public_eval done median={median_score:.2f} "
-            f"abs={getattr(public_result, 'overall_absolute_score', 0.0):.2f} "
-            f"cases={len(case_scores)} elapsed_ms={elapsed_ms:.0f}"
-        )
         logger.info(
             f"[ale_bench_public_reward_fn][{problem_id}] public_eval done: "
             f"median={median_score:.2f} "
@@ -238,7 +211,6 @@ def ale_bench_public_reward_fn(
         exec_time_ms = (time.time() - start_time) * 1000.0
         return median_score, result, code, exec_time_ms
     except Exception as e:
-        _p(f"public_eval FAILED {type(e).__name__}: {e}")
         logger.error(
             f"[ale_bench_public_reward_fn][{problem_id}] public_eval failed: "
             f"{type(e).__name__}: {e}"
@@ -264,12 +236,17 @@ def _private_eval_one_problem(
     lite_version: bool,
     session_duration_hours: float,
     ale_bench_num_workers: int,
+    session: Any | None = None,
 ) -> dict[str, Any]:
     """Run only the private evaluation for the best candidate of a problem.
 
     ``candidate_results`` must already contain the public evaluation scores
     (e.g. produced by ``ale_bench_public_reward_fn``).  The best candidate is
     selected by the highest public median case score.
+
+    Args:
+        session: Optional pre-built ALE-Bench session to reuse. If provided,
+            the caller retains ownership and this function will not close it.
     """
     from ale_bench.session import CodeLanguage
 
@@ -292,18 +269,23 @@ def _private_eval_one_problem(
     result["best_candidate_idx"] = best_idx
     best_code = candidate_results[best_idx].get("code", best_code)
 
-    session = None
+    owns_session = session is None
     try:
         logger.info(
             f"[_private_eval_one_problem][{problem_id}] "
             f"private_eval best candidate {best_idx}"
         )
-        session = _get_ale_bench_session(
-            problem_id=problem_id,
-            lite_version=lite_version,
-            session_duration_hours=session_duration_hours,
-            ale_bench_num_workers=ale_bench_num_workers,
-        )
+        if session is None:
+            session = _get_ale_bench_session(
+                problem_id=problem_id,
+                lite_version=lite_version,
+                session_duration_hours=session_duration_hours,
+                ale_bench_num_workers=ale_bench_num_workers,
+            )
+        else:
+            logger.info(
+                f"[_private_eval_one_problem][{problem_id}] Reusing provided session"
+            )
         private_result, rank, performance = session.private_eval(
             code=best_code,
             code_language=CodeLanguage.CPP20,
@@ -333,7 +315,7 @@ def _private_eval_one_problem(
             f"[_private_eval_one_problem][{problem_id}] failed: {result['error']}"
         )
     finally:
-        if session is not None:
+        if owns_session and session is not None:
             try:
                 session.close()
             except Exception:
@@ -627,6 +609,7 @@ def evaluate_problem_subset_with_public_scores(
     session_duration_hours: float,
     ale_bench_num_workers: int,
     n_parallel_problems: int = 1,
+    problem_sessions: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Run only private evaluation after public scores are already known.
 
@@ -644,6 +627,9 @@ def evaluate_problem_subset_with_public_scores(
         ale_bench_num_workers: ``num_workers`` passed to ``ale_bench.start``.
         n_parallel_problems: Number of problems to evaluate concurrently in a
             local process pool.
+        problem_sessions: Optional mapping from problem_id to pre-built
+            ALE-Bench session. If provided, sessions are reused instead of
+            creating new ones inside each worker.
 
     Returns:
         List of per-problem result dictionaries in the same order as
@@ -654,6 +640,8 @@ def evaluate_problem_subset_with_public_scores(
         f"Starting private eval for {len(problem_ids)} problems, "
         f"n_parallel={n_parallel_problems}"
     )
+
+    problem_sessions = problem_sessions or {}
 
     if n_parallel_problems > 1:
         with ProcessPoolExecutor(max_workers=n_parallel_problems) as executor:
@@ -666,6 +654,7 @@ def evaluate_problem_subset_with_public_scores(
                     lite_version,
                     session_duration_hours,
                     ale_bench_num_workers,
+                    problem_sessions.get(problem_id),
                 ): problem_id
                 for problem_id in problem_ids
             }
@@ -701,6 +690,7 @@ def evaluate_problem_subset_with_public_scores(
             lite_version,
             session_duration_hours,
             ale_bench_num_workers,
+            problem_sessions.get(problem_id),
         )
         _log_problem_result(result)
         results.append(result)

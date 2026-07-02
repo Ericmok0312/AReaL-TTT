@@ -633,6 +633,13 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             f"[AleBenchEval-{label}] Running private eval for {len(eval_problem_ids)} problems"
         )
 
+        # Reuse the env sessions created in _setup_ale_bench_eval so private
+        # eval does not rebuild Rust tools in each worker.
+        problem_sessions = {
+            problem_id: env.session
+            for problem_id, env in self._ale_bench_eval_envs.items()
+            if hasattr(env, "session") and env.session is not None
+        }
         local_results = evaluate_problem_subset_with_public_scores(
             eval_problem_ids,
             public_results_by_problem,
@@ -640,6 +647,7 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             session_duration_hours=4.0,
             ale_bench_num_workers=config.ale_bench_eval_num_workers,
             n_parallel_problems=config.ale_bench_eval_n_parallel_problems,
+            problem_sessions=problem_sessions,
         )
         logger.info(
             f"[AleBenchEval-{label}] Private eval done, {len(local_results)} results"
