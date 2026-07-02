@@ -15,7 +15,6 @@ paper:
 from __future__ import annotations
 
 import json
-import logging
 import os
 import traceback
 from collections.abc import Sequence
@@ -25,6 +24,8 @@ from datetime import timedelta
 from typing import Any
 
 import numpy as np
+
+from areal.utils import logging
 
 logger = logging.getLogger("AleBenchEval")
 

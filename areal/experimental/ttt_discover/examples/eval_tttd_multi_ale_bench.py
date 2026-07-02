@@ -333,6 +333,28 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             return
 
         original_problem_id = getattr(config.sampler, "problem_id", "")
+        original_num_cpus = getattr(config.sampler, "num_cpus", 2)
+        # Use the eval-specific worker count for ALE-Bench sessions; the training
+        # sampler may use a much smaller num_cpus which would make public eval slow.
+        config.sampler.num_cpus = config.ale_bench_eval_num_workers
+        cpu_count = os.cpu_count() or 1
+        total_workers = (
+            config.ale_bench_eval_num_workers
+            * config.ale_bench_eval_n_parallel_problems
+        )
+        if total_workers > cpu_count:
+            logger.warning(
+                f"[AleBenchEval] Eval may oversubscribe CPU: "
+                f"num_workers({config.ale_bench_eval_num_workers}) × "
+                f"n_parallel_problems({config.ale_bench_eval_n_parallel_problems}) = "
+                f"{total_workers} > cpu_count({cpu_count}). "
+                f"Consider reducing ale_bench_eval_num_workers or "
+                f"ale_bench_eval_n_parallel_problems."
+            )
+        logger.info(
+            f"[AleBenchEval] Creating {len(self._ale_bench_eval_problem_ids)} envs "
+            f"with num_workers={config.ale_bench_eval_num_workers}"
+        )
         for problem_id in self._ale_bench_eval_problem_ids:
             config.sampler.problem_id = problem_id
             config.sampler.env_type = "ale_bench"
@@ -344,6 +366,7 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
                     f"[AleBenchEval] Failed to create env for {problem_id}: {e}"
                 )
         config.sampler.problem_id = original_problem_id
+        config.sampler.num_cpus = original_num_cpus
 
     def _zero_lora_weights(self, engine):
         """Zero out all LoRA parameters so the model behaves like the pure base model."""
