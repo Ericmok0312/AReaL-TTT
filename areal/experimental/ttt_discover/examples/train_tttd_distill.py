@@ -770,15 +770,6 @@ class TTTDDistillTrainer(PPOTrainer):
             train_batch_size=config.sampler.batch_size,
         )
 
-        # Align evaluator frequency with ALE-Bench eval settings so the standard
-        # Evaluator API can drive the custom ALE-Bench evaluation.
-        if self._ale_bench_eval_enabled:
-            if getattr(config, "ale_bench_eval_freq_steps", None) is not None:
-                config.evaluator.freq_steps = config.ale_bench_eval_freq_steps
-            # Disable epoch-based eval triggers; ALE-Bench eval is purely step-based.
-            config.evaluator.freq_epochs = None
-            config.evaluator.eval_before_train = config.ale_bench_eval_before_train
-
         self.evaluator = Evaluator(config.evaluator, ft_spec)
         self.saver = Saver(config.saver, ft_spec)
         self.recover_handler = RecoverHandler(config.recover, ft_spec)
@@ -1118,34 +1109,6 @@ class TTTDDistillTrainer(PPOTrainer):
         )
 
         # =====================================================================
-        # ALE-Bench evaluation driver (standard AReaL Evaluator API)
-        # =====================================================================
-        def _ale_bench_evaluate_fn(eval_global_step: int):
-            """Callable passed to Evaluator.evaluate; runs only on global rank 0."""
-            if self.actor.rank != 0:
-                return
-            self._run_ale_bench_eval(global_step=eval_global_step)
-            # Internal barrier matching standard AReaL _evaluate_fn: all ranks
-            # wait for the DP head's eval rollouts to finish.
-            if dist.is_initialized():
-                dist.barrier(group=self.actor.cpu_group)
-                current_platform.synchronize()
-
-        if self._ale_bench_eval_enabled:
-            # Before-train eval (if configured)
-            self.evaluator.evaluate(
-                functools.partial(_ale_bench_evaluate_fn, start_step),
-                epoch=0,
-                step=start_step,
-                global_step=start_step,
-            )
-            # External barrier matching standard AReaL _evaluate: all ranks wait
-            # before entering the training loop.
-            if dist.is_initialized():
-                dist.barrier(group=self.actor.cpu_group)
-                current_platform.synchronize()
-
-        # =====================================================================
         # Phase 1: Distillation steps (no verification)
         # =====================================================================
         for global_step in range(start_step, config.max_steps):
@@ -1462,20 +1425,6 @@ class TTTDDistillTrainer(PPOTrainer):
             logger.info(
                 f"[HANG-DEBUG][Step {global_step}][Rank {dist.get_rank()}] After rollout.resume"
             )
-
-            # Periodic ALE-Bench full-corpus evaluation via standard Evaluator API
-            if self._ale_bench_eval_enabled:
-                self.evaluator.evaluate(
-                    functools.partial(_ale_bench_evaluate_fn, global_step + 1),
-                    epoch=0,
-                    step=global_step + 1,
-                    global_step=global_step + 1,
-                )
-                # External barrier matching standard AReaL _evaluate: all ranks wait
-                # for the eval to finish before starting the next training step.
-                if dist.is_initialized():
-                    dist.barrier(group=self.actor.cpu_group)
-                    current_platform.synchronize()
 
             step_total = time.perf_counter() - step_start_time
             logger.info(
