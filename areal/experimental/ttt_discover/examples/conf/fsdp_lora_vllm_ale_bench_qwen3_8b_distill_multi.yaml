@@ -294,6 +294,7 @@ perf_tracer:
 
 eval_models:
   #baseline: null
+  step5: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch4epochstep4globalstep4
   step10: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch9epochstep9globalstep9
   #step20: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch19epochstep19globalstep19
   #step30: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch29epochstep29globalstep29
