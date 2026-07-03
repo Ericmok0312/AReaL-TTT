@@ -1272,6 +1272,9 @@ class TTTDDistillTrainer(PPOTrainer):
                         rollout_batch["privileged_teacher_loss_mask"] = (
                             teacher_loss_mask
                         )
+                        self.save_teacher_completions_text(
+                            rollout_batch, global_step
+                        )
                     else:
                         # Teacher and student see the same prompts (no privileged OPD)
                         teacher_logps_list = self.teacher.compute_logp([rollout_batch])
@@ -2405,6 +2408,139 @@ class TTTDDistillTrainer(PPOTrainer):
             teacher_input_ids,
             teacher_attention_mask,
             teacher_loss_mask,
+        )
+
+    def _decode_prompt_completion_text(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        idx: int,
+    ) -> tuple[str, str, int, int]:
+        """Decode prompt and completion text matching AReaL's rollout dump logic.
+
+        Mirrors ``WorkflowExecutor._dump_trajectory``:
+          1. Use attention_mask to determine real sequence length.
+          2. Split prompt / completion by loss_mask.
+          3. Decode with ``skip_special_tokens=False``.
+
+        Returns
+        -------
+        prompt_text, completion_text, prompt_len, completion_len
+            Empty strings and zeros if the sample has no completion.
+        """
+        seqlen = int(attention_mask[idx].sum().item())
+        if seqlen == 0:
+            return "", "", 0, 0
+
+        ids = input_ids[idx, :seqlen].cpu().tolist()
+        mask = loss_mask[idx, :seqlen].cpu().tolist()
+
+        # Match AReaL: skip samples whose last token is not a completion token.
+        if mask[-1] != 1:
+            return "", "", 0, 0
+
+        prompt_end = seqlen - sum(mask)
+        prompt_ids = ids[:prompt_end]
+        completion_ids = ids[prompt_end:]
+
+        prompt_text = self.tokenizer.decode(
+            prompt_ids, skip_special_tokens=False
+        )
+        completion_text = self.tokenizer.decode(
+            completion_ids, skip_special_tokens=False
+        )
+        return prompt_text, completion_text, prompt_end, len(completion_ids)
+
+    def save_teacher_completions_text(
+        self,
+        rollout_batch: dict[str, Any],
+        global_step: int,
+    ) -> None:
+        """Persist decoded student and teacher prompt/completion text.
+
+        Saves both the student rollout text (matching AReaL's own rollout dump)
+        and the privileged teacher text in the same record so pairing is trivial.
+        All ranks write their local slice to per-rank JSONL files.
+        """
+        teacher_input_ids = rollout_batch.get("privileged_teacher_input_ids")
+        teacher_attention_mask = rollout_batch.get(
+            "privileged_teacher_attention_mask"
+        )
+        teacher_loss_mask = rollout_batch.get("privileged_teacher_loss_mask")
+        if (
+            teacher_input_ids is None
+            or teacher_attention_mask is None
+            or teacher_loss_mask is None
+        ):
+            return
+
+        save_dir = os.path.join(
+            self.config.saver.fileroot,
+            self.config.experiment_name,
+            self.config.trial_name,
+            "teacher_completions_text",
+        )
+        os.makedirs(save_dir, exist_ok=True)
+
+        problem_ids = rollout_batch.get("_problem_ids", [])
+        student_input_ids = rollout_batch["input_ids"]
+        student_attention_mask = rollout_batch["attention_mask"]
+        student_loss_mask = rollout_batch["loss_mask"]
+        batch_size = teacher_input_ids.shape[0]
+
+        records = []
+        for i in range(batch_size):
+            (
+                student_prompt_text,
+                student_completion_text,
+                student_prompt_len,
+                student_completion_len,
+            ) = self._decode_prompt_completion_text(
+                student_input_ids,
+                student_attention_mask,
+                student_loss_mask,
+                i,
+            )
+            (
+                teacher_prompt_text,
+                teacher_completion_text,
+                teacher_prompt_len,
+                teacher_completion_len,
+            ) = self._decode_prompt_completion_text(
+                teacher_input_ids,
+                teacher_attention_mask,
+                teacher_loss_mask,
+                i,
+            )
+
+            records.append(
+                {
+                    "step": global_step,
+                    "rank": self.actor.rank,
+                    "sample_idx": i,
+                    "problem_id": problem_ids[i] if i < len(problem_ids) else "",
+                    "student_prompt_text": student_prompt_text,
+                    "student_completion_text": student_completion_text,
+                    "student_prompt_len": student_prompt_len,
+                    "student_completion_len": student_completion_len,
+                    "teacher_prompt_text": teacher_prompt_text,
+                    "teacher_completion_text": teacher_completion_text,
+                    "teacher_prompt_len": teacher_prompt_len,
+                    "teacher_completion_len": teacher_completion_len,
+                }
+            )
+
+        save_path = os.path.join(
+            save_dir, f"step{global_step:06d}_rank{self.actor.rank}.jsonl"
+        )
+        with open(save_path, "w", encoding="utf-8") as f:
+            for rec in records:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        logger.info(
+            f"[TeacherCompletionText] Rank {self.actor.rank}: "
+            f"saved {len(records)} samples to {save_path}"
         )
 
     def _generate_ale_bench_eval_candidates(
