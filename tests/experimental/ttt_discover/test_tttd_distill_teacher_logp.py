@@ -149,10 +149,10 @@ class TestComputePrivilegedTeacherLogp:
         """In hint mode, teacher logps align to student completion positions."""
         # Student prompt text length = 14 -> token ids [1..15] -> prompt_len = 15.
         # Student completion tokens [20, 21] -> comp_len = 2.
-        # Teacher prompt = student prompt + hint.  Hint length = 8 chars -> total 22
-        # chars -> teacher_prompt_len = 22.
-        # Teacher seq len = 22 + 2 = 24.
-        # Teacher completion logps at positions 21, 22 -> values 21, 22.
+        # Teacher prompt = student prompt + hint.  Hint "\n\n[Hint]\n" is 9 chars,
+        # so teacher prompt is 23 chars -> token ids [1..24] -> teacher_prompt_len = 24.
+        # Teacher seq len = 24 + 2 = 26.
+        # Teacher completion logps at positions 23, 24 -> values 23, 24.
         # Student completion positions: prompt_len-1=14 to prompt_len+comp_len-2=15.
         input_ids = torch.tensor(
             [[10] * 15 + [20, 21]], dtype=torch.int32
@@ -173,16 +173,16 @@ class TestComputePrivilegedTeacherLogp:
         )
 
         expected = torch.zeros(1, 17, dtype=torch.float32)
-        expected[0, 14:16] = torch.tensor([21.0, 22.0])
+        expected[0, 14:16] = torch.tensor([23.0, 24.0])
         torch.testing.assert_close(aligned_logp, expected)
 
         # Teacher batch should be teacher_prompt + student_completion.
         assert teacher_input_ids.shape[0] == 1
-        assert teacher_input_ids.shape[1] == 24
-        # First 22 tokens are the teacher prompt (loss mask 0), last 2 are completion.
+        assert teacher_input_ids.shape[1] == 26
+        # First 24 tokens are the teacher prompt (loss mask 0), last 2 are completion.
         torch.testing.assert_close(
             teacher_loss_mask[0].float(),
-            torch.tensor([0.0] * 22 + [1.0, 1.0]),
+            torch.tensor([0.0] * 24 + [1.0, 1.0]),
         )
 
     def test_single_teacher_continuation_mode(self, trainer):
@@ -283,7 +283,7 @@ class TestComputePrivilegedTeacherLogpMulti:
         """Multi-teacher path loads LoRA and aligns per-problem logps."""
         # Two rollouts for problem p1.
         # Student prompt text "student prompt" -> prompt_len = 15.
-        # Hint text length = 8 -> teacher prompt len = 22.
+        # Hint "\n\n[Hint]\n" is 9 chars -> teacher prompt len = 24.
         # Completion [20, 21] -> comp_len = 2.
         input_ids = torch.tensor(
             [[10] * 15 + [20, 21], [10] * 15 + [22, 23]], dtype=torch.int32
@@ -305,7 +305,7 @@ class TestComputePrivilegedTeacherLogpMulti:
         )
 
         expected = torch.zeros(2, 17, dtype=torch.float32)
-        expected[:, 14:16] = torch.tensor([21.0, 22.0])
+        expected[:, 14:16] = torch.tensor([23.0, 24.0])
         torch.testing.assert_close(aligned_logp, expected)
         trainer_multi._load_peft_lora_adapter.assert_called_once_with(
             trainer_multi.teacher, "/fake/lora"
