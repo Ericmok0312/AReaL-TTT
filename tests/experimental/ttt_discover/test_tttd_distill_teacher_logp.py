@@ -147,13 +147,16 @@ class TestComputePrivilegedTeacherLogp:
 
     def test_single_teacher_hint_mode_aligns_logps(self, trainer):
         """In hint mode, teacher logps align to student completion positions."""
-        # Student prompt text length = 14 -> token ids [1..15] -> prompt_len = 15.
-        # Student completion tokens [20, 21] -> comp_len = 2.
-        # Teacher prompt = student prompt + hint.  Hint "\n\n[Hint]\n" is 9 chars,
-        # so teacher prompt is 23 chars -> token ids [1..24] -> teacher_prompt_len = 24.
-        # Teacher seq len = 24 + 2 = 26.
-        # Teacher completion logps at positions 23, 24 -> values 23, 24.
-        # Student completion positions: prompt_len-1=14 to prompt_len+comp_len-2=15.
+        student_prompt = "student prompt"
+        hint = trainer._build_hint(_make_state())  # "\n\n[Hint]\n"
+        teacher_prompt_len = len(
+            trainer.tokenizer.apply_chat_template(
+                [{"role": "user", "content": student_prompt + hint}],
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+        )
+
         input_ids = torch.tensor(
             [[10] * 15 + [20, 21]], dtype=torch.int32
         )
@@ -165,30 +168,41 @@ class TestComputePrivilegedTeacherLogp:
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "loss_mask": loss_mask,
-            "_student_prompts": ["student prompt"],
+            "_student_prompts": [student_prompt],
         }
 
         aligned_logp, teacher_input_ids, teacher_attention_mask, teacher_loss_mask = (
             trainer._compute_privileged_teacher_logp(rollout_batch)
         )
 
+        # Completion logps are at teacher positions teacher_prompt_len-1 and
+        # teacher_prompt_len; because our mock returns position index as logp.
         expected = torch.zeros(1, 17, dtype=torch.float32)
-        expected[0, 14:16] = torch.tensor([23.0, 24.0])
+        expected[0, 14:16] = torch.tensor(
+            [float(teacher_prompt_len - 1), float(teacher_prompt_len)]
+        )
         torch.testing.assert_close(aligned_logp, expected)
 
         # Teacher batch should be teacher_prompt + student_completion.
         assert teacher_input_ids.shape[0] == 1
-        assert teacher_input_ids.shape[1] == 26
-        # First 24 tokens are the teacher prompt (loss mask 0), last 2 are completion.
+        assert teacher_input_ids.shape[1] == teacher_prompt_len + 2
         torch.testing.assert_close(
             teacher_loss_mask[0].float(),
-            torch.tensor([0.0] * 24 + [1.0, 1.0]),
+            torch.tensor([0.0] * teacher_prompt_len + [1.0, 1.0]),
         )
 
     def test_single_teacher_continuation_mode(self, trainer):
         """In continuation mode, teacher prompt comes from env.get_prompt."""
         trainer.config.privileged_prompt_mode = "continuation"
-        # env.get_prompt returns "privileged prompt" (length 16) -> prompt_len = 17.
+        teacher_prompt = trainer.env.get_prompt(_make_state())
+        teacher_prompt_len = len(
+            trainer.tokenizer.apply_chat_template(
+                [{"role": "user", "content": teacher_prompt}],
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+        )
+
         input_ids = torch.tensor([[10, 11, 20, 21]], dtype=torch.int32)
         attention_mask = torch.ones(1, 4, dtype=torch.bool)
         loss_mask = torch.tensor([[0, 0, 1, 1]], dtype=torch.int32)
@@ -201,10 +215,11 @@ class TestComputePrivilegedTeacherLogp:
 
         aligned_logp, *_ = trainer._compute_privileged_teacher_logp(rollout_batch)
 
-        # teacher_prompt_len = 17, comp_len = 2 -> teacher positions 16, 17 -> values 16,17.
         # student_prompt_len = 2 -> student positions 1, 2.
         expected = torch.zeros(1, 4, dtype=torch.float32)
-        expected[0, 1:3] = torch.tensor([16.0, 17.0])
+        expected[0, 1:3] = torch.tensor(
+            [float(teacher_prompt_len - 1), float(teacher_prompt_len)]
+        )
         torch.testing.assert_close(aligned_logp, expected)
 
     def test_single_teacher_zero_completion(self, trainer):
@@ -222,6 +237,153 @@ class TestComputePrivilegedTeacherLogp:
         aligned_logp, *_ = trainer._compute_privileged_teacher_logp(rollout_batch)
         expected = torch.zeros(1, 2, dtype=torch.float32)
         torch.testing.assert_close(aligned_logp, expected)
+
+
+class TestComputePrivilegedTeacherLogpFormula:
+    """Verify the OPD formula: teacher_logp[n] = log p_T(C_n | P, C_{<n}).
+
+    The distillation loss sums over completion tokens the divergence between
+    teacher distribution p_T(· | x, y*, ŷ_{<n}) and student distribution
+    p_S(· | x, ŷ_{<n}).  These tests verify that the teacher logps we feed into
+    AReaL's KDRL path are conditioned on the privileged prompt plus the exact
+    completion prefix.
+    """
+
+    @pytest.fixture
+    def trainer_formula(self):
+        """Return a trainer whose teacher logps depend on the full prefix."""
+        trainer = object.__new__(TTTDDistillTrainer)
+        trainer.is_multi_teacher = False
+
+        config = MagicMock()
+        config.gconfig.n_samples = 1
+        config.use_breakthrough_opd = False
+        config.privileged_prompt_mode = "hint"
+        config.enable_thinking = False
+        trainer.config = config
+
+        actor = MagicMock()
+        actor.data_parallel_world_size = 1
+        actor.data_parallel_rank = 0
+        trainer.actor = actor
+
+        tokenizer = MagicMock()
+        tokenizer.pad_token_id = 0
+        # Exact tokenization map so we can compute prefix sums by hand.
+        token_map = {
+            "ab": [1, 2],
+            "abH": [1, 2, 10],
+        }
+
+        def _apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, enable_thinking=False
+        ):
+            return token_map.get(messages[0]["content"], [1])
+
+        tokenizer.apply_chat_template = _apply_chat_template
+        trainer.tokenizer = tokenizer
+
+        teacher_sampler = MagicMock()
+        teacher_sampler.sample_states = lambda n: [_make_state()] * n
+        trainer.teacher_sampler = teacher_sampler
+
+        env = MagicMock()
+        trainer.env = env
+
+        # Hint "H" makes privileged prompt "abH" -> [1, 2, 10].
+        trainer._build_hint = lambda state: "H"
+        trainer._milestone_hints_data = None
+
+        def _compute_logp(batches):
+            """Return prefix-sum logps: logp at position j = sum(input_ids[:j]).
+
+            This simulates a causal LM where the distribution at position j is a
+            deterministic function of the prefix input_ids[:j].  For completion
+            token C_n at teacher position |P| - 1 + n, the prefix is
+            P + C_{<n}, so the returned logp depends exactly on the privileged
+            prompt and previous completion tokens.
+            """
+            input_ids = batches[0]["input_ids"].to(torch.int64)
+            batch_size, seq_len = input_ids.shape
+            zeros = torch.zeros(batch_size, 1, dtype=torch.float32)
+            if seq_len == 1:
+                prefix_sums = zeros
+            else:
+                prefix_sums = torch.cat(
+                    [zeros, input_ids[:, :-1].cumsum(dim=1).float()], dim=1
+                )
+            return [prefix_sums]
+
+        teacher = MagicMock()
+        teacher.compute_logp = _compute_logp
+        trainer.teacher = teacher
+
+        return trainer
+
+    def test_teacher_logp_conditions_on_privileged_prompt_and_prefix(self, trainer_formula):
+        """Teacher logp for C_n uses privileged prompt P and completion prefix C_{<n}."""
+        # Student prompt "ab" -> [1, 2], completion [20, 21].
+        # Privileged prompt "abH" -> [1, 2, 10].
+        # Teacher input: [1, 2, 10, 20, 21].
+        # logp(C_1) at pos 3 = sum([1, 2, 10])            = 13
+        # logp(C_2) at pos 4 = sum([1, 2, 10, 20])        = 33
+        # Mapped to student positions 1 and 2.
+        input_ids = torch.tensor([[1, 2, 20, 21]], dtype=torch.int32)
+        attention_mask = torch.ones(1, 4, dtype=torch.bool)
+        loss_mask = torch.tensor([[0, 0, 1, 1]], dtype=torch.int32)
+        rollout_batch = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "loss_mask": loss_mask,
+            "_student_prompts": ["ab"],
+        }
+
+        aligned_logp, teacher_input_ids, teacher_attention_mask, teacher_loss_mask = (
+            trainer_formula._compute_privileged_teacher_logp(rollout_batch)
+        )
+
+        expected = torch.zeros(1, 4, dtype=torch.float32)
+        expected[0, 1:3] = torch.tensor([13.0, 33.0])
+        torch.testing.assert_close(aligned_logp, expected)
+
+        # Teacher batch structure: privileged prompt + completion.
+        torch.testing.assert_close(
+            teacher_input_ids[0],
+            torch.tensor([1, 2, 10, 20, 21], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            teacher_loss_mask[0].float(),
+            torch.tensor([0.0, 0.0, 0.0, 1.0, 1.0]),
+        )
+
+    def test_teacher_logp_changes_with_privileged_prompt(self, trainer_formula):
+        """Different privileged hint gives different teacher logps for same completion."""
+        # Base case: hint "H" -> privileged prompt "abH" -> [1, 2, 10].
+        input_ids = torch.tensor([[1, 2, 20, 21]], dtype=torch.int32)
+        attention_mask = torch.ones(1, 4, dtype=torch.bool)
+        loss_mask = torch.tensor([[0, 0, 1, 1]], dtype=torch.int32)
+        rollout_batch = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "loss_mask": loss_mask,
+            "_student_prompts": ["ab"],
+        }
+        aligned_base, *_ = trainer_formula._compute_privileged_teacher_logp(
+            rollout_batch
+        )
+
+        # Change hint so privileged prompt becomes "abX" -> [1, 2, 99].
+        trainer_formula.tokenizer._token_map = {
+            "ab": [1, 2],
+            "abX": [1, 2, 99],
+        }
+        trainer_formula._build_hint = lambda state: "X"
+        aligned_changed, *_ = trainer_formula._compute_privileged_teacher_logp(
+            rollout_batch
+        )
+
+        # The completion logps must differ because the privileged context changed.
+        assert not torch.allclose(aligned_base, aligned_changed)
 
 
 class TestComputePrivilegedTeacherLogpMulti:
@@ -281,10 +443,16 @@ class TestComputePrivilegedTeacherLogpMulti:
 
     def test_multi_teacher_aligns_per_problem(self, trainer_multi):
         """Multi-teacher path loads LoRA and aligns per-problem logps."""
-        # Two rollouts for problem p1.
-        # Student prompt text "student prompt" -> prompt_len = 15.
-        # Hint "\n\n[Hint]\n" is 9 chars -> teacher prompt len = 24.
-        # Completion [20, 21] -> comp_len = 2.
+        student_prompt = "student prompt"
+        hint = trainer_multi._build_hint(_make_state())
+        teacher_prompt_len = len(
+            trainer_multi.tokenizer.apply_chat_template(
+                [{"role": "user", "content": student_prompt + hint}],
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+        )
+
         input_ids = torch.tensor(
             [[10] * 15 + [20, 21], [10] * 15 + [22, 23]], dtype=torch.int32
         )
@@ -296,7 +464,7 @@ class TestComputePrivilegedTeacherLogpMulti:
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "loss_mask": loss_mask,
-            "_student_prompts": ["student prompt", "student prompt"],
+            "_student_prompts": [student_prompt, student_prompt],
             "_problem_ids": ["p1", "p1"],
         }
 
@@ -305,7 +473,9 @@ class TestComputePrivilegedTeacherLogpMulti:
         )
 
         expected = torch.zeros(2, 17, dtype=torch.float32)
-        expected[:, 14:16] = torch.tensor([23.0, 24.0])
+        expected[:, 14:16] = torch.tensor(
+            [float(teacher_prompt_len - 1), float(teacher_prompt_len)]
+        )
         torch.testing.assert_close(aligned_logp, expected)
         trainer_multi._load_peft_lora_adapter.assert_called_once_with(
             trainer_multi.teacher, "/fake/lora"

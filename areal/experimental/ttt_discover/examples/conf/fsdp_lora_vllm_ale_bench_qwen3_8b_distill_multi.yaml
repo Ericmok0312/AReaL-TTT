@@ -71,7 +71,7 @@ teacher:
   disable_dropout: true
   dtype: ${actor.dtype}
   mb_spec:
-    max_tokens_per_mb: 32768
+    max_tokens_per_mb: 65536
     n_mbs: 1
     granularity: 1
   optimizer: null
