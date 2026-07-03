@@ -97,6 +97,65 @@ def dummy_reward_fn(prompt, completions, prompt_ids, completion_ids, **data):
     return 0.0, result, "", 0.0
 
 
+def align_teacher_completion_logps(
+    teacher_logps_full: torch.Tensor,
+    teacher_prompt_lens: list[int],
+    student_prompt_lens: list[int],
+    comp_lens: list[int],
+    student_seqlen: int,
+) -> torch.Tensor:
+    """Align teacher completion logps to student sequence positions.
+
+    Teacher and student share the same completion tokens, but the teacher sees a
+    privileged prompt of length ``T`` while the student sees a plain prompt of
+    length ``S``.  For completion token ``c`` (0-indexed), the teacher logp is at
+    position ``T - 1 + c`` in ``teacher_logps_full``; we copy it to position
+    ``S - 1 + c`` in the student sequence.
+
+    Parameters
+    ----------
+    teacher_logps_full : torch.Tensor
+        [batch_size, teacher_seq_len] log probabilities from ``teacher.compute_logp``.
+    teacher_prompt_lens : list[int]
+        Privileged prompt length for each batch item.
+    student_prompt_lens : list[int]
+        Plain prompt length for each batch item.
+    comp_lens : list[int]
+        Completion length for each batch item.
+    student_seqlen : int
+        Target sequence length (student ``seq_len``).
+
+    Returns
+    -------
+    aligned_teacher_logp : torch.Tensor
+        [batch_size, student_seqlen] with completion logps aligned to student
+        positions.  Non-completion positions are zero-filled.
+    """
+    batch_size = teacher_logps_full.shape[0]
+    device = teacher_logps_full.device
+    aligned_teacher_logp = torch.zeros(
+        (batch_size, student_seqlen), dtype=torch.float32, device=device
+    )
+    for i in range(batch_size):
+        comp_len = int(comp_lens[i])
+        if comp_len == 0:
+            continue
+        teacher_prompt_len = int(teacher_prompt_lens[i])
+        student_prompt_len = int(student_prompt_lens[i])
+
+        # Teacher completion logps: [teacher_prompt_len-1, teacher_prompt_len+comp_len-1)
+        t_start = teacher_prompt_len - 1
+        t_end = teacher_prompt_len + comp_len - 1
+        teacher_comp_logps = teacher_logps_full[i, t_start:t_end]
+
+        # Student completion positions: [student_prompt_len-1, student_prompt_len+comp_len-1)
+        s_start = student_prompt_len - 1
+        s_end = student_prompt_len + comp_len - 1
+        aligned_teacher_logp[i, s_start:s_end] = teacher_comp_logps.to(dtype=torch.float32)
+
+    return aligned_teacher_logp
+
+
 # =============================================================================
 # Distillation Trainer
 # =============================================================================
@@ -2105,26 +2164,14 @@ class TTTDDistillTrainer(PPOTrainer):
         # ------------------------------------------------------------------
         # 6. Align completion logps back to student sequence positions
         # ------------------------------------------------------------------
-        aligned_teacher_logp = torch.zeros(
-            (batch_size, student_seqlen), dtype=torch.float32, device=device
+        teacher_prompt_lens = [len(ids) for ids in teacher_prompt_ids_list]
+        aligned_teacher_logp = align_teacher_completion_logps(
+            teacher_logps_full,
+            teacher_prompt_lens,
+            prompt_lens.tolist(),
+            comp_lens.tolist(),
+            student_seqlen,
         )
-        for i in range(batch_size):
-            prompt_len = int(prompt_lens[i])
-            comp_len = int(comp_lens[i])
-            teacher_prompt_len = len(teacher_prompt_ids_list[i])
-            if comp_len == 0:
-                continue
-            # Teacher completion logps: [teacher_prompt_len-1, teacher_prompt_len+comp_len-1)
-            t_start = teacher_prompt_len - 1
-            t_end = teacher_prompt_len + comp_len - 1
-            teacher_comp_logps = teacher_logps_full[i, t_start:t_end]
-
-            # Student completion positions: [prompt_len-1, prompt_len+comp_len-1)
-            s_start = prompt_len - 1
-            s_end = prompt_len + comp_len - 1
-            aligned_teacher_logp[i, s_start:s_end] = teacher_comp_logps.to(
-                device=device, dtype=torch.float32
-            )
 
         return (
             aligned_teacher_logp,
@@ -2295,21 +2342,16 @@ class TTTDDistillTrainer(PPOTrainer):
             teacher_logps_full = teacher_logps_list[0]
 
             # Align logps back to the original rollout positions
+            problem_student_prompt_lens = [int(prompt_lens[idx]) for idx in indices]
+            problem_aligned = align_teacher_completion_logps(
+                teacher_logps_full,
+                problem_teacher_prompt_lens,
+                problem_student_prompt_lens,
+                problem_comp_lens,
+                student_seqlen,
+            )
             for j, idx in enumerate(indices):
-                comp_len = problem_comp_lens[j]
-                if comp_len == 0:
-                    continue
-                teacher_prompt_len = problem_teacher_prompt_lens[j]
-                t_start = teacher_prompt_len - 1
-                t_end = teacher_prompt_len + comp_len - 1
-                teacher_comp_logps = teacher_logps_full[j, t_start:t_end]
-
-                prompt_len = int(prompt_lens[idx])
-                s_start = prompt_len - 1
-                s_end = prompt_len + comp_len - 1
-                aligned_teacher_logp[idx, s_start:s_end] = teacher_comp_logps.to(
-                    device=device, dtype=torch.float32
-                )
+                aligned_teacher_logp[idx] = problem_aligned[j]
 
                 # Store privileged teacher inputs for dynamic metrics
                 teacher_input_ids_rows[idx] = problem_input_ids[j]
