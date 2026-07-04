@@ -485,20 +485,24 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
 
     def _generate_ale_bench_eval_candidates(
         self, label: str, global_step: int
-    ) -> tuple[dict[str, list[str]], dict[str, list[dict[str, Any]]]]:
+    ) -> tuple[
+        dict[str, list[str]],
+        dict[str, list[dict[str, Any]]],
+        dict[int, dict[str, str]],
+    ]:
         """Generate candidate responses for ALE-Bench evaluation for the current model."""
         config = self.config
         n_candidates = config.ale_bench_eval_n_candidates
 
         if self.actor.rank != 0:
-            return {}, {}
+            return {}, {}, {}
 
         eval_problem_ids = self._ale_bench_eval_problem_ids
         local_candidates: dict[str, list[str]] = {}
         public_results_by_problem: dict[str, list[dict[str, Any]]] = {}
 
         if not eval_problem_ids:
-            return local_candidates, public_results_by_problem
+            return local_candidates, public_results_by_problem, {}
 
         base_eval_gconfig = config.eval_gconfig or config.gconfig
         eval_gconfig = base_eval_gconfig.new(n_samples=n_candidates)
@@ -551,21 +555,26 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             )
 
         if not data_list:
-            return local_candidates, public_results_by_problem
+            return local_candidates, public_results_by_problem, {}
 
         logger.info(
             f"[AleBenchEval-{label}] Generating {n_candidates} candidates "
             f"for {len(data_list)} problems"
         )
 
+        task_to_problem: dict[int, dict[str, str]] = {}
         for data in data_list:
-            self.eval_rollout.submit(
+            task_id = self.eval_rollout.submit(
                 data,
                 eval_workflow_cls,
                 workflow_kwargs=eval_workflow_kwargs,
                 group_size=n_candidates,
                 is_eval=True,
             )
+            task_to_problem[task_id] = {
+                "problem_id": data.get("_problem_id", ""),
+                "state_id": data.get("state_id", ""),
+            }
 
         logger.info(
             f"[AleBenchEval-{label}] Submitted {len(data_list)} rollout requests"
@@ -632,7 +641,7 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             f"[AleBenchEval-{label}] Generated {total_count} candidate codes "
             f"across {len(local_candidates)} problems"
         )
-        return local_candidates, public_results_by_problem
+        return local_candidates, public_results_by_problem, task_to_problem
 
     def _run_ale_bench_eval_for_model(
         self, label: str, global_step: int
@@ -648,7 +657,7 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             return {"model": label, "skipped": True}
 
         logger.info(f"[AleBenchEval-{label}] Starting candidate generation")
-        candidates_by_problem, public_results_by_problem = (
+        candidates_by_problem, public_results_by_problem, task_to_problem = (
             self._generate_ale_bench_eval_candidates(label, global_step)
         )
         logger.info(f"[AleBenchEval-{label}] Candidate generation done")
@@ -697,6 +706,7 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
                 "ale_bench_num_workers": config.ale_bench_eval_num_workers,
                 "n_parallel_problems": config.ale_bench_eval_n_parallel_problems,
                 "selection_method": selection_method,
+                "task_to_problem": task_to_problem,
             }
         )
 
@@ -731,6 +741,7 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
         )
 
         all_results: dict[str, dict[str, Any]] = {}
+        combined_task_to_problem: dict[str, dict[str, Any]] = {}
         for idx, label in enumerate(self._eval_models):
             if dist.is_initialized():
                 dist.barrier()
@@ -738,6 +749,13 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             all_results[label] = self._run_ale_bench_eval_for_model(
                 label, global_step=idx
             )
+            task_to_problem = all_results[label].get("task_to_problem", {})
+            for task_id, info in task_to_problem.items():
+                combined_task_to_problem[str(task_id)] = {
+                    **info,
+                    "model": label,
+                    "version": idx,
+                }
 
         # Save combined comparison summary on DP head
         if is_dp_head:
@@ -748,6 +766,17 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             with open(comparison_path, "w") as f:
                 json.dump(all_results, f, indent=2)
             logger.info(f"[MultiEval] Comparison results saved to {comparison_path}")
+
+            combined_mapping_path = os.path.join(
+                self._ale_bench_eval_output_dir,
+                "task_to_problem_all_models.json",
+            )
+            with open(combined_mapping_path, "w") as f:
+                json.dump(combined_task_to_problem, f, indent=2)
+            logger.info(
+                f"[MultiEval] Combined task-to-problem mapping saved to "
+                f"{combined_mapping_path}"
+            )
 
             logger.info("\n" + "=" * 90)
             logger.info("ALE-BENCH EVALUATION COMPARISON")
