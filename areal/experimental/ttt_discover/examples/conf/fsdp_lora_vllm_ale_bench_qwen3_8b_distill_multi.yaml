@@ -24,7 +24,7 @@ ale_bench_eval_freq_steps: 10
 ale_bench_eval_n_candidates: 15
 ale_bench_eval_lite_version: false
 ale_bench_eval_num_workers: 16
-ale_bench_eval_n_parallel_problems: 40
+ale_bench_eval_n_parallel_problems: 10
 
 # # Multi-teacher hint selection: diverse best + diverse worst from different PUCT branches
 # multi_teacher_hint_mode: "diverse_best_worst"
