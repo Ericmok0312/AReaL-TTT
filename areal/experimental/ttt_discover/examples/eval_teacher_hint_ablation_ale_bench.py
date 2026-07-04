@@ -111,14 +111,23 @@ HINT_MODES = [
 ]
 
 # Default hint combinations for the ablation. Each entry can be a plain mode
-# string (k=1) or a dict with ``mode`` and ``k``. The optional ``label`` is
-# used in logs and the output JSON; it defaults to ``{mode}_k{k}``.
+# string (k=1) or a dict with ``mode``, ``k``, and optional ``combine`` /
+# ``label``. When ``combine=True`` and k>1, all k states are shown together
+# in a single prompt instead of rotating across candidates.
 DEFAULT_EVAL_HINT_MODES: list[dict[str, Any] | str] = [
+    {"mode": "none", "label": "none"},
     {"mode": "best_worst_combined", "k": 1, "label": "best_worst_k1"},
     {"mode": "best", "k": 1, "label": "best_k1"},
     {"mode": "best", "k": 2, "label": "best_k2"},
+    {"mode": "best", "k": 2, "label": "best_k2_combined", "combine": True},
     {"mode": "worst_nonzero", "k": 1, "label": "worst_k1"},
     {"mode": "diverse_best", "k": 2, "label": "diverse_best_k2"},
+    {
+        "mode": "diverse_best",
+        "k": 2,
+        "label": "diverse_best_k2_combined",
+        "combine": True,
+    },
     {"mode": "milestone", "label": "milestone"},
 ]
 
@@ -137,10 +146,10 @@ def _mode_spec_label(spec: dict[str, Any]) -> str:
 
 
 def _normalize_mode_spec(item: Any) -> dict[str, Any] | None:
-    """Normalize a mode config item into a ``{mode, k, label}`` dict.
+    """Normalize a mode config item into a spec dict.
 
     Accepts either a mode string or a dict with ``mode`` and optional ``k`` /
-    ``label``. Returns ``None`` if the mode is not supported.
+    ``label`` / ``combine``. Returns ``None`` if the mode is not supported.
     """
     if isinstance(item, str):
         item = {"mode": item.strip()}
@@ -150,6 +159,8 @@ def _normalize_mode_spec(item: Any) -> dict[str, Any] | None:
     if mode not in HINT_MODES:
         return None
     spec = {"mode": mode, "k": int(item.get("k", 1))}
+    if item.get("combine"):
+        spec["combine"] = True
     if "label" in item:
         spec["label"] = str(item["label"])
     else:
@@ -401,7 +412,12 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
             sampler_ckpt = getattr(entry, "sampler_checkpoint", "")
             if not lora_path:
                 raise ValueError(f"multi_teacher[{i}] missing lora_path")
-            label = os.path.basename(os.path.normpath(lora_path)) or f"teacher_{i}"
+            label = (
+                getattr(entry, "label", None)
+                or problem_id
+                or os.path.basename(os.path.normpath(lora_path))
+                or f"teacher_{i}"
+            )
             hint_sampler = self._create_hint_sampler(
                 config, problem_id, sampler_ckpt, max_version_history
             )
@@ -534,6 +550,36 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
             "and why the weaker ones perform less well. Identify the underlying principles, "
             "and try to generalize them. Then generate your own independent C++20 solution "
             "based on your understanding.\n"
+        )
+
+    def _build_multi_state_hint(
+        self,
+        states: list[Any],
+        title: str = "Reference Approaches",
+        preamble: str = "Below are reference approaches:",
+        example_label: str = "Reference example",
+    ) -> str:
+        """Build a hint that shows multiple states of the same type together."""
+        fence = self._hint_code_fence()
+        hint_parts: list[str] = []
+        hint_parts.append(preamble)
+        for idx, state in enumerate(states, start=1):
+            if state.code and state.code.strip():
+                hint_parts.append(f"{example_label} {idx}:")
+                hint_parts.append(f"```{fence}\n{state.code.strip()}\n```")
+            score, score_label = self._display_score(state)
+            if score is not None:
+                hint_parts.append(
+                    f"This approach achieves a {score_label} of {score:.6f}."
+                )
+            hint_parts.append("")
+
+        hint_text = "\n".join(hint_parts).strip()
+        return (
+            f"\n\n[{title}]\n{hint_text}\n\n"
+            "Study all the approaches above. Identify the underlying principles, "
+            "and try to generalize them. Then generate your own independent C++20 "
+            "solution based on your understanding.\n"
         )
 
     def _build_breakthrough_pair_hint(self, parent_state: Any, child_state: Any) -> str:
@@ -676,7 +722,55 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
                     min_improvement=min_improvement,
                     deterministic=deterministic,
                 )
-                state_hint_data[sid] = {"type": "pool", "pool": hint_pool}
+
+                # When ``combine=True`` and the pool has multiple states of the
+                # same type, show them all together in one prompt instead of
+                # rotating across candidates.
+                if mode_spec.get("combine") and len(hint_pool) > 1:
+                    states = [payload for _label, payload in hint_pool]
+                    if mode == "best":
+                        combined = self._build_multi_state_hint(
+                            states,
+                            title="Strong Reference Approaches",
+                            preamble=f"Below are {len(states)} strong reference approaches:",
+                            example_label="Strong example",
+                        )
+                    elif mode == "worst_nonzero":
+                        combined = self._build_multi_state_hint(
+                            states,
+                            title="Weaker Reference Approaches",
+                            preamble=(
+                                f"Below are {len(states)} weaker but still valid "
+                                f"reference approaches:"
+                            ),
+                            example_label="Weak example",
+                        )
+                    elif mode == "diverse_best":
+                        combined = self._build_multi_state_hint(
+                            states,
+                            title="Diverse Strong Reference Approaches",
+                            preamble=(
+                                f"Below are {len(states)} strong reference approaches "
+                                f"from different search branches:"
+                            ),
+                            example_label="Diverse strong example",
+                        )
+                    elif mode == "diverse_worst_nonzero":
+                        combined = self._build_multi_state_hint(
+                            states,
+                            title="Diverse Weak Reference Approaches",
+                            preamble=(
+                                f"Below are {len(states)} weak but still valid "
+                                f"reference approaches from different search branches:"
+                            ),
+                            example_label="Diverse weak example",
+                        )
+                    else:
+                        # Fallback for any other mode with combine=True.
+                        combined = self._build_multi_state_hint(states)
+                    state_hint_data[sid] = {"type": "fixed", "hint_text": combined}
+                else:
+                    state_hint_data[sid] = {"type": "pool", "pool": hint_pool}
 
         def hint_fn(state):
             sid = getattr(state, "id", "")
@@ -686,6 +780,9 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
 
             counter = counters[sid]
             counters[sid] = counter + 1
+
+            if data["type"] == "fixed":
+                return data["hint_text"]
 
             if data["type"] == "milestone":
                 paths = data["paths"]
@@ -1316,8 +1413,11 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
             spec["problem_id"]: spec for spec in self._eval_teacher_specs
         }
 
+        # Baseline measures the pure base model *with* hints; skip the no-hint
+        # ``none`` mode since that comparison is provided by the teachers.
+        baseline_mode_specs = [m for m in mode_specs if m["mode"] != "none"]
         results_by_mode: dict[str, dict[str, Any]] = {}
-        for mode_spec in mode_specs:
+        for mode_spec in baseline_mode_specs:
             mode_label = mode_spec["label"]
             logger.info(f"[Baseline] Running mode: {mode_label}")
             results_by_mode[mode_label] = self._run_multi_problem_mode_eval(
