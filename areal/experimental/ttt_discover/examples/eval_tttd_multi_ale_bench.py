@@ -801,6 +801,22 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
 
     def close(self):
         """Cleanup resources."""
+        # Close ALE-Bench env sessions first to release Docker containers/tools
+        # even when the process is terminated by the launcher.
+        if hasattr(self, "_ale_bench_eval_envs"):
+            for problem_id, env in list(self._ale_bench_eval_envs.items()):
+                session = getattr(env, "session", None)
+                if session is not None:
+                    try:
+                        session.close()
+                        logger.info(
+                            f"[AleBenchEval] Closed env session for {problem_id}"
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"[AleBenchEval] Failed to close session for {problem_id}: {e}"
+                        )
+
         self.stats_logger.close()
         if hasattr(self, "eval_rollout") and self.eval_rollout is not None:
             self.eval_rollout.destroy()

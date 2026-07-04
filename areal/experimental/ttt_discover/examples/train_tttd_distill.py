@@ -2897,6 +2897,21 @@ class TTTDDistillTrainer(PPOTrainer):
             except Exception as e:
                 logger.warning(f"[DynamicMetrics] Failed to save checkpoint: {e}")
 
+        # Close ALE-Bench eval env sessions to release Docker containers/tools.
+        if hasattr(self, "_ale_bench_eval_envs"):
+            for problem_id, env in list(self._ale_bench_eval_envs.items()):
+                session = getattr(env, "session", None)
+                if session is not None:
+                    try:
+                        session.close()
+                        logger.info(
+                            f"[AleBenchEval] Closed eval env session for {problem_id}"
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"[AleBenchEval] Failed to close eval session for {problem_id}: {e}"
+                        )
+
         self.stats_logger.close()
         if hasattr(self, "eval_rollout") and self.eval_rollout is not None:
             self.eval_rollout.destroy()
