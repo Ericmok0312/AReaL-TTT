@@ -67,6 +67,12 @@ def _case_absolute_score(case: Any) -> float:
     return 0.0
 
 
+def _is_accepted(candidate: dict[str, Any]) -> bool:
+    """Return True if the candidate's public judge result is ACCEPTED."""
+    judge_result = candidate.get("public", {}).get("judge_result")
+    return str(judge_result).upper() == "ACCEPTED"
+
+
 def _select_best_candidate_index(
     candidate_results: list[dict[str, Any]],
     selection_method: str = "median",
@@ -77,19 +83,44 @@ def _select_best_candidate_index(
     Args:
         candidate_results: List of candidate result dicts with public scores.
         selection_method: "median", "median_case_score", or "best_public".
-        score_type: "minimize" or "maximize". Only used for ``best_public``.
+        score_type: "minimize" or "maximize". Both ``best_public`` and
+            ``median_case_score`` operate on raw absolute scores, so their
+            selection direction follows the original problem semantics: lower
+            is better for ``minimize``, higher is better for ``maximize``.
+            Non-AC candidates are excluded when ``judge_result`` is available.
     """
     if not candidate_results:
         return 0
 
+    is_minimize = str(score_type).lower().strip() == "minimize"
+
+    def _ac_indices() -> list[int] | None:
+        ac = [i for i, c in enumerate(candidate_results) if _is_accepted(c)]
+        return ac if ac else None
+
     if selection_method == "median_case_score":
+        # ``median_case_score`` is the median of per-case *raw* scores, so the
+        # direction matches the original problem semantics.
         medians = [
-            c.get("public", {}).get("median_case_score", float("-inf"))
+            c.get("public", {}).get("median_case_score", float("nan"))
             for c in candidate_results
         ]
-        return int(np.argmax(medians))
+        valid_indices = [i for i, s in enumerate(medians) if not np.isnan(s)]
+        if not valid_indices:
+            return 0
+        ac = _ac_indices()
+        if ac is not None:
+            valid_indices = [i for i in valid_indices if i in ac]
+            if not valid_indices:
+                return 0
+        best_fn = np.argmin if is_minimize else np.argmax
+        valid_medians = [medians[i] for i in valid_indices]
+        return int(valid_indices[int(best_fn(valid_medians))])
 
     if selection_method == "best_public":
+        # ``overall_absolute_score`` is the sum of raw per-case absolute scores.
+        # It is *not* a normalized standing score: lower is better for minimize
+        # and higher is better for maximize. Prefer AC candidates.
         scores = [
             c.get("public", {}).get("overall_absolute_score", float("nan"))
             for c in candidate_results
@@ -99,12 +130,19 @@ def _select_best_candidate_index(
             return _select_best_candidate_index(
                 candidate_results, "median_case_score", score_type
             )
-        # For minimization, lower absolute score is better.
-        # For maximization, higher absolute score is better.
-        best_fn = np.argmin if score_type == "minimize" else np.argmax
+        ac = _ac_indices()
+        if ac is not None:
+            valid_indices = [i for i in valid_indices if i in ac]
+            if not valid_indices:
+                return _select_best_candidate_index(
+                    candidate_results, "median_case_score", score_type
+                )
         valid_scores = [scores[i] for i in valid_indices]
-        local_best = best_fn(valid_scores)
-        return int(valid_indices[local_best])
+        if is_minimize:
+            best_sub = int(np.argmin(valid_scores))
+        else:
+            best_sub = int(np.argmax(valid_scores))
+        return int(valid_indices[best_sub])
 
     scores = [
         c.get("public", {}).get("overall_absolute_score", float("nan"))
