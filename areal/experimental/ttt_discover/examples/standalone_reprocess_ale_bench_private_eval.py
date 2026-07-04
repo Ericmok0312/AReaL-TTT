@@ -40,6 +40,24 @@ from areal.utils import logging
 logger = logging.getLogger("standalone_reprocess_ale_bench_private_eval")
 
 
+def _get_problem_score_type(problem_id: str, lite_version: bool) -> str:
+    """Load ALE-Bench problem metadata and return its score type.
+
+    Returns "minimize" or "maximize". Falls back to "minimize" on error.
+    """
+    try:
+        from ale_bench.data import load_problem
+
+        problem, *_ = load_problem(problem_id=problem_id, lite_version=lite_version)
+        return str(problem.metadata.score_type.value)
+    except Exception as e:
+        logger.warning(
+            f"[{problem_id}] Failed to load problem metadata: {e}. "
+            f"Falling back to minimize semantics."
+        )
+        return "minimize"
+
+
 def _case_absolute_score(case: Any) -> float:
     """Extract the absolute/raw score from a case result robustly."""
     for attr in ("absolute_score", "score", "raw_score"):
@@ -52,8 +70,15 @@ def _case_absolute_score(case: Any) -> float:
 def _select_best_candidate_index(
     candidate_results: list[dict[str, Any]],
     selection_method: str = "median",
+    score_type: str = "minimize",
 ) -> int:
-    """Select the best candidate index using the official ALE-Bench strategy."""
+    """Select the best candidate index using the chosen strategy.
+
+    Args:
+        candidate_results: List of candidate result dicts with public scores.
+        selection_method: "median", "median_case_score", or "best_public".
+        score_type: "minimize" or "maximize". Only used for ``best_public``.
+    """
     if not candidate_results:
         return 0
 
@@ -64,13 +89,32 @@ def _select_best_candidate_index(
         ]
         return int(np.argmax(medians))
 
+    if selection_method == "best_public":
+        scores = [
+            c.get("public", {}).get("overall_absolute_score", float("nan"))
+            for c in candidate_results
+        ]
+        valid_indices = [i for i, s in enumerate(scores) if not np.isnan(s)]
+        if not valid_indices:
+            return _select_best_candidate_index(
+                candidate_results, "median_case_score", score_type
+            )
+        # For minimization, lower absolute score is better.
+        # For maximization, higher absolute score is better.
+        best_fn = np.argmin if score_type == "minimize" else np.argmax
+        valid_scores = [scores[i] for i in valid_indices]
+        local_best = best_fn(valid_scores)
+        return int(valid_indices[local_best])
+
     scores = [
         c.get("public", {}).get("overall_absolute_score", float("nan"))
         for c in candidate_results
     ]
     valid_scores = [s for s in scores if not np.isnan(s)]
     if not valid_scores:
-        return _select_best_candidate_index(candidate_results, "median_case_score")
+        return _select_best_candidate_index(
+            candidate_results, "median_case_score", score_type
+        )
 
     median_score = float(np.median(valid_scores))
     distances = [
@@ -145,9 +189,13 @@ def _run_private_eval_for_problem(
         result["error"] = "no candidates"
         return result
 
-    best_idx = _select_best_candidate_index(candidate_results, selection_method)
+    score_type = _get_problem_score_type(problem_id, lite_version)
+    best_idx = _select_best_candidate_index(
+        candidate_results, selection_method, score_type
+    )
     result["best_candidate_idx"] = best_idx
     result["selection_method"] = selection_method
+    result["score_type"] = score_type
     best_code = candidate_results[best_idx].get("code", "")
 
     logger.info(
@@ -468,9 +516,11 @@ def main(argv: list[str]) -> None:
         "--selection_method",
         "-s",
         default="median",
-        choices=["median", "median_case_score"],
+        choices=["median", "median_case_score", "best_public"],
         help="Candidate selection method. 'median' matches the official "
-        "ALE-Bench leaderboard protocol.",
+        "ALE-Bench leaderboard protocol. 'best_public' selects the candidate "
+        "with the best overall_absolute_score according to the problem's "
+        "score_type (minimize/maximize).",
     )
     parser.add_argument(
         "--ale_bench_num_workers",
@@ -518,7 +568,7 @@ def main(argv: list[str]) -> None:
             output_path = os.path.join(
                 args.output,
                 os.path.basename(input_path).replace(
-                    ".json", "_standalone_reprocessed.json"
+                    ".json", f"_standalone_reprocessed_{args.selection_method}.json"
                 ),
             )
         else:
