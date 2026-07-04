@@ -46,20 +46,45 @@ def _case_absolute_score(case) -> float:
     return 0.0
 
 
+def _get_problem_score_type(problem_id: str, lite_version: bool) -> str:
+    """Load ALE-Bench problem metadata and return its score type.
+
+    Returns ``"minimize"`` or ``"maximize"``. Falls back to ``"minimize"`` on
+    error.
+    """
+    try:
+        from ale_bench.data import load_problem
+
+        problem, *_ = load_problem(problem_id=problem_id, lite_version=lite_version)
+        return str(problem.metadata.score_type.value)
+    except Exception as e:
+        logger.warning(
+            f"[{problem_id}] Failed to load problem metadata: {e}. "
+            f"Falling back to minimize semantics."
+        )
+        return "minimize"
+
+
 def _select_best_candidate_index(
     candidate_results: list[dict[str, Any]],
     selection_method: str = "median",
+    score_type: str = "minimize",
 ) -> int:
-    """Select the best candidate index using the official ALE-Bench strategy.
+    """Select the best candidate index using the chosen strategy.
 
     Args:
         candidate_results: List of candidate result dicts. Each dict must contain
             a ``public`` entry with ``overall_absolute_score`` (official median)
             or ``median_case_score`` (legacy).
         selection_method: ``"median"`` for the official ALE-Bench leaderboard
-            protocol (closest to median of ``overall_absolute_score``), or
+            protocol (closest to median of ``overall_absolute_score``),
             ``"median_case_score"`` for the legacy highest per-candidate median
-            case score.
+            case score, or ``"best_public"`` for the candidate with the best
+            public ``overall_absolute_score`` according to the problem's score
+            type.
+        score_type: ``"minimize"`` or ``"maximize"``. Used by ``"best_public"``
+            and ``"median_case_score"`` to determine selection direction. Prefer
+            ACCEPTED candidates when ``judge_result`` is available.
 
     Returns:
         Index of the selected candidate in ``candidate_results``.
@@ -67,14 +92,58 @@ def _select_best_candidate_index(
     if not candidate_results:
         return 0
 
+    is_minimize = str(score_type).lower().strip() == "minimize"
+
+    def _ac_indices() -> list[int] | None:
+        ac = [
+            i
+            for i, c in enumerate(candidate_results)
+            if str(c.get("public", {}).get("judge_result", "")).upper() == "ACCEPTED"
+        ]
+        return ac if ac else None
+
     if selection_method == "median_case_score":
         medians = [
-            c.get("public", {}).get("median_case_score", float("-inf"))
+            c.get("public", {}).get("median_case_score", float("nan"))
             for c in candidate_results
         ]
-        return int(np.argmax(medians))
+        valid_indices = [i for i, s in enumerate(medians) if not np.isnan(s)]
+        if not valid_indices:
+            return 0
+        ac = _ac_indices()
+        if ac is not None:
+            valid_indices = [i for i in valid_indices if i in ac]
+            if not valid_indices:
+                return 0
+        best_fn = np.argmin if is_minimize else np.argmax
+        valid_medians = [medians[i] for i in valid_indices]
+        return int(valid_indices[int(best_fn(valid_medians))])
 
-    # Official ALE-Bench "median" selection: from the 15 repeated samples,
+    if selection_method == "best_public":
+        scores = [
+            c.get("public", {}).get("overall_absolute_score", float("nan"))
+            for c in candidate_results
+        ]
+        valid_indices = [i for i, s in enumerate(scores) if not np.isnan(s)]
+        if not valid_indices:
+            return _select_best_candidate_index(
+                candidate_results, "median_case_score", score_type
+            )
+        ac = _ac_indices()
+        if ac is not None:
+            valid_indices = [i for i in valid_indices if i in ac]
+            if not valid_indices:
+                return _select_best_candidate_index(
+                    candidate_results, "median_case_score", score_type
+                )
+        valid_scores = [scores[i] for i in valid_indices]
+        if is_minimize:
+            best_sub = int(np.argmin(valid_scores))
+        else:
+            best_sub = int(np.argmax(valid_scores))
+        return int(valid_indices[best_sub])
+
+    # Official ALE-Bench "median" selection: from the repeated samples,
     # pick the candidate whose overall_absolute_score is closest to the median
     # of all candidates' overall_absolute_scores.
     scores = [
@@ -85,7 +154,9 @@ def _select_best_candidate_index(
     if not valid_scores:
         # Fall back to legacy behavior if overall_absolute_score is missing.
         return _select_best_candidate_index(
-            candidate_results, selection_method="median_case_score"
+            candidate_results,
+            selection_method="median_case_score",
+            score_type=score_type,
         )
 
     median_score = float(np.median(valid_scores))
@@ -288,6 +359,7 @@ def _private_eval_one_problem(
     ale_bench_num_workers: int,
     session: Any | None = None,
     selection_method: str = "median",
+    score_type: str | None = None,
 ) -> dict[str, Any]:
     """Run only the private evaluation for the best candidate of a problem.
 
@@ -299,8 +371,11 @@ def _private_eval_one_problem(
         session: Optional pre-built ALE-Bench session to reuse. If provided,
             the caller retains ownership and this function will not close it.
         selection_method: ``"median"`` for official ALE-Bench median selection
-            (closest to median of ``overall_absolute_score``) or
-            ``"median_case_score"`` for legacy highest per-candidate median.
+            (closest to median of ``overall_absolute_score``),
+            ``"median_case_score"`` for legacy highest per-candidate median, or
+            ``"best_public"`` for the best public overall absolute score.
+        score_type: ``"minimize"`` or ``"maximize"``. If not provided, loaded
+            from the problem metadata.
     """
     from ale_bench.session import CodeLanguage
 
@@ -315,9 +390,15 @@ def _private_eval_one_problem(
         result["error"] = "no candidates"
         return result
 
-    best_idx = _select_best_candidate_index(candidate_results, selection_method)
+    if score_type is None:
+        score_type = _get_problem_score_type(problem_id, lite_version)
+
+    best_idx = _select_best_candidate_index(
+        candidate_results, selection_method, score_type
+    )
     result["best_candidate_idx"] = best_idx
     result["selection_method"] = selection_method
+    result["score_type"] = score_type
     best_code = candidate_results[best_idx].get("code", best_code)
 
     owns_session = session is None
@@ -662,6 +743,7 @@ def evaluate_problem_subset_with_public_scores(
     n_parallel_problems: int = 1,
     problem_sessions: dict[str, Any] | None = None,
     selection_method: str = "median",
+    problem_score_types: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Run only private evaluation after public scores are already known.
 
@@ -683,8 +765,13 @@ def evaluate_problem_subset_with_public_scores(
         problem_sessions: Optional mapping from problem_id to pre-built
             ALE-Bench session. If provided, sessions are reused instead of
             creating new ones inside each worker.
-        selection_method: ``"median"`` for official ALE-Bench median selection
-            or ``"median_case_score"`` for legacy highest per-candidate median.
+        selection_method: ``"median"`` for official ALE-Bench median selection,
+            ``"median_case_score"`` for legacy highest per-candidate median, or
+            ``"best_public"`` for the best public overall absolute score.
+        problem_score_types: Optional mapping from problem_id to ``"minimize"``
+            or ``"maximize"``. Used for ``"best_public"`` and
+            ``"median_case_score"`` selection. If a problem is missing, the
+            score type is loaded from problem metadata.
 
     Returns:
         List of per-problem result dictionaries in the same order as
@@ -697,6 +784,7 @@ def evaluate_problem_subset_with_public_scores(
     )
 
     problem_sessions = problem_sessions or {}
+    problem_score_types = problem_score_types or {}
 
     results_by_problem: dict[str, dict[str, Any]] = {}
     total = len(problem_ids)
@@ -714,6 +802,7 @@ def evaluate_problem_subset_with_public_scores(
                     ale_bench_num_workers,
                     problem_sessions.get(problem_id),
                     selection_method,
+                    problem_score_types.get(problem_id),
                 ): problem_id
                 for problem_id in problem_ids
             }
@@ -744,6 +833,7 @@ def evaluate_problem_subset_with_public_scores(
                 ale_bench_num_workers,
                 problem_sessions.get(problem_id),
                 selection_method,
+                problem_score_types.get(problem_id),
             )
             results_by_problem[problem_id] = result
             private = result.get("private", {})

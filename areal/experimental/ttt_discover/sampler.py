@@ -12,6 +12,7 @@ import random
 import threading
 import time
 from abc import ABC, abstractmethod
+from typing import Any
 
 import numpy as np
 
@@ -1735,6 +1736,153 @@ class PUCTSampler(StateSampler):
                 return []
             candidates.sort(key=lambda s: s.value, reverse=False)
             return self._diverse_top_k(candidates, k)
+
+    def extract_milestone_paths(
+        self,
+        n_paths: int = 10,
+        n_milestones: int = 4,
+        min_improvement: float = 0.001,
+        max_depth: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Extract milestone paths from the PUCT tree in memory.
+
+        This mirrors ``extract_milestone_hints.py`` but works directly on the
+        sampler's loaded state objects, so callers do not need a pre-extracted
+        JSON file.
+
+        Parameters
+        ----------
+        n_paths : int
+            Number of top root-to-leaf paths to return.
+        n_milestones : int
+            Number of milestone states to keep per path.
+        min_improvement : float
+            Minimum value improvement for a transition to be chosen as a milestone.
+        max_depth : int
+            Maximum path depth to avoid exponential blow-up on very deep trees.
+
+        Returns
+        -------
+        list[dict]
+            Each dict has ``"milestones"`` key mapping to a list of milestone dicts
+            with ``code``, ``value``, and ``raw_score``.
+        """
+        with self._lock:
+            id_to_state = {s.id: s for s in self._states if s.id}
+            children_map = self._build_children_map()
+
+            # Root states: no parents or explicitly marked as initial states.
+            initial_ids = {s.id for s in self._initial_states}
+            root_ids = [
+                s.id
+                for s in self._states
+                if s.id and (not s.parents or s.id in initial_ids)
+            ]
+
+        if not id_to_state or not root_ids:
+            return []
+
+        # Collect all root-to-leaf paths.
+        paths: list[list[str]] = []
+
+        def dfs(node_id: str, path: list[str]) -> None:
+            if len(path) > max_depth:
+                paths.append(path.copy())
+                return
+            children = children_map.get(node_id, [])
+            if not children:
+                paths.append(path.copy())
+                return
+            for child_id in children:
+                dfs(child_id, path + [child_id])
+
+        for rid in root_ids:
+            dfs(rid, [rid])
+
+        if not paths:
+            return []
+
+        # Sort paths by the value of the leaf state (higher is better in PUCT).
+        def _leaf_value(path: list[str]) -> float:
+            leaf = id_to_state.get(path[-1])
+            return (
+                leaf.value
+                if leaf is not None and leaf.value is not None
+                else float("-inf")
+            )
+
+        paths.sort(key=_leaf_value, reverse=True)
+        paths = paths[:n_paths]
+
+        # Helper to extract milestones from a sequence of states.
+        def _extract_milestones(states: list[State]) -> list[dict[str, Any]]:
+            if len(states) <= n_milestones:
+                selected = list(range(len(states)))
+            else:
+                improvements = []
+                for i in range(1, len(states)):
+                    prev_val = states[i - 1].value
+                    curr_val = states[i].value
+                    if prev_val is not None and curr_val is not None:
+                        improvements.append((i, curr_val - prev_val))
+                improvements.sort(key=lambda x: x[1], reverse=True)
+
+                selected = [0]
+                for idx, imp in improvements:
+                    if imp >= min_improvement and idx not in selected:
+                        selected.append(idx)
+                    if len(selected) >= n_milestones - 1:
+                        break
+
+                if len(selected) < n_milestones - 1:
+                    n_needed = n_milestones - 1 - len(selected)
+                    step = len(states) // (n_needed + 1)
+                    for i in range(1, n_needed + 1):
+                        idx = i * step
+                        if idx not in selected and idx < len(states) - 1:
+                            selected.append(idx)
+
+                if (len(states) - 1) not in selected:
+                    selected.append(len(states) - 1)
+                selected = sorted(set(selected))
+
+            milestones = []
+            for idx in selected:
+                s = states[idx]
+                raw = getattr(s, "raw_score", None)
+                if raw is None and s.value is not None:
+                    # AC1 convention: value = -raw_score
+                    raw = -s.value
+                milestones.append(
+                    {
+                        "code": s.code if s.code else "",
+                        "value": s.value,
+                        "raw_score": raw,
+                    }
+                )
+            return milestones
+
+        result = []
+        for rank, path_ids in enumerate(paths, start=1):
+            states = [id_to_state[sid] for sid in path_ids if sid in id_to_state]
+            if not states:
+                continue
+            result.append(
+                {
+                    "path_rank": rank,
+                    "milestones": _extract_milestones(states),
+                }
+            )
+
+        import logging
+
+        _logger = logging.getLogger("PUCTSampler")
+        _logger.info(
+            f"[MilestonePaths] Extracted {len(result)} milestone paths "
+            f"(n_paths={n_paths}, n_milestones={n_milestones}, "
+            f"min_improvement={min_improvement})"
+        )
+        return result
 
     def get_hint_states(
         self,

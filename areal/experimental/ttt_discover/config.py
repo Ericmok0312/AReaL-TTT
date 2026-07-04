@@ -487,6 +487,55 @@ class TTTDDistillConfig(TTTDPPOConfig):
             "'continuation' (directly use PUCT sampler's privileged state as prompt base)."
         },
     )
+    eval_hint_modes: list[str] = field(
+        default_factory=lambda: ["best_worst_combined", "best", "diverse_best", "none"],
+        metadata={
+            "help": "List of hint-sampling modes to ablate in eval_teacher_hint_ablation_ale_bench.py. "
+            "Options: 'none', 'best', 'worst_nonzero', 'breakthrough', 'best_worst_combined', "
+            "'diverse_best', 'diverse_worst_nonzero', 'diverse_best_worst'."
+        },
+    )
+    eval_hint_k: int = field(
+        default=1,
+        metadata={
+            "help": "Number of reference examples per category for combined/few-shot hint modes "
+            "in eval_teacher_hint_ablation_ale_bench.py."
+        },
+    )
+    eval_hint_min_improvement: float = field(
+        default=0.001,
+        metadata={
+            "help": "Minimum absolute value improvement for a breakthrough transition hint "
+            "in eval_teacher_hint_ablation_ale_bench.py."
+        },
+    )
+    eval_hint_deterministic: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, select breakthrough hints deterministically by improvement magnitude "
+            "in eval_teacher_hint_ablation_ale_bench.py."
+        },
+    )
+    eval_milestone_n_paths: int = field(
+        default=10,
+        metadata={
+            "help": "Number of root-to-leaf milestone paths to extract from the sampler "
+            "when no pre-extracted milestone_hints JSON is provided."
+        },
+    )
+    eval_milestone_n_milestones: int = field(
+        default=4,
+        metadata={
+            "help": "Number of milestones to keep per extracted path in eval_teacher_hint_ablation_ale_bench.py."
+        },
+    )
+    eval_milestone_min_improvement: float = field(
+        default=0.001,
+        metadata={
+            "help": "Minimum value improvement for a state to be selected as a milestone "
+            "when extracting milestone paths in eval_teacher_hint_ablation_ale_bench.py."
+        },
+    )
     test_construction_match: bool = field(
         default=False,
         metadata={
