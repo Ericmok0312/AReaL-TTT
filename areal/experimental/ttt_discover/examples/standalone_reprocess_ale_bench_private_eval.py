@@ -3,15 +3,14 @@
 
 """Standalone re-run of ALE-Bench private evaluation from saved public results.
 
-This script intentionally does **not** use the trainer's ``ale_bench_eval.py``
-helpers.  It loads a previously saved ``ale_bench_eval_results_*.json``,
-re-selects the best candidate per problem using the official ALE-Bench median
-selection, and runs private evaluation in parallel using a simple
-``ProcessPoolExecutor``.
+This script loads a previously saved ``ale_bench_eval_results_*.json``,
+re-selects the best candidate per problem, and runs private evaluation in
+parallel using a simple ``ProcessPoolExecutor``.
 
-Each worker builds its own ALE-Bench session, runs exactly one
-``private_eval`` (ALE-Bench limits a session to a single private evaluation),
-and immediately closes the session.
+Each worker builds **one** ALE-Bench session per problem and evaluates **all**
+candidates on that session by resetting the private-eval counter before each
+``private_eval``.  This avoids rebuilding the Rust tools for every candidate
+and matches the session-reuse logic used by the main evaluation pipeline.
 
 No LLM generation is performed.
 
@@ -36,6 +35,7 @@ from typing import Any
 
 import numpy as np
 
+from areal.experimental.ttt_discover.ale_bench_eval import _compute_private_stats
 from areal.utils import logging
 
 logger = logging.getLogger("standalone_reprocess_ale_bench_private_eval")
@@ -107,6 +107,26 @@ def _is_accepted(candidate: dict[str, Any]) -> bool:
         return judge_result == JudgeResult.ACCEPTED
     except Exception:
         return False
+
+
+def _reset_private_eval_counter(session: Any) -> None:
+    """Reset ALE-Bench's per-session private-eval counter.
+
+    ``ale_bench.start()`` hard-codes ``num_call_private_eval=1``.  Replacing the
+    resource usage object with an equivalent one whose private-eval count is
+    zero lets us run multiple ``private_eval`` calls on the same session without
+    rebuilding Rust tools.
+    """
+    from ale_bench.result import ResourceUsage
+
+    old = session._current_resource_usage
+    session._current_resource_usage = ResourceUsage(
+        num_case_gen=old.num_case_gen,
+        num_case_eval=old.num_case_eval,
+        num_call_public_eval=old.num_call_public_eval,
+        num_call_private_eval=0,
+        execution_time_case_eval=old.execution_time_case_eval,
+    )
 
 
 def _select_best_candidate_index(
@@ -241,40 +261,33 @@ def _build_session(
     return session
 
 
-def _run_private_eval_for_problem(
+def _run_all_candidates_private_for_problem(
     problem_id: str,
     candidate_results: list[dict[str, Any]],
-    selection_method: str,
     lite_version: bool,
     session_duration_hours: float,
     ale_bench_num_workers: int,
 ) -> dict[str, Any]:
-    """Run private evaluation for one problem (worker-friendly entry point)."""
+    """Run private evaluation for *all* candidates of one problem.
+
+    One ALE-Bench session is created per problem and reused for every candidate
+    by resetting ``num_call_private_eval`` before each ``private_eval``.  The
+    session is closed before the worker returns.
+    """
     from ale_bench.session import CodeLanguage
 
     result: dict[str, Any] = {
         "problem_id": problem_id,
         "candidates": candidate_results,
-        "best_candidate_idx": None,
+        "private_results": [],
+        "private_stats": {},
+        "score_type": _get_problem_score_type(problem_id, lite_version),
         "error": None,
     }
 
     if not candidate_results:
         result["error"] = "no candidates"
         return result
-
-    score_type = _get_problem_score_type(problem_id, lite_version)
-    best_idx = _select_best_candidate_index(
-        candidate_results, selection_method, score_type
-    )
-    result["best_candidate_idx"] = best_idx
-    result["selection_method"] = selection_method
-    result["score_type"] = score_type
-    best_code = candidate_results[best_idx].get("code", "")
-
-    logger.info(
-        f"[{problem_id}] Selected candidate {best_idx} (selection={selection_method})"
-    )
 
     session = None
     try:
@@ -284,33 +297,72 @@ def _run_private_eval_for_problem(
             session_duration_hours=session_duration_hours,
             ale_bench_num_workers=ale_bench_num_workers,
         )
-        private_start = time.time()
-        private_result, rank, performance = session.private_eval(
-            code=best_code,
-            code_language=CodeLanguage.CPP20,
+        private_results: list[dict[str, Any]] = []
+        n_total = len(candidate_results)
+        for i, cand in enumerate(candidate_results):
+            code = cand.get("code", "")
+            cand_idx = cand.get("idx", i)
+            progress = f"{i + 1}/{n_total}"
+            try:
+                logger.info(
+                    f"[{problem_id}] candidate {cand_idx} [{progress}] private_eval starting"
+                )
+                _reset_private_eval_counter(session)
+                private_result, rank, performance = session.private_eval(
+                    code=code,
+                    code_language=CodeLanguage.CPP20,
+                )
+                absolute_score = float(
+                    getattr(private_result, "overall_absolute_score", 0.0)
+                )
+                relative_score = float(
+                    getattr(private_result, "overall_relative_score", 0.0) or 0.0
+                )
+                judge_result = str(
+                    getattr(private_result, "overall_judge_result", "UNKNOWN")
+                )
+                private_results.append(
+                    {
+                        "idx": cand_idx,
+                        "absolute_score": absolute_score,
+                        "relative_score": relative_score,
+                        "judge_result": judge_result,
+                        "rank": int(rank),
+                        "performance": int(performance),
+                    }
+                )
+                logger.info(
+                    f"[{problem_id}] candidate {cand_idx} [{progress}] done: "
+                    f"abs={absolute_score:.2f} rank={rank} perf={performance} judge={judge_result}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[{problem_id}] candidate {cand_idx} [{progress}] failed: {e}"
+                )
+                private_results.append(
+                    {
+                        "idx": cand_idx,
+                        "error": f"{type(e).__name__}: {e}",
+                    }
+                )
+
+        _reset_private_eval_counter(session)
+        result["private_results"] = private_results
+        result["private_stats"] = _compute_private_stats(
+            private_results, result["score_type"]
         )
         logger.info(
-            f"[{problem_id}] private_eval done in {time.time() - private_start:.1f}s: "
-            f"abs={getattr(private_result, 'overall_absolute_score', 0.0):.2f} "
-            f"rank={rank} perf={performance}"
+            f"[{problem_id}] all-candidates private eval done: "
+            f"evaluated {len(private_results)} candidates, "
+            f"accepted={result['private_stats'].get('count_accepted', 0)}, "
+            f"mean_abs={result['private_stats'].get('absolute_score', {}).get('mean', 0.0):.2f}"
         )
-        result["private"] = {
-            "absolute_score": float(
-                getattr(private_result, "overall_absolute_score", 0.0)
-            ),
-            "relative_score": float(
-                getattr(private_result, "overall_relative_score", 0.0) or 0.0
-            ),
-            "judge_result": str(
-                getattr(private_result, "overall_judge_result", "UNKNOWN")
-            ),
-            "rank": int(rank),
-            "performance": int(performance),
-        }
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
         result["traceback"] = traceback.format_exc()
-        logger.error(f"[{problem_id}] private eval failed: {result['error']}")
+        logger.error(
+            f"[{problem_id}] failed to build session or run private evals: {result['error']}"
+        )
     finally:
         if session is not None:
             try:
@@ -320,6 +372,62 @@ def _run_private_eval_for_problem(
                 pass
 
     return result
+
+
+def _derive_selection_results(
+    all_results: list[dict[str, Any]],
+    selection_methods: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Derive per-problem results for each selection method from private results."""
+    outputs: dict[str, list[dict[str, Any]]] = {sel: [] for sel in selection_methods}
+    for result in all_results:
+        problem_id = result["problem_id"]
+        candidate_results = result.get("candidates", [])
+        private_results = result.get("private_results", [])
+        score_type = result.get("score_type", "minimize")
+        first_error = result.get("error")
+
+        for sel in selection_methods:
+            if first_error:
+                outputs[sel].append(
+                    {
+                        "problem_id": problem_id,
+                        "best_candidate_idx": None,
+                        "error": first_error,
+                    }
+                )
+                continue
+
+            best_idx = _select_best_candidate_index(candidate_results, sel, score_type)
+            private_result = next(
+                (r for r in private_results if r.get("idx") == best_idx), None
+            )
+            if private_result is None or "error" in private_result:
+                outputs[sel].append(
+                    {
+                        "problem_id": problem_id,
+                        "best_candidate_idx": best_idx,
+                        "error": "selected candidate private eval missing",
+                    }
+                )
+                continue
+
+            outputs[sel].append(
+                {
+                    "problem_id": problem_id,
+                    "best_candidate_idx": best_idx,
+                    "selection_method": sel,
+                    "candidates": candidate_results,
+                    "private": {
+                        "absolute_score": private_result["absolute_score"],
+                        "relative_score": private_result["relative_score"],
+                        "judge_result": private_result["judge_result"],
+                        "rank": private_result["rank"],
+                        "performance": private_result["performance"],
+                    },
+                }
+            )
+    return outputs
 
 
 def _average_private_scores(
@@ -390,13 +498,13 @@ def _combine_results(
 def reprocess_single_file(
     input_path: str,
     output_path: str | None,
-    selection_method: str,
+    selection_methods: list[str],
     ale_bench_num_workers: int,
     n_parallel_problems: int,
     session_duration_hours: float,
     per_problem_timeout: float,
 ) -> dict[str, Any]:
-    """Re-run private eval for one saved result file."""
+    """Re-run private eval for all candidates of one saved result file."""
     file_start = time.time()
     logger.info(f"Loading saved results from {input_path}")
     with open(input_path) as f:
@@ -423,12 +531,13 @@ def reprocess_single_file(
         f"Loaded {len(eval_problem_ids)} problems, {total_candidates} total candidates"
     )
     logger.info(
-        f"Re-running private eval: selection={selection_method}, "
+        f"Re-running all-candidates private eval: "
+        f"selection_methods={selection_methods}, "
         f"n_parallel={n_parallel_problems}, workers={ale_bench_num_workers}, "
         f"timeout={per_problem_timeout}s"
     )
 
-    local_results: list[dict[str, Any]] = []
+    all_results: list[dict[str, Any]] = []
     completed = 0
     failed = 0
 
@@ -439,23 +548,23 @@ def reprocess_single_file(
                 logger.warning("Shutdown requested, stopping sequential processing")
                 break
             logger.info(f"[{i}/{len(eval_problem_ids)}] Processing {problem_id}")
-            result = _run_private_eval_for_problem(
+            result = _run_all_candidates_private_for_problem(
                 problem_id=problem_id,
                 candidate_results=public_results_by_problem.get(problem_id, []),
-                selection_method=selection_method,
                 lite_version=lite_version,
                 session_duration_hours=session_duration_hours,
                 ale_bench_num_workers=ale_bench_num_workers,
             )
-            local_results.append(result)
+            all_results.append(result)
             if result.get("error"):
                 failed += 1
             else:
                 completed += 1
     else:
-        # Parallel mode: each worker builds its own session, runs private eval,
-        # and closes the session.  We use as_completed so one hung problem does
-        # not block the rest from being logged/saved.
+        # Parallel mode: each worker builds one session per problem, evaluates
+        # all candidates by resetting the private-eval counter, and closes the
+        # session.  We use as_completed so one hung problem does not block the
+        # rest from being logged/saved.
         logger.info(
             f"Submitting {len(eval_problem_ids)} problems to {n_parallel_problems} workers"
         )
@@ -464,10 +573,9 @@ def reprocess_single_file(
             _current_executor = executor
             futures = {
                 executor.submit(
-                    _run_private_eval_for_problem,
+                    _run_all_candidates_private_for_problem,
                     problem_id,
                     public_results_by_problem.get(problem_id, []),
-                    selection_method,
                     lite_version,
                     session_duration_hours,
                     ale_bench_num_workers,
@@ -482,7 +590,8 @@ def reprocess_single_file(
                     result = {
                         "problem_id": problem_id,
                         "candidates": public_results_by_problem.get(problem_id, []),
-                        "best_candidate_idx": None,
+                        "private_results": [],
+                        "private_stats": {},
                         "error": f"timeout after {per_problem_timeout}s",
                     }
                     logger.error(
@@ -492,22 +601,23 @@ def reprocess_single_file(
                     result = {
                         "problem_id": problem_id,
                         "candidates": public_results_by_problem.get(problem_id, []),
-                        "best_candidate_idx": None,
+                        "private_results": [],
+                        "private_stats": {},
                         "error": f"{type(e).__name__}: {e}",
                     }
                     logger.error(f"[{problem_id}] Worker failed: {e}")
 
-                local_results.append(result)
+                all_results.append(result)
                 if result.get("error"):
                     failed += 1
                 else:
                     completed += 1
 
-                private = result.get("private", {})
+                stats = result.get("private_stats", {})
                 logger.info(
                     f"[{completed + failed}/{len(eval_problem_ids)}] {problem_id} done: "
-                    f"abs={private.get('absolute_score', 0.0):.2f} "
-                    f"rank={private.get('rank', -1)} perf={private.get('performance', -1)} "
+                    f"accepted={stats.get('count_accepted', 0)}/{stats.get('count', 0)} "
+                    f"mean_abs={stats.get('absolute_score', {}).get('mean', 0.0):.2f} "
                     f"(completed={completed}, failed={failed})"
                 )
 
@@ -520,40 +630,70 @@ def reprocess_single_file(
         f"completed={completed}, failed={failed}"
     )
 
-    output = _combine_results(local_results, eval_problem_ids, training_problem_ids)
-    output.update(
-        {
-            "model": saved.get("model", "unknown"),
-            "lora_path": saved.get("lora_path", ""),
-            "n_candidates": saved.get("n_candidates", 0),
-            "lite_version": lite_version,
-            "session_duration_hours": session_duration_hours,
-            "ale_bench_num_workers": ale_bench_num_workers,
-            "n_parallel_problems": n_parallel_problems,
-            "selection_method": selection_method,
-            "reprocessed_from": os.path.abspath(input_path),
-        }
-    )
+    selection_results = _derive_selection_results(all_results, selection_methods)
 
+    outputs: dict[str, Any] = {}
+    for sel in selection_methods:
+        output = _combine_results(
+            selection_results[sel], eval_problem_ids, training_problem_ids
+        )
+        output.update(
+            {
+                "model": saved.get("model", "unknown"),
+                "lora_path": saved.get("lora_path", ""),
+                "n_candidates": saved.get("n_candidates", 0),
+                "lite_version": lite_version,
+                "session_duration_hours": session_duration_hours,
+                "ale_bench_num_workers": ale_bench_num_workers,
+                "n_parallel_problems": n_parallel_problems,
+                "selection_method": sel,
+                "reprocessed_from": os.path.abspath(input_path),
+            }
+        )
+        outputs[sel] = output
+
+        avg_all = output.get("average_all", {})
+        avg_oot = output.get("average_out_of_training", {})
+        logger.info(
+            f"Selection={sel}: "
+            f"all_abs={avg_all.get('absolute_score', 0.0):.2f} "
+            f"all_perf={avg_all.get('performance', 0.0):.2f} "
+            f"oot_abs={avg_oot.get('absolute_score', 0.0):.2f} "
+            f"oot_perf={avg_oot.get('performance', 0.0):.2f} "
+            f"success={avg_all.get('count', 0)}/{len(eval_problem_ids)}"
+        )
+
+    if len(selection_methods) == 1:
+        output = outputs[selection_methods[0]]
+        if output_path is None:
+            base, ext = os.path.splitext(input_path)
+            output_path = f"{base}_standalone_reprocessed{ext}"
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        with open(output_path, "w") as f:
+            json.dump(output, f, indent=2)
+        logger.info(f"Saved reprocessed results to {output_path}")
+        return output
+
+    # Multiple selection methods: write each selection to its own file.
     if output_path is None:
         base, ext = os.path.splitext(input_path)
-        output_path = f"{base}_standalone_reprocessed{ext}"
+        output_dir = f"{base}_standalone_reprocessed"
+    else:
+        output_dir = output_path
+    os.makedirs(output_dir, exist_ok=True)
 
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    with open(output_path, "w") as f:
-        json.dump(output, f, indent=2)
+    for sel, output in outputs.items():
+        sel_path = os.path.join(
+            output_dir,
+            os.path.basename(input_path).replace(
+                ".json", f"_standalone_reprocessed_{sel}.json"
+            ),
+        )
+        with open(sel_path, "w") as f:
+            json.dump(output, f, indent=2)
+        logger.info(f"Saved reprocessed results for {sel} to {sel_path}")
 
-    avg_all = output.get("average_all", {})
-    avg_oot = output.get("average_out_of_training", {})
-    logger.info(f"Saved reprocessed results to {output_path}")
-    logger.info(
-        f"all_abs={avg_all.get('absolute_score', 0.0):.2f} "
-        f"all_perf={avg_all.get('performance', 0.0):.2f} "
-        f"oot_abs={avg_oot.get('absolute_score', 0.0):.2f} "
-        f"oot_perf={avg_oot.get('performance', 0.0):.2f} "
-        f"success={avg_all.get('count', 0)}/{len(eval_problem_ids)}"
-    )
-    return output
+    return outputs
 
 
 def _find_result_files(path: str) -> list[str]:
@@ -597,11 +737,12 @@ def main(argv: list[str]) -> None:
         "--selection_method",
         "-s",
         default="median",
-        choices=["median", "median_case_score", "best_public"],
+        choices=["median", "median_case_score", "best_public", "all"],
         help="Candidate selection method. 'median' matches the official "
         "ALE-Bench leaderboard protocol. 'best_public' selects the candidate "
         "with the best overall_absolute_score according to the problem's "
-        "score_type (minimize/maximize).",
+        "score_type (minimize/maximize). 'all' writes both 'median' and "
+        "'best_public' result files.",
     )
     parser.add_argument(
         "--ale_bench_num_workers",
@@ -646,6 +787,11 @@ def main(argv: list[str]) -> None:
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
+    if args.selection_method == "all":
+        selection_methods = ["median", "best_public"]
+    else:
+        selection_methods = [args.selection_method]
+
     for i, input_path in enumerate(input_paths, start=1):
         if _shutdown_requested:
             logger.warning("Shutdown requested, stopping file processing")
@@ -655,7 +801,8 @@ def main(argv: list[str]) -> None:
             output_path = os.path.join(
                 args.output,
                 os.path.basename(input_path).replace(
-                    ".json", f"_standalone_reprocessed_{args.selection_method}.json"
+                    ".json",
+                    f"_standalone_reprocessed_{args.selection_method}.json",
                 ),
             )
         else:
@@ -664,7 +811,7 @@ def main(argv: list[str]) -> None:
         reprocess_single_file(
             input_path=input_path,
             output_path=output_path,
-            selection_method=args.selection_method,
+            selection_methods=selection_methods,
             ale_bench_num_workers=args.ale_bench_num_workers,
             n_parallel_problems=args.n_parallel_problems,
             session_duration_hours=args.session_duration_hours,
