@@ -23,6 +23,7 @@ Usage:
 import functools
 import json
 import os
+import signal
 import sys
 from typing import Any
 
@@ -37,6 +38,7 @@ from areal.api.io_struct import FinetuneSpec
 from areal.experimental.ttt_discover.actor import TTTDActor
 from areal.experimental.ttt_discover.ale_bench_eval import (
     ale_bench_public_reward_fn,
+    close_all_cached_ale_bench_sessions,
     combine_ale_bench_results,
     evaluate_problem_subset_with_public_scores,
     list_ale_bench_problem_ids,
@@ -46,6 +48,7 @@ from areal.experimental.ttt_discover.config import (
     create_env_from_config,
 )
 from areal.experimental.ttt_discover.envs.ale_bench import (
+    close_all_ale_bench_sessions,
     create_initial_state_ale_bench,
 )
 from areal.experimental.ttt_discover.sampler import create_sampler
@@ -70,6 +73,7 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
 
     def __init__(self, config: TTTDDistillConfig):
         self.config = config
+        self._closed = False
         rank = int(os.getenv("RANK", "0"))
         if is_single_controller():
             logging.setup_file_logging(StatsLogger.get_log_path(config.stats_logger))
@@ -667,13 +671,9 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             f"[AleBenchEval-{label}] Running private eval for {len(eval_problem_ids)} problems"
         )
 
-        # Reuse the env sessions created in _setup_ale_bench_eval so private
-        # eval does not rebuild Rust tools in each worker.
-        problem_sessions = {
-            problem_id: env.session
-            for problem_id, env in self._ale_bench_eval_envs.items()
-            if hasattr(env, "session") and env.session is not None
-        }
+        # ALE-Bench sessions can only perform one private_eval each.  Let each
+        # worker create its own fresh session for the single selected candidate
+        # instead of reusing the env sessions that are shared with public eval.
         selection_method = getattr(config, "ale_bench_eval_selection_method", "median")
         local_results = evaluate_problem_subset_with_public_scores(
             eval_problem_ids,
@@ -682,7 +682,7 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             session_duration_hours=4.0,
             ale_bench_num_workers=config.ale_bench_eval_num_workers,
             n_parallel_problems=config.ale_bench_eval_n_parallel_problems,
-            problem_sessions=problem_sessions,
+            problem_sessions=None,
             selection_method=selection_method,
         )
         logger.info(
@@ -800,7 +800,13 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             dist.barrier()
 
     def close(self):
-        """Cleanup resources."""
+        """Cleanup resources.
+
+        Safe to call multiple times.
+        """
+        if self._closed:
+            return
+        self._closed = True
         # Close ALE-Bench env sessions first to release Docker containers/tools
         # even when the process is terminated by the launcher.
         if hasattr(self, "_ale_bench_eval_envs"):
@@ -854,8 +860,36 @@ def main(args):
     if not getattr(config, "ale_bench_eval_selection_method", ""):
         config.ale_bench_eval_selection_method = "median"
 
-    with TTTDAleBenchMultiEvalTrainer(config) as trainer:
+    trainer = TTTDAleBenchMultiEvalTrainer(config)
+
+    def _signal_handler(signum, frame):
+        sig_name = signal.Signals(signum).name
+        logger.warning(
+            f"[Main] Received {sig_name} (signal {signum}), "
+            "closing ALE-Bench sessions and exiting."
+        )
+        try:
+            close_all_ale_bench_sessions()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[Main] Failed to close env sessions: {e}")
+        try:
+            close_all_cached_ale_bench_sessions()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[Main] Failed to close eval sessions: {e}")
+        try:
+            trainer.close()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[Main] trainer.close() failed: {e}")
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    try:
         trainer.run_eval()
+    finally:
+        trainer.close()
 
 
 if __name__ == "__main__":

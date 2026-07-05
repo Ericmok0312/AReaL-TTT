@@ -9,9 +9,9 @@ re-selects the best candidate per problem using the official ALE-Bench median
 selection, and runs private evaluation in parallel using a simple
 ``ProcessPoolExecutor``.
 
-Sessions are pre-built in the main process (so compilation progress is visible)
-and then passed to workers.  Workers only run ``private_eval`` and immediately
-close their session.
+Each worker builds its own ALE-Bench session, runs exactly one
+``private_eval`` (ALE-Bench limits a session to a single private evaluation),
+and immediately closes the session.
 
 No LLM generation is performed.
 
@@ -26,6 +26,7 @@ Usage:
 import argparse
 import json
 import os
+import signal
 import sys
 import time
 import traceback
@@ -38,6 +39,26 @@ import numpy as np
 from areal.utils import logging
 
 logger = logging.getLogger("standalone_reprocess_ale_bench_private_eval")
+
+# Global state used by the SIGINT/SIGTERM handler to cancel pending work.
+_shutdown_requested = False
+_current_executor: ProcessPoolExecutor | None = None
+
+
+def _signal_handler(signum, frame) -> None:
+    """Cancel pending futures and exit on Ctrl+C or pkill."""
+    global _shutdown_requested
+    _shutdown_requested = True
+    sig_name = signal.Signals(signum).name
+    logger.warning(
+        f"[Main] Received {sig_name} (signal {signum}), shutting down pending private evals."
+    )
+    if _current_executor is not None:
+        try:
+            _current_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[Main] Failed to shutdown executor: {e}")
+    sys.exit(1)
 
 
 def _get_problem_score_type(problem_id: str, lite_version: bool) -> str:
@@ -399,6 +420,9 @@ def reprocess_single_file(
     if n_parallel_problems <= 1:
         # Sequential mode (useful for debugging).
         for i, problem_id in enumerate(eval_problem_ids, start=1):
+            if _shutdown_requested:
+                logger.warning("Shutdown requested, stopping sequential processing")
+                break
             logger.info(f"[{i}/{len(eval_problem_ids)}] Processing {problem_id}")
             result = _run_private_eval_for_problem(
                 problem_id=problem_id,
@@ -420,7 +444,9 @@ def reprocess_single_file(
         logger.info(
             f"Submitting {len(eval_problem_ids)} problems to {n_parallel_problems} workers"
         )
+        global _current_executor
         with ProcessPoolExecutor(max_workers=n_parallel_problems) as executor:
+            _current_executor = executor
             futures = {
                 executor.submit(
                     _run_private_eval_for_problem,
@@ -469,6 +495,8 @@ def reprocess_single_file(
                     f"rank={private.get('rank', -1)} perf={private.get('performance', -1)} "
                     f"(completed={completed}, failed={failed})"
                 )
+
+        _current_executor = None
 
     private_elapsed = time.time() - file_start
     logger.info(
@@ -600,7 +628,13 @@ def main(argv: list[str]) -> None:
         os.makedirs(args.output, exist_ok=True)
         output_is_dir = True
 
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
     for i, input_path in enumerate(input_paths, start=1):
+        if _shutdown_requested:
+            logger.warning("Shutdown requested, stopping file processing")
+            break
         logger.info(f"[{i}/{len(input_paths)}] Reprocessing {input_path}")
         if output_is_dir:
             output_path = os.path.join(
