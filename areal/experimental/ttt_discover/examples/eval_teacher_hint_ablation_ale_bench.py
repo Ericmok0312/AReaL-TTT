@@ -1524,6 +1524,11 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
                 if dist.is_initialized():
                     dist.barrier()
 
+            # Keep one env object per problem across framings so we do not
+            # recreate ALE-Bench env wrappers and so all sessions can be closed.
+            if not hasattr(self, "_teacher_envs"):
+                self._teacher_envs: dict[str, Any] = {}
+
             for spec in self._eval_teacher_specs:
                 teacher_label = spec["label"]
                 self._current_teacher_spec = spec
@@ -1535,18 +1540,24 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
                 # closed together in ``close()``.
                 problem_id = spec["problem_id"]
                 if self.actor.rank == 0:
-                    # Reuse the env created during baseline eval when possible;
-                    # baseline already covers the union of all teacher problems.
-                    if (
+                    # Prefer a previously created teacher env, then a baseline env.
+                    if problem_id in self._teacher_envs:
+                        self.env = self._teacher_envs[problem_id]
+                        logger.info(
+                            f"[Eval] Reusing cached teacher env for problem {problem_id}"
+                        )
+                    elif (
                         hasattr(self, "_baseline_envs")
                         and problem_id in self._baseline_envs
                     ):
                         self.env = self._baseline_envs[problem_id]
+                        self._teacher_envs[problem_id] = self.env
                         logger.info(
                             f"[Eval] Reusing baseline env for problem {problem_id}"
                         )
                     else:
                         self.env = self._create_env_for_problem(problem_id)
+                        self._teacher_envs[problem_id] = self.env
                     self._score_type = self._get_score_type(self.env)
                     logger.info("=" * 60)
                     logger.info(f"[Eval] Evaluating teacher: {teacher_label}")
@@ -1759,6 +1770,8 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
         env = getattr(self, "env", None)
         if env is not None:
             all_envs.append(env)
+        if hasattr(self, "_teacher_envs"):
+            all_envs.extend(self._teacher_envs.values())
         if hasattr(self, "_baseline_envs"):
             all_envs.extend(self._baseline_envs.values())
 
