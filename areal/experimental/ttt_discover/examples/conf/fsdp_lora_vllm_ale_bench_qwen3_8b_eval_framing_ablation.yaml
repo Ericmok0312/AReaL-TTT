@@ -8,7 +8,7 @@ is_tttd_config: true
 seed: 1
 enable_offload: false
 max_steps: 0
-total_train_epochs: 0
+total_train_epochs: 1
 enable_thinking: true
 reset_puct_stats_on_resume: false
 student_sampler_inherit_teacher_pool: false
