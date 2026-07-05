@@ -671,9 +671,14 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             f"[AleBenchEval-{label}] Running private eval for {len(eval_problem_ids)} problems"
         )
 
-        # ALE-Bench sessions can only perform one private_eval each.  Let each
-        # worker create its own fresh session for the single selected candidate
-        # instead of reusing the env sessions that are shared with public eval.
+        # Reuse the env sessions created in _setup_ale_bench_eval.  Each worker
+        # gets a forked copy of the session, runs exactly one private_eval, and
+        # returns; the parent session is protected from child-process cleanup.
+        problem_sessions = {
+            problem_id: env.session
+            for problem_id, env in self._ale_bench_eval_envs.items()
+            if hasattr(env, "session") and env.session is not None
+        }
         selection_method = getattr(config, "ale_bench_eval_selection_method", "median")
         local_results = evaluate_problem_subset_with_public_scores(
             eval_problem_ids,
@@ -682,7 +687,7 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             session_duration_hours=4.0,
             ale_bench_num_workers=config.ale_bench_eval_num_workers,
             n_parallel_problems=config.ale_bench_eval_n_parallel_problems,
-            problem_sessions=None,
+            problem_sessions=problem_sessions,
             selection_method=selection_method,
         )
         logger.info(
