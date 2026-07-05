@@ -27,6 +27,7 @@ values are only used as a normalization reference.
 
 from __future__ import annotations
 
+import atexit
 import datetime as dt
 import threading
 from typing import Any
@@ -51,6 +52,30 @@ _ALE_SESSIONS: dict[tuple[str, bool, str, int, float], Any] = {}
 # executors (e.g. AsyncRewardWrapper's ProcessPoolExecutor) each have their own
 # module state, so this lock coordinates threads within one process.
 _ALE_SESSIONS_LOCK = threading.Lock()
+
+
+def close_all_ale_bench_sessions() -> None:
+    """Close all cached ALE-Bench sessions in this process.
+
+    This is registered with :mod:`atexit` so that sessions are cleaned up on
+    normal interpreter shutdown.  Callers that need cleanup on ``SIGINT`` or
+    ``SIGTERM`` (e.g. ``pkill`` / Ctrl-C) should install a signal handler that
+    invokes this function.
+    """
+    sessions: list[Any] = []
+    with _ALE_SESSIONS_LOCK:
+        sessions.extend(_ALE_SESSIONS.values())
+        _ALE_SESSIONS.clear()
+
+    for session in sessions:
+        try:
+            if session is not None and not getattr(session, "_closed", False):
+                session.close()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[AleBenchEnv] Failed to close cached session: {e}")
+
+
+atexit.register(close_all_ale_bench_sessions)
 
 # Very long session duration (100 years in seconds) to avoid ALE-Bench's default
 # problem-defined session time limit during long-running RL training.
@@ -320,7 +345,7 @@ Execution time limit: {time_limit} sec / Memory limit: {memory_limit} MiB
             self.session_duration_seconds,
         )
         with _ALE_SESSIONS_LOCK:
-            _ALE_SESSIONS.pop(key, None)
+            old_session = _ALE_SESSIONS.pop(key, None)
             # Build the new session while holding the lock so concurrent
             # recreations of the same key do not waste work.
             session = start(
@@ -332,6 +357,17 @@ Execution time limit: {time_limit} sec / Memory limit: {memory_limit} MiB
                 run_visualization_server=False,
             )
             _ALE_SESSIONS[key] = session
+
+        if old_session is not None and not getattr(old_session, "_closed", False):
+            try:
+                old_session.close()
+                logger.info(
+                    f"[AleBenchEnv] closed old session for {self.problem_id} during recreate"
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"[AleBenchEnv] failed to close old session for {self.problem_id}: {e}"
+                )
         self.session = session
         self.problem = self.session.problem
         self.standings = self.session._standings
@@ -403,6 +439,15 @@ Execution time limit: {time_limit} sec / Memory limit: {memory_limit} MiB
         # ALE-Bench's official aggregate score is the sum over all public cases.
         # We expose the per-case average as both ``raw_score`` and the reward
         # basis, matching the original TTT-Discover AHC implementation.
+        #
+        # NOTE: ``raw_score`` lives in the problem's native metric domain, so its
+        # direction depends on ``self.maximize``:
+        #   - maximize problems: higher raw_score is better.
+        #   - minimize problems: lower raw_score is better.
+        # The PUCT sampler expects ``value``/``reward`` to always be
+        # higher-is-better. Therefore downstream code that selects states by
+        # quality (e.g. warm-start hints) should sort by ``state.value``, not by
+        # ``raw_score``, to obtain a consistent ordering across problems.
         total_raw_score = float(getattr(result, "overall_absolute_score", 0.0))
         avg_raw_score = total_raw_score / num_cases if num_cases > 0 else 0.0
         normalized_avg_raw_score = avg_raw_score / self.reward_scale

@@ -14,6 +14,7 @@ paper:
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import traceback
@@ -171,6 +172,26 @@ def _select_best_candidate_index(
 # the full evaluation configuration so that sessions are reused across candidates
 # of the same problem.
 _ale_bench_sessions: dict[tuple[str, bool, float, int], Any] = {}
+
+
+def close_all_cached_ale_bench_sessions() -> None:
+    """Close all ALE-Bench sessions cached by this module in this process.
+
+    Registered with :mod:`atexit` for normal interpreter shutdown.  Callers that
+    need cleanup on ``SIGINT`` / ``SIGTERM`` should install a signal handler that
+    invokes this function.
+    """
+    sessions = list(_ale_bench_sessions.values())
+    _ale_bench_sessions.clear()
+    for session in sessions:
+        try:
+            if session is not None and not getattr(session, "_closed", False):
+                session.close()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[AleBenchEval] Failed to close cached session: {e}")
+
+
+atexit.register(close_all_cached_ale_bench_sessions)
 
 
 def _get_ale_bench_session(
@@ -762,9 +783,9 @@ def evaluate_problem_subset_with_public_scores(
         ale_bench_num_workers: ``num_workers`` passed to ``ale_bench.start``.
         n_parallel_problems: Number of problems to evaluate concurrently in a
             local process pool.
-        problem_sessions: Optional mapping from problem_id to pre-built
-            ALE-Bench session. If provided, sessions are reused instead of
-            creating new ones inside each worker.
+        problem_sessions: Deprecated. ALE-Bench sessions can only perform one
+            ``private_eval`` each, so this mapping is no longer used.  A fresh
+            session is created for every candidate.
         selection_method: ``"median"`` for official ALE-Bench median selection,
             ``"median_case_score"`` for legacy highest per-candidate median, or
             ``"best_public"`` for the best public overall absolute score.
@@ -855,9 +876,7 @@ def _compute_private_stats(
     successful = [r for r in private_results if "error" not in r]
     count = len(private_results)
     count_accepted = sum(
-        1
-        for r in successful
-        if str(r.get("judge_result", "")).upper() == "ACCEPTED"
+        1 for r in successful if str(r.get("judge_result", "")).upper() == "ACCEPTED"
     )
     stats: dict[str, Any] = {
         "count": count,
@@ -893,14 +912,14 @@ def _compute_private_stats(
         bc = 0.0
         if std > 1e-9:
             z = (arr - mean) / std
-            skew = float(np.mean(z ** 3))
+            skew = float(np.mean(z**3))
             # Excess kurtosis (Fisher), 0 for normal.
-            kurt = float(np.mean(z ** 4) - 3.0)
+            kurt = float(np.mean(z**4) - 3.0)
             # Sarle's bimodality coefficient. BC > 0.55 suggests bimodality.
             denom_term = 3.0 * (n - 1) ** 2 / ((n - 2) * (n - 3))
             denom = kurt + denom_term
             if abs(denom) > 1e-9:
-                bc = (skew ** 2 + 1.0) / denom
+                bc = (skew**2 + 1.0) / denom
         stats[metric] = {
             "mean": mean,
             "median": float(np.median(arr)),
@@ -1037,9 +1056,23 @@ def _private_eval_all_candidates_one_problem(
 ) -> dict[str, Any]:
     """Run private evaluation on *every* candidate for one problem.
 
+    .. important::
+        ALE-Bench hard-codes ``maximum_resource_usage.num_call_private_eval=1``,
+        so each session can only perform a single ``private_eval``.  Therefore
+        this function creates a fresh session for every candidate instead of
+        reusing the optional ``session`` argument.
+
     Returns a dict with per-candidate private results and aggregated statistics.
     """
+    from datetime import timedelta
+
+    from ale_bench import start
     from ale_bench.session import CodeLanguage
+
+    # ``session`` is kept in the signature for backward compatibility but is
+    # intentionally not used, because one session cannot private-eval more than
+    # one candidate.
+    del session
 
     result: dict[str, Any] = {
         "problem_id": problem_id,
@@ -1057,32 +1090,28 @@ def _private_eval_all_candidates_one_problem(
         score_type = _get_problem_score_type(problem_id, lite_version)
     result["score_type"] = score_type
 
-    owns_session = session is None
     try:
-        if session is None:
-            session = _get_ale_bench_session(
-                problem_id=problem_id,
-                lite_version=lite_version,
-                session_duration_hours=session_duration_hours,
-                ale_bench_num_workers=ale_bench_num_workers,
-            )
-        else:
-            logger.info(
-                f"[_private_eval_all_candidates_one_problem][{problem_id}] "
-                f"Reusing provided session"
-            )
-
         private_results: list[dict[str, Any]] = []
         for cand in candidate_results:
             code = cand.get("code", "")
+            cand_idx = cand.get("idx", len(private_results))
+            cand_session: Any | None = None
             try:
-                private_result, rank, performance = session.private_eval(
+                cand_session = start(
+                    problem_id=problem_id,
+                    lite_version=lite_version,
+                    use_same_time_scale=False,
+                    session_duration=timedelta(hours=session_duration_hours),
+                    num_workers=ale_bench_num_workers,
+                    run_visualization_server=False,
+                )
+                private_result, rank, performance = cand_session.private_eval(
                     code=code,
                     code_language=CodeLanguage.CPP20,
                 )
                 private_results.append(
                     {
-                        "idx": cand.get("idx", len(private_results)),
+                        "idx": cand_idx,
                         "absolute_score": float(
                             getattr(private_result, "overall_absolute_score", 0.0)
                         ),
@@ -1100,14 +1129,20 @@ def _private_eval_all_candidates_one_problem(
             except Exception as e:
                 logger.warning(
                     f"[_private_eval_all_candidates_one_problem][{problem_id}] "
-                    f"candidate {cand.get('idx', len(private_results))} failed: {e}"
+                    f"candidate {cand_idx} failed: {e}"
                 )
                 private_results.append(
                     {
-                        "idx": cand.get("idx", len(private_results)),
+                        "idx": cand_idx,
                         "error": f"{type(e).__name__}: {e}",
                     }
                 )
+            finally:
+                if cand_session is not None:
+                    try:
+                        cand_session.close()
+                    except Exception:
+                        pass
 
         result["private_results"] = private_results
         result["private_stats"] = _compute_private_stats(private_results, score_type)
@@ -1123,12 +1158,6 @@ def _private_eval_all_candidates_one_problem(
         logger.error(
             f"[_private_eval_all_candidates_one_problem][{problem_id}] failed: {result['error']}"
         )
-    finally:
-        if owns_session and session is not None:
-            try:
-                session.close()
-            except Exception:
-                pass
 
     return result
 
@@ -1168,7 +1197,7 @@ def evaluate_all_candidates_private(
                     lite_version,
                     session_duration_hours,
                     ale_bench_num_workers,
-                    problem_sessions.get(problem_id),
+                    None,
                     problem_score_types.get(problem_id),
                 ): problem_id
                 for problem_id in problem_ids
@@ -1198,7 +1227,7 @@ def evaluate_all_candidates_private(
                 lite_version,
                 session_duration_hours,
                 ale_bench_num_workers,
-                problem_sessions.get(problem_id),
+                None,
                 problem_score_types.get(problem_id),
             )
             results_by_problem[problem_id] = result

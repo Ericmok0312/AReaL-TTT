@@ -56,6 +56,7 @@ import copy
 import functools
 import json
 import os
+import signal
 import sys
 from collections.abc import Callable
 from typing import Any
@@ -72,6 +73,7 @@ from areal.experimental.ttt_discover.actor import TTTDActor
 from areal.experimental.ttt_discover.ale_bench_eval import (
     ale_bench_public_reward_fn,
     average_all_candidates_stats,
+    close_all_cached_ale_bench_sessions,
     combine_ale_bench_results,
     derive_selection_outputs_from_all_candidates,
     evaluate_all_candidates_private,
@@ -79,6 +81,8 @@ from areal.experimental.ttt_discover.ale_bench_eval import (
 )
 from areal.experimental.ttt_discover.config import TTTDDistillConfig
 from areal.experimental.ttt_discover.envs.ale_bench import (
+    AleBenchEnv,
+    close_all_ale_bench_sessions,
     create_initial_state_ale_bench,
 )
 from areal.experimental.ttt_discover.sampler import (
@@ -178,6 +182,7 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
 
     def __init__(self, config: TTTDDistillConfig):
         self.config = config
+        self._closed = False
         rank = int(os.getenv("RANK", "0"))
         if is_single_controller():
             logging.setup_file_logging(StatsLogger.get_log_path(config.stats_logger))
@@ -342,8 +347,6 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
             reward_scale=getattr(config.sampler, "reward_scale", None),
             session_duration_seconds=int(_EVAL_SESSION_DURATION_HOURS * 3600),
         )
-        from areal.experimental.ttt_discover.envs.ale_bench import AleBenchEnv
-
         return AleBenchEnv(**env_kwargs)
 
     def _load_milestone_hints(
@@ -496,18 +499,14 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
         if not candidates:
             # Last resort: any state that has code.
             candidates = [
-                s
-                for s in states
-                if getattr(s, "code", None) and s.code.strip()
+                s for s in states if getattr(s, "code", None) and s.code.strip()
             ]
         if not candidates:
             logger.warning("[WarmStart] No eligible warm-start state found")
             return None
 
         candidates.sort(key=lambda s: float(s.value))
-        percentile = float(
-            getattr(self.config, "eval_warm_start_percentile", 0.25)
-        )
+        percentile = float(getattr(self.config, "eval_warm_start_percentile", 0.25))
         idx = min(int(len(candidates) * percentile), len(candidates) - 1)
         selected = candidates[idx]
         logger.info(
@@ -529,9 +528,7 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
             f"```{fence}\n{code}\n```",
         ]
         if score is not None:
-            lines.append(
-                f"This solution achieves a {score_label} of {score:.6f}."
-            )
+            lines.append(f"This solution achieves a {score_label} of {score:.6f}.")
         lines.append("Improve it to achieve a better score.\n")
         return "\n\n".join([""] + lines)
 
@@ -787,9 +784,7 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
                 # solution for each problem.
                 warm_state = spec.get("_warm_start_state")
                 if warm_state is None:
-                    warm_state = self._select_warm_start_state(
-                        spec["hint_sampler"]
-                    )
+                    warm_state = self._select_warm_start_state(spec["hint_sampler"])
                     spec["_warm_start_state"] = warm_state
                 if warm_state is None:
                     state_hint_data[sid] = {"type": "fixed", "hint_text": ""}
@@ -1223,9 +1218,7 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
 
         # If we are evaluating all candidates privately anyway, derive median and
         # best_public from the same pool instead of running two extra private evals.
-        run_all_cands = getattr(
-            config, "eval_private_eval_all_candidates", False
-        )
+        run_all_cands = getattr(config, "eval_private_eval_all_candidates", False)
         all_candidates_output: dict[str, Any] | None = None
         if run_all_cands:
             logger.info(
@@ -1498,9 +1491,7 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
 
         # If we are evaluating all candidates privately anyway, derive median and
         # best_public from the same pool instead of running two extra private evals.
-        run_all_cands = getattr(
-            config, "eval_private_eval_all_candidates", False
-        )
+        run_all_cands = getattr(config, "eval_private_eval_all_candidates", False)
         all_candidates_output: dict[str, Any] | None = None
         if run_all_cands:
             logger.info(
@@ -1616,8 +1607,10 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
             spec["problem_id"]: spec for spec in self._eval_teacher_specs
         }
 
-        # Baseline measures the pure base model *with* hints; skip the no-hint
-        # ``none`` mode since that comparison is provided by the teachers.
+        # Baseline measures the pure base model *with* hints.  The no-hint
+        # ``none`` mode is skipped here because the base model's performance on
+        # ALE-Bench without hints has already been evaluated separately; we only
+        # need to compare how much hints help the base model vs. the teacher.
         baseline_mode_specs = [m for m in mode_specs if m["mode"] != "none"]
         results_by_mode: dict[str, dict[str, Any]] = {}
         for mode_spec in baseline_mode_specs:
@@ -1865,14 +1858,18 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
                 )
                 with open(output_path, "w") as f:
                     json.dump(summary, f, indent=2)
-                logger.info(
-                    f"[Eval] Combined ablation results saved to {output_path}"
-                )
+                logger.info(f"[Eval] Combined ablation results saved to {output_path}")
 
                 # Save task-id -> (model, hint mode, problem) mapping so rollout
                 # trajectories dumped by AReaL can be matched back to their eval
                 # context. AReaL writes eval rollouts to
                 # ``<log_path>/eval-rollout/<version>/<task_id>.jsonl``.
+                #
+                # To inspect the actual generated code for a task_id:
+                #   1. Load this JSON to get ``task_metadata[str(task_id)]``.
+                #   2. Read ``<log_path>/eval-rollout/<version>/<task_id>.jsonl``.
+                #   3. Each line is a rollout record with ``prompt``, completion
+                #      text, and public-eval metadata.
                 mapping_path = os.path.join(
                     output_dir,
                     f"eval_teacher_hint_ablation_task_metadata{suffix}.json",
@@ -1954,12 +1951,16 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
             )
             with open(comparison_path, "w") as f:
                 json.dump(all_framing_summaries, f, indent=2)
-            logger.info(
-                f"[Eval] Framing comparison saved to {comparison_path}"
-            )
+            logger.info(f"[Eval] Framing comparison saved to {comparison_path}")
 
     def close(self):
-        """Close all globally-shared ALE-Bench sessions and cleanup resources."""
+        """Close all globally-shared ALE-Bench sessions and cleanup resources.
+
+        Safe to call multiple times.
+        """
+        if self._closed:
+            return
+        self._closed = True
         # Collect every env that may hold a session reference. Because sessions
         # are globally cached per problem, deduplicate by ``id(session)`` before
         # closing to avoid double-close.
@@ -2028,6 +2029,36 @@ def main(args):
         config.ale_bench_eval_lite_version = False
 
     trainer = TeacherHintAblationAleBenchTrainer(config)
+
+    def _signal_handler(signum, frame):
+        sig_name = signal.Signals(signum).name
+        logger.warning(
+            f"[Main] Received {sig_name} (signal {signum}), "
+            "closing ALE-Bench sessions and exiting."
+        )
+        # Close module-level cached sessions first to release Docker containers
+        # and temp tool_dirs as quickly as possible.
+        try:
+            close_all_ale_bench_sessions()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[Main] Failed to close env sessions: {e}")
+        try:
+            close_all_cached_ale_bench_sessions()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[Main] Failed to close eval sessions: {e}")
+        # Run the full trainer cleanup (rollout/actor destruction, etc.).
+        try:
+            trainer.close()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[Main] trainer.close() failed: {e}")
+        # Restore the default handler and re-raise the signal so the process
+        # actually terminates.
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
     try:
         trainer.run()
     finally:
