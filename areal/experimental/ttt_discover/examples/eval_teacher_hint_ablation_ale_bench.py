@@ -469,6 +469,17 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
         )
         return (raw, label) if raw is not None else (None, label)
 
+    def _log_hint_state_info(self, problem_id: str, label: str, state: Any) -> None:
+        """Log a concise summary of a sampled hint state."""
+        code = getattr(state, "code", None) or ""
+        score, score_label = self._display_score(state)
+        preview = code[:200].replace("\n", " ") if code else ""
+        logger.info(
+            f"[Hint][{problem_id}] {label}: code_len={len(code)}, "
+            f"{score_label}={score if score is not None else 'n/a'}, "
+            f"preview={preview!r}"
+        )
+
     def _select_warm_start_state(self, sampler: Any) -> Any | None:
         """Select a mediocre accepted state to use as a warm-start hint.
 
@@ -802,6 +813,11 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
                 milestone_paths = milestone_hints.get("paths", [])
                 if not milestone_paths:
                     milestone_paths = self._extract_milestones_for_spec(spec)
+                if self.actor.rank == 0:
+                    logger.info(
+                        f"[Hint][{mode}] problem={spec['problem_id']} "
+                        f"using {len(milestone_paths)} milestone path(s)"
+                    )
                 state_hint_data[sid] = {
                     "type": "milestone",
                     "paths": milestone_paths,
@@ -816,6 +832,23 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
                     min_improvement=min_improvement,
                     deterministic=deterministic,
                 )
+                if self.actor.rank == 0:
+                    logger.info(
+                        f"[Hint][{mode}] problem={spec['problem_id']} "
+                        f"sampled {len(hint_pool)} hint state(s) "
+                        f"(k={k}, min_improvement={min_improvement}, "
+                        f"deterministic={deterministic})"
+                    )
+                    for hint_label, payload in hint_pool:
+                        if isinstance(payload, (list, tuple)):
+                            for i, st in enumerate(payload):
+                                self._log_hint_state_info(
+                                    spec["problem_id"], f"{hint_label}[{i}]", st
+                                )
+                        else:
+                            self._log_hint_state_info(
+                                spec["problem_id"], hint_label, payload
+                            )
 
                 # When ``combine=True`` and the pool has multiple states of the
                 # same type, show them all together in one prompt instead of
@@ -1685,6 +1718,57 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
             f"[Eval] Running over prompt framings: {framing_list} "
             f"(baseline={'on' if run_baseline else 'off'})"
         )
+
+        if self.actor.rank == 0:
+            output_dir = os.path.join(
+                config.saver.fileroot, config.experiment_name, config.trial_name
+            )
+            unique_problem_ids = sorted(
+                {spec["problem_id"] for spec in self._eval_teacher_specs}
+            )
+            logger.info("=" * 60)
+            logger.info("[Eval] Run summary")
+            logger.info("=" * 60)
+            logger.info(f"  Experiment:  {config.experiment_name}")
+            logger.info(f"  Trial:       {config.trial_name}")
+            logger.info(f"  Output dir:  {output_dir}")
+            logger.info(f"  Model:       {config.actor.path}")
+            logger.info(f"  Allocation:  {config.allocation_mode}")
+            logger.info(f"  #Teachers:   {len(self._eval_teacher_specs)}")
+            logger.info(f"  #Problems:   {len(unique_problem_ids)}")
+            logger.info(f"  Problem IDs: {unique_problem_ids}")
+            logger.info(f"  Modes:       {[m['label'] for m in mode_specs]}")
+            logger.info(f"  Framings:    {framing_list}")
+            logger.info(f"  Baseline:    {'on' if run_baseline else 'off'}")
+            logger.info("[Eval] ALE-Bench eval config:")
+            logger.info(
+                f"    n_candidates:           "
+                f"{getattr(config, 'ale_bench_eval_n_candidates', 15)}"
+            )
+            logger.info(
+                f"    lite_version:           "
+                f"{getattr(config, 'ale_bench_eval_lite_version', False)}"
+            )
+            logger.info(
+                f"    num_workers:            {config.ale_bench_eval_num_workers}"
+            )
+            logger.info(
+                f"    n_parallel_problems:    "
+                f"{config.ale_bench_eval_n_parallel_problems}"
+            )
+            logger.info(f"    session_duration_hours: {_EVAL_SESSION_DURATION_HOURS}")
+            logger.info(
+                f"    eval_all_candidates:    "
+                f"{getattr(config, 'eval_private_eval_all_candidates', False)}"
+            )
+            logger.info("[Eval] Teacher specs:")
+            for spec in self._eval_teacher_specs:
+                logger.info(
+                    f"    - {spec['label']:20s} "
+                    f"problem={spec['problem_id']} "
+                    f"lora={spec['lora_path']}"
+                )
+            logger.info("=" * 60)
 
         all_framing_summaries: dict[str, dict[str, Any]] = {}
 

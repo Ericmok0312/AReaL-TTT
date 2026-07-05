@@ -23,6 +23,7 @@ Usage:
 """
 
 import argparse
+import atexit
 import json
 import os
 import signal
@@ -46,8 +47,24 @@ _current_executor: ProcessPoolExecutor | None = None
 # Module-level cache of ALE-Bench sessions, keyed by problem configuration.
 # Sessions are reused across files/runs within the same process.  ALE-Bench
 # registers ``session.close`` with atexit, so cached sessions are still cleaned
-# up when the process exits.
+# up when the process exits normally.
 _ale_bench_sessions: dict[tuple[str, bool, float, int], Any] = {}
+
+
+def _close_cached_sessions() -> None:
+    """Close all sessions held in the module-level cache."""
+    sessions = list(_ale_bench_sessions.values())
+    _ale_bench_sessions.clear()
+    for session in sessions:
+        try:
+            if session is not None and not getattr(session, "_closed", False):
+                session.close()
+                setattr(session, "_closed", True)
+        except Exception:
+            pass
+
+
+atexit.register(_close_cached_sessions)
 
 
 def _signal_handler(signum, frame) -> None:
@@ -63,6 +80,7 @@ def _signal_handler(signum, frame) -> None:
             _current_executor.shutdown(wait=False, cancel_futures=True)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[Main] Failed to shutdown executor: {e}")
+    _close_cached_sessions()
     sys.exit(1)
 
 
