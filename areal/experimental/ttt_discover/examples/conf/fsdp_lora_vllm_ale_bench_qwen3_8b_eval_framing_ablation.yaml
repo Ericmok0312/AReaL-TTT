@@ -1,9 +1,9 @@
-# Eval-only config for teacher hint ablation on ALE-Bench.
-# Reuses the trained teacher LoRAs and samplers from the trial0 training run of
-# fsdp_lora_vllm_ale_bench_qwen3_8b_distill_multi.yaml, but writes outputs to a
-# fresh trial so the original training data is not overwritten.
+# Minimal config for prompt-framing ablation.
+# Tests only one problem and one hint mode (best_k2 combined) with two prompt
+# framings: generalize (default) vs minimal, in a single run. Baseline is
+# disabled to save time because this ablation only needs the teacher result.
 experiment_name: tttd-distill-qwen3-8b-ale-bench-multi-diverse-best-worst
-trial_name: trial0_eval_hint_ablation
+trial_name: trial0_eval_framing_ablation
 is_tttd_config: true
 seed: 1
 enable_offload: false
@@ -29,45 +29,23 @@ ale_bench_eval_lite_version: false
 ale_bench_eval_num_workers: 16
 ale_bench_eval_n_parallel_problems: 10
 
-# Prompt framing for hint suffix. "generalize" pushes the model to identify
-# principles and write fresh code; "minimal" just asks for a solution without
-# referencing the hints.
-eval_hint_prompt_framing: generalize
+# Run both prompt framings in one shot.
+eval_hint_framing_ablation:
+  - generalize
+  - minimal
 
-# Milestone hint extraction: each path has 3 milestones, and we extract 3 paths
-# so that each path is used for 5 candidates. This keeps the hint fixed enough
-# to measure the mode's effect on teacher output diversity while averaging over
-# a few different paths.
-eval_milestone_n_milestones: 3
-eval_milestone_n_paths: 3
+# Skip baseline for this quick framing-only ablation.
+eval_hint_ablation_run_baseline: false
 
-# One entry per trained ALE-Bench problem. Paths point to the original trial0
-# training outputs so the eval can load the final teacher adapters.
+# Only test one mode so we can cleanly compare framing effects.
+eval_hint_modes:
+  - {mode: best, k: 2, label: best_k2_combined, combine: true}
+
+# Only one problem to keep the ablation cheap.
 multi_teacher:
-  - problem_id: ahc025
-    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc025/trial0_ahc025/sampler
-    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc025/trial0_ahc025/default/epoch29epochstep29globalstep29
-  - problem_id: ahc026
-    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc026/trial0_ahc026/sampler
-    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc026/trial0_ahc026/default/epoch29epochstep29globalstep29
-  - problem_id: ahc027
-    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc027/trial0_ahc027/sampler
-    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc027/trial0_ahc027/default/epoch29epochstep29globalstep29
   - problem_id: ahc039
     sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc039/trial0_ahc039/sampler
     lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc039/trial0_ahc039/default/epoch29epochstep29globalstep29
-  - problem_id: ahc046
-    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc046/trial0_ahc046/sampler
-    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc046/trial0_ahc046/default/epoch29epochstep29globalstep29
-  - problem_id: ahc011
-    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc011/trial0_ahc011/sampler
-    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc011/trial0_ahc011/default/epoch29epochstep29globalstep29
-  - problem_id: ahc015
-    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc015/trial0_ahc015/sampler
-    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc015/trial0_ahc015/default/epoch29epochstep29globalstep29
-  - problem_id: ahc016
-    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc016/trial0_ahc016/sampler
-    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc016/trial0_ahc016/default/epoch29epochstep29globalstep29
 
 # Shared teacher engine uses the base model with LoRA structure so the trainer
 # can load each problem's adapter before computing teacher_logp.
@@ -242,7 +220,7 @@ sampler:
   checkpoint_dir: ${cluster.fileroot}/${experiment_name}/${trial_name}/sampler
   initial_exp_type: random
   env_type: ale_bench
-  problem_id: ahc025
+  problem_id: ahc039
   ale_bench_lite_version: false
   reward_scale: 100000.0
   eval_timeout: 600
@@ -268,7 +246,6 @@ saver:
   freq_steps: 1
   freq_secs: null
 
-# Eval-only: disable recover so the job exits cleanly after evaluation.
 recover:
   mode: 'off'
   experiment_name: ${experiment_name}

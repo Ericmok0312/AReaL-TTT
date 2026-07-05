@@ -536,6 +536,30 @@ class TTTDDistillConfig(TTTDPPOConfig):
             "when extracting milestone paths in eval_teacher_hint_ablation_ale_bench.py."
         },
     )
+    eval_hint_prompt_framing: str = field(
+        default="generalize",
+        metadata={
+            "help": "Prompt framing for hint-sampling ablation in "
+            "eval_teacher_hint_ablation_ale_bench.py. "
+            "'generalize' asks the model to generalize the reference approach. "
+            "'minimal' only asks for an independent solution."
+        },
+    )
+    eval_hint_framing_ablation: list[str] = field(
+        default_factory=list,
+        metadata={
+            "help": "If non-empty, eval_teacher_hint_ablation_ale_bench.py runs the same "
+            "eval_hint_modes once per listed prompt framing (e.g. [generalize, minimal]) "
+            "and writes one result file per framing."
+        },
+    )
+    eval_hint_ablation_run_baseline: bool = field(
+        default=True,
+        metadata={
+            "help": "If True, eval_teacher_hint_ablation_ale_bench.py also evaluates the "
+            "pure base model with hints. Set to False for a quick framing-only ablation."
+        },
+    )
     test_construction_match: bool = field(
         default=False,
         metadata={

@@ -483,6 +483,28 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
         """Extract milestone paths from the current teacher's hint sampler."""
         return self._extract_milestones_for_spec(self._current_teacher_spec)
 
+    def _get_prompt_framing_text(self, study_object: str = "reference approach") -> str:
+        """Return the final instruction for a hint based on config framing.
+
+        ``config.eval_hint_prompt_framing`` controls how strongly the model is
+        pushed to generalize the reference:
+
+        - ``generalize`` (default): identify principles and write fresh code.
+        - ``minimal``: just ask for a solution without referencing the hints.
+        """
+        framing = getattr(self.config, "eval_hint_prompt_framing", "generalize")
+        if framing == "minimal":
+            return (
+                "Now generate your own independent C++20 solution for this problem.\n"
+            )
+        # Default: generalize
+        return (
+            f"Study the {study_object} above. Identify the underlying principles, "
+            f"and try to generalize them. Then generate your own independent C++20 "
+            f"solution. Do not copy it verbatim; write a fresh implementation based "
+            f"on your generalized understanding.\n"
+        )
+
     def _build_single_hint(self, privileged_state: Any) -> str:
         """Build a short hint from a single privileged state."""
         fence = self._hint_code_fence()
@@ -497,10 +519,7 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
         hint_text = "\n".join(hint_parts)
         return (
             f"\n\n[Reference Approach]\n{hint_text}\n\n"
-            "Study the reference approach above. Reason about why it succeeds on "
-            "this problem, identify the underlying principles, and try to generalize "
-            "them. Then generate your own independent C++20 solution. Do not copy it "
-            "verbatim; write a fresh implementation based on your generalized understanding.\n"
+            + self._get_prompt_framing_text("reference approach")
         )
 
     def _build_best_worst_hint(self, best_states: Any, worst_states: Any) -> str:
@@ -546,10 +565,7 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
         hint_text = "\n".join(hint_parts).strip()
         return (
             f"\n\n[Reference Approaches]\n{hint_text}\n\n"
-            "Study all the approaches above. Understand why the strong approaches succeed "
-            "and why the weaker ones perform less well. Identify the underlying principles, "
-            "and try to generalize them. Then generate your own independent C++20 solution "
-            "based on your understanding.\n"
+            + self._get_prompt_framing_text("approaches")
         )
 
     def _build_multi_state_hint(
@@ -575,11 +591,8 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
             hint_parts.append("")
 
         hint_text = "\n".join(hint_parts).strip()
-        return (
-            f"\n\n[{title}]\n{hint_text}\n\n"
-            "Study all the approaches above. Identify the underlying principles, "
-            "and try to generalize them. Then generate your own independent C++20 "
-            "solution based on your understanding.\n"
+        return f"\n\n[{title}]\n{hint_text}\n\n" + self._get_prompt_framing_text(
+            "approaches"
         )
 
     def _build_breakthrough_pair_hint(self, parent_state: Any, child_state: Any) -> str:
@@ -613,10 +626,7 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
         hint_text = "\n".join(hint_parts)
         return (
             f"\n\n[Breakthrough Transition]\n{hint_text}\n\n"
-            "Study the transition above. Understand why the second approach "
-            "succeeds compared to the first, identify the underlying principles, "
-            "and try to generalize them. Then generate your own independent "
-            "C++20 solution based on that generalized insight.\n"
+            + self._get_prompt_framing_text("transition")
         )
 
     def _build_milestone_hint(self, milestones: list[dict]) -> str:
@@ -625,12 +635,8 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
             return ""
         fence = self._hint_code_fence()
         lines = ["\n=== Strategy Evolution Hints ==="]
-        lines.append(
-            "Below are key phases discovered during search. Study each phase, "
-            "reason about why the later phases succeed, identify the underlying "
-            "principles, and try to generalize them. Then generate your own "
-            "independent C++20 solution.\n"
-        )
+        lines.append("Below are key phases discovered during search.\n")
+        lines.append(self._get_prompt_framing_text("phases"))
         for i, ms in enumerate(milestones):
             phase_label = (
                 ["Baseline", "Phase 1", "Phase 2", "Phase 3"][i]
@@ -1456,7 +1462,13 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
         logger.info("[Eval] Weights pushed and rollouts resumed.")
 
     def run(self):
-        """Run the full hint ablation across all teachers and save combined results."""
+        """Run the full hint ablation across all teachers and save combined results.
+
+        If ``config.eval_hint_framing_ablation`` is non-empty, the same set of
+        modes is evaluated once per listed prompt framing (e.g.
+        ``[generalize, minimal]``) and a separate result file is written for each
+        framing, plus a combined comparison file.
+        """
         config = self.config
 
         # Determine modes to run. Allow either plain strings or dicts with
@@ -1473,213 +1485,270 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
             f"{[m['label'] for m in mode_specs]}"
         )
 
-        all_teacher_results: dict[str, dict[str, Any]] = {}
-        combined_task_metadata: dict[int, dict[str, Any]] = {}
+        # Prompt framings to test. If an explicit ablation list is given, run all
+        # of them in one shot; otherwise fall back to the single configured framing.
+        framing_list = list(getattr(config, "eval_hint_framing_ablation", []))
+        if not framing_list:
+            framing_list = [getattr(config, "eval_hint_prompt_framing", "generalize")]
+        run_baseline = getattr(config, "eval_hint_ablation_run_baseline", True)
+        logger.info(
+            f"[Eval] Running over prompt framings: {framing_list} "
+            f"(baseline={'on' if run_baseline else 'off'})"
+        )
 
-        # Baseline evaluation on all unique teacher problems.
-        logger.info("[Baseline] Using pure base model (zero LoRA weights)")
-        self._zero_lora_weights(self.actor)
-        self._push_teacher_weights()
-        baseline_results = self._run_baseline_eval(mode_specs)
-        if baseline_results and not baseline_results.get("skipped"):
-            for mode_result in baseline_results.get("results_by_mode", {}).values():
-                combined_task_metadata.update(mode_result.get("task_metadata", {}))
-        if dist.is_initialized():
-            dist.barrier()
+        all_framing_summaries: dict[str, dict[str, Any]] = {}
 
-        for spec in self._eval_teacher_specs:
-            teacher_label = spec["label"]
-            self._current_teacher_spec = spec
-            self._teacher_path = spec["lora_path"]
-            self.hint_sampler = spec["hint_sampler"]
+        for framing in framing_list:
+            config.eval_hint_prompt_framing = framing
+            logger.info("=" * 60)
+            logger.info(f"[Eval] Prompt framing: {framing}")
+            logger.info("=" * 60)
 
-            # NOTE: ALE-Bench sessions are globally cached per problem, so we
-            # do NOT close the previous teacher's session here. All sessions are
-            # closed together in ``close()``.
-            problem_id = spec["problem_id"]
-            if self.actor.rank == 0:
-                # Reuse the env created during baseline eval when possible;
-                # baseline already covers the union of all teacher problems.
-                if (
-                    hasattr(self, "_baseline_envs")
-                    and problem_id in self._baseline_envs
-                ):
-                    self.env = self._baseline_envs[problem_id]
-                    logger.info(f"[Eval] Reusing baseline env for problem {problem_id}")
-                else:
-                    self.env = self._create_env_for_problem(problem_id)
-                self._score_type = self._get_score_type(self.env)
-                logger.info("=" * 60)
-                logger.info(f"[Eval] Evaluating teacher: {teacher_label}")
-                logger.info(f"[Eval]   Problem: {problem_id}")
-                logger.info(f"[Eval]   LoRA path: {self._teacher_path}")
-                logger.info(
-                    f"[Eval]   Sampler checkpoint: {spec['sampler_checkpoint']}"
-                )
-                logger.info(f"[Eval]   Score type: {self._score_type}")
-                logger.info("=" * 60)
-            else:
-                self.env = None
+            all_teacher_results: dict[str, dict[str, Any]] = {}
+            combined_task_metadata: dict[int, dict[str, Any]] = {}
 
-            # Load this teacher's LoRA and push to vLLM
-            self._load_peft_lora_adapter(self.actor, self._teacher_path)
-            self._push_teacher_weights()
-
-            results_by_mode: dict[str, dict[str, Any]] = {}
-            for mode_spec in mode_specs:
-                mode_result = self._run_single_mode(mode_spec)
-                results_by_mode[mode_spec["label"]] = mode_result
-                combined_task_metadata.update(mode_result.get("task_metadata", {}))
+            # Baseline evaluation on all unique teacher problems.
+            baseline_results = None
+            if run_baseline:
+                logger.info("[Baseline] Using pure base model (zero LoRA weights)")
+                self._zero_lora_weights(self.actor)
+                self._push_teacher_weights()
+                baseline_results = self._run_baseline_eval(mode_specs)
+                if baseline_results and not baseline_results.get("skipped"):
+                    for mode_result in baseline_results.get(
+                        "results_by_mode", {}
+                    ).values():
+                        combined_task_metadata.update(
+                            mode_result.get("task_metadata", {})
+                        )
                 if dist.is_initialized():
                     dist.barrier()
 
-            # Aggregate only on DP head.
-            if self.actor.rank == 0:
+            for spec in self._eval_teacher_specs:
+                teacher_label = spec["label"]
+                self._current_teacher_spec = spec
+                self._teacher_path = spec["lora_path"]
+                self.hint_sampler = spec["hint_sampler"]
 
-                def _sort_key(r: dict[str, Any], sel: str) -> tuple[float, float]:
-                    avg = r.get(sel, {}).get("average_all", {})
-                    return (
-                        avg.get("absolute_score", 0.0),
-                        avg.get("performance", 0.0),
+                # NOTE: ALE-Bench sessions are globally cached per problem, so we
+                # do NOT close the previous teacher's session here. All sessions are
+                # closed together in ``close()``.
+                problem_id = spec["problem_id"]
+                if self.actor.rank == 0:
+                    # Reuse the env created during baseline eval when possible;
+                    # baseline already covers the union of all teacher problems.
+                    if (
+                        hasattr(self, "_baseline_envs")
+                        and problem_id in self._baseline_envs
+                    ):
+                        self.env = self._baseline_envs[problem_id]
+                        logger.info(
+                            f"[Eval] Reusing baseline env for problem {problem_id}"
+                        )
+                    else:
+                        self.env = self._create_env_for_problem(problem_id)
+                    self._score_type = self._get_score_type(self.env)
+                    logger.info("=" * 60)
+                    logger.info(f"[Eval] Evaluating teacher: {teacher_label}")
+                    logger.info(f"[Eval]   Problem: {problem_id}")
+                    logger.info(f"[Eval]   LoRA path: {self._teacher_path}")
+                    logger.info(
+                        f"[Eval]   Sampler checkpoint: {spec['sampler_checkpoint']}"
                     )
+                    logger.info(f"[Eval]   Score type: {self._score_type}")
+                    logger.info("=" * 60)
+                else:
+                    self.env = None
 
-                all_teacher_results[teacher_label] = {
-                    "problem_id": spec["problem_id"],
-                    "lora_path": spec["lora_path"],
-                    "sampler_checkpoint": spec["sampler_checkpoint"],
-                    "results_by_mode": results_by_mode,
-                    "ranking_by_median": [
-                        {
-                            "rank": i + 1,
-                            "mode": r["mode"],
-                            "mode_label": r.get("mode_label", r["mode"]),
-                            "private_absolute_score": r.get("median", {})
-                            .get("average_all", {})
-                            .get("absolute_score", 0.0),
-                            "private_performance": r.get("median", {})
-                            .get("average_all", {})
-                            .get("performance", 0.0),
-                        }
-                        for i, r in enumerate(
-                            sorted(
-                                results_by_mode.values(),
-                                key=lambda r: _sort_key(r, "median"),
-                                reverse=True,
-                            )
+                # Load this teacher's LoRA and push to vLLM
+                self._load_peft_lora_adapter(self.actor, self._teacher_path)
+                self._push_teacher_weights()
+
+                results_by_mode: dict[str, dict[str, Any]] = {}
+                for mode_spec in mode_specs:
+                    mode_result = self._run_single_mode(mode_spec)
+                    results_by_mode[mode_spec["label"]] = mode_result
+                    combined_task_metadata.update(mode_result.get("task_metadata", {}))
+                    if dist.is_initialized():
+                        dist.barrier()
+
+                # Aggregate only on DP head.
+                if self.actor.rank == 0:
+
+                    def _sort_key(r: dict[str, Any], sel: str) -> tuple[float, float]:
+                        avg = r.get(sel, {}).get("average_all", {})
+                        return (
+                            avg.get("absolute_score", 0.0),
+                            avg.get("performance", 0.0),
                         )
-                    ],
-                    "ranking_by_best_public": [
-                        {
-                            "rank": i + 1,
-                            "mode": r["mode"],
-                            "mode_label": r.get("mode_label", r["mode"]),
-                            "private_absolute_score": r.get("best_public", {})
-                            .get("average_all", {})
-                            .get("absolute_score", 0.0),
-                            "private_performance": r.get("best_public", {})
-                            .get("average_all", {})
-                            .get("performance", 0.0),
-                        }
-                        for i, r in enumerate(
-                            sorted(
-                                results_by_mode.values(),
-                                key=lambda r: _sort_key(r, "best_public"),
-                                reverse=True,
+
+                    all_teacher_results[teacher_label] = {
+                        "problem_id": spec["problem_id"],
+                        "lora_path": spec["lora_path"],
+                        "sampler_checkpoint": spec["sampler_checkpoint"],
+                        "results_by_mode": results_by_mode,
+                        "ranking_by_median": [
+                            {
+                                "rank": i + 1,
+                                "mode": r["mode"],
+                                "mode_label": r.get("mode_label", r["mode"]),
+                                "private_absolute_score": r.get("median", {})
+                                .get("average_all", {})
+                                .get("absolute_score", 0.0),
+                                "private_performance": r.get("median", {})
+                                .get("average_all", {})
+                                .get("performance", 0.0),
+                            }
+                            for i, r in enumerate(
+                                sorted(
+                                    results_by_mode.values(),
+                                    key=lambda r: _sort_key(r, "median"),
+                                    reverse=True,
+                                )
                             )
+                        ],
+                        "ranking_by_best_public": [
+                            {
+                                "rank": i + 1,
+                                "mode": r["mode"],
+                                "mode_label": r.get("mode_label", r["mode"]),
+                                "private_absolute_score": r.get("best_public", {})
+                                .get("average_all", {})
+                                .get("absolute_score", 0.0),
+                                "private_performance": r.get("best_public", {})
+                                .get("average_all", {})
+                                .get("performance", 0.0),
+                            }
+                            for i, r in enumerate(
+                                sorted(
+                                    results_by_mode.values(),
+                                    key=lambda r: _sort_key(r, "best_public"),
+                                    reverse=True,
+                                )
+                            )
+                        ],
+                    }
+
+            # Build combined summary across teachers for this framing.
+            summary = {
+                "prompt_framing": framing,
+                "modes": [m["label"] for m in mode_specs],
+                "mode_specs": mode_specs,
+                "baseline_results": baseline_results
+                if baseline_results is not None
+                else {},
+                "teachers": all_teacher_results,
+            }
+            all_framing_summaries[framing] = summary
+
+            if self.actor.rank == 0:
+                output_dir = os.path.join(
+                    config.saver.fileroot,
+                    config.experiment_name,
+                    config.trial_name,
+                )
+                os.makedirs(output_dir, exist_ok=True)
+
+                # When testing multiple framings, keep separate files so later
+                # iterations do not overwrite earlier ones.
+                suffix = "" if len(framing_list) == 1 else f"_{framing}"
+                output_path = os.path.join(
+                    output_dir, f"eval_teacher_hint_ablation{suffix}.json"
+                )
+                with open(output_path, "w") as f:
+                    json.dump(summary, f, indent=2)
+                logger.info(
+                    f"[Eval] Combined ablation results saved to {output_path}"
+                )
+
+                # Save task-id -> (model, hint mode, problem) mapping so rollout
+                # trajectories dumped by AReaL can be matched back to their eval
+                # context. AReaL writes eval rollouts to
+                # ``<log_path>/eval-rollout/<version>/<task_id>.jsonl``.
+                mapping_path = os.path.join(
+                    output_dir,
+                    f"eval_teacher_hint_ablation_task_metadata{suffix}.json",
+                )
+                with open(mapping_path, "w") as f:
+                    json.dump(
+                        {
+                            "task_metadata": {
+                                str(k): v for k, v in combined_task_metadata.items()
+                            },
+                            "rollout_dump_subdir": "eval-rollout",
+                        },
+                        f,
+                        indent=2,
+                    )
+                logger.info(f"[Eval] Task metadata mapping saved to {mapping_path}")
+
+                # Print baseline + per-teacher ranking for this framing.
+                logger.info("=" * 60)
+                logger.info(f"TEACHER HINT ABLATION - FINAL RESULTS [{framing}]")
+                logger.info("=" * 60)
+                if baseline_results and not baseline_results.get("skipped"):
+                    logger.info("Baseline (pure base model):")
+                    for mode, mode_result in baseline_results.get(
+                        "results_by_mode", {}
+                    ).items():
+                        logger.info(f"  Mode: {mode}")
+                        median_avg = mode_result.get("median", {}).get(
+                            "average_all", {}
                         )
-                    ],
-                }
+                        best_public_avg = mode_result.get("best_public", {}).get(
+                            "average_all", {}
+                        )
+                        logger.info(
+                            f"    median       abs={median_avg.get('absolute_score', 0.0):.4f} "
+                            f"perf={median_avg.get('performance', 0.0):.4f} "
+                            f"success={median_avg.get('count', 0)}/"
+                            f"{len(baseline_results.get('problem_ids', []))}"
+                        )
+                        logger.info(
+                            f"    best_public  abs={best_public_avg.get('absolute_score', 0.0):.4f} "
+                            f"perf={best_public_avg.get('performance', 0.0):.4f} "
+                            f"success={best_public_avg.get('count', 0)}/"
+                            f"{len(baseline_results.get('problem_ids', []))}"
+                        )
+                for teacher_label, teacher_summary in all_teacher_results.items():
+                    logger.info(f"Teacher: {teacher_label}")
+                    logger.info("  Ranking by median selection:")
+                    for entry in teacher_summary["ranking_by_median"]:
+                        label = entry.get("mode_label", entry["mode"])
+                        logger.info(
+                            f"    #{entry['rank']} {label:18s} "
+                            f"abs={entry['private_absolute_score']:.4f} "
+                            f"perf={entry['private_performance']:.4f}"
+                        )
+                    logger.info("  Ranking by best-public selection:")
+                    for entry in teacher_summary["ranking_by_best_public"]:
+                        label = entry.get("mode_label", entry["mode"])
+                        logger.info(
+                            f"    #{entry['rank']} {label:18s} "
+                            f"abs={entry['private_absolute_score']:.4f} "
+                            f"perf={entry['private_performance']:.4f}"
+                        )
+                logger.info("=" * 60)
 
-        # Build combined summary across teachers
-        summary = {
-            "modes": [m["label"] for m in mode_specs],
-            "mode_specs": mode_specs,
-            "baseline_results": baseline_results
-            if baseline_results is not None
-            else {},
-            "teachers": all_teacher_results,
-        }
+            if dist.is_initialized():
+                dist.barrier()
 
-        if self.actor.rank == 0:
+        # After all framings, write a combined comparison file if applicable.
+        if self.actor.rank == 0 and len(framing_list) > 1:
             output_dir = os.path.join(
                 config.saver.fileroot,
                 config.experiment_name,
                 config.trial_name,
             )
             os.makedirs(output_dir, exist_ok=True)
-            output_path = os.path.join(output_dir, "eval_teacher_hint_ablation.json")
-            with open(output_path, "w") as f:
-                json.dump(summary, f, indent=2)
-            logger.info(f"[Eval] Combined ablation results saved to {output_path}")
-
-            # Save task-id -> (model, hint mode, problem) mapping so rollout
-            # trajectories dumped by AReaL can be matched back to their eval
-            # context. AReaL writes eval rollouts to
-            # ``<log_path>/eval-rollout/<version>/<task_id>.jsonl``.
-            mapping_path = os.path.join(
-                output_dir, "eval_teacher_hint_ablation_task_metadata.json"
+            comparison_path = os.path.join(
+                output_dir, "eval_teacher_hint_ablation_framing_comparison.json"
             )
-            with open(mapping_path, "w") as f:
-                json.dump(
-                    {
-                        "task_metadata": {
-                            str(k): v for k, v in combined_task_metadata.items()
-                        },
-                        "rollout_dump_subdir": "eval-rollout",
-                    },
-                    f,
-                    indent=2,
-                )
-            logger.info(f"[Eval] Task metadata mapping saved to {mapping_path}")
-
-            # Print baseline + per-teacher ranking
-            logger.info("=" * 60)
-            logger.info("TEACHER HINT ABLATION - FINAL RESULTS")
-            logger.info("=" * 60)
-            if baseline_results and not baseline_results.get("skipped"):
-                logger.info("Baseline (pure base model):")
-                for mode, mode_result in baseline_results.get(
-                    "results_by_mode", {}
-                ).items():
-                    logger.info(f"  Mode: {mode}")
-                    median_avg = mode_result.get("median", {}).get("average_all", {})
-                    best_public_avg = mode_result.get("best_public", {}).get(
-                        "average_all", {}
-                    )
-                    logger.info(
-                        f"    median       abs={median_avg.get('absolute_score', 0.0):.4f} "
-                        f"perf={median_avg.get('performance', 0.0):.4f} "
-                        f"success={median_avg.get('count', 0)}/"
-                        f"{len(baseline_results.get('problem_ids', []))}"
-                    )
-                    logger.info(
-                        f"    best_public  abs={best_public_avg.get('absolute_score', 0.0):.4f} "
-                        f"perf={best_public_avg.get('performance', 0.0):.4f} "
-                        f"success={best_public_avg.get('count', 0)}/"
-                        f"{len(baseline_results.get('problem_ids', []))}"
-                    )
-            for teacher_label, teacher_summary in all_teacher_results.items():
-                logger.info(f"Teacher: {teacher_label}")
-                logger.info("  Ranking by median selection:")
-                for entry in teacher_summary["ranking_by_median"]:
-                    label = entry.get("mode_label", entry["mode"])
-                    logger.info(
-                        f"    #{entry['rank']} {label:18s} "
-                        f"abs={entry['private_absolute_score']:.4f} "
-                        f"perf={entry['private_performance']:.4f}"
-                    )
-                logger.info("  Ranking by best-public selection:")
-                for entry in teacher_summary["ranking_by_best_public"]:
-                    label = entry.get("mode_label", entry["mode"])
-                    logger.info(
-                        f"    #{entry['rank']} {label:18s} "
-                        f"abs={entry['private_absolute_score']:.4f} "
-                        f"perf={entry['private_performance']:.4f}"
-                    )
-            logger.info("=" * 60)
-
-        if dist.is_initialized():
-            dist.barrier()
+            with open(comparison_path, "w") as f:
+                json.dump(all_framing_summaries, f, indent=2)
+            logger.info(
+                f"[Eval] Framing comparison saved to {comparison_path}"
+            )
 
     def close(self):
         """Close all globally-shared ALE-Bench sessions and cleanup resources."""
