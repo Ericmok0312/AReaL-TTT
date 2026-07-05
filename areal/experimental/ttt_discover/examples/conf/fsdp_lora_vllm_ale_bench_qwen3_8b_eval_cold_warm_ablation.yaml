@@ -1,9 +1,11 @@
-# Eval-only config for teacher hint ablation on ALE-Bench.
-# Reuses the trained teacher LoRAs and samplers from the trial0 training run of
-# fsdp_lora_vllm_ale_bench_qwen3_8b_distill_multi.yaml, but writes outputs to a
-# fresh trial so the original training data is not overwritten.
+# Minimal config for cold-start vs warm-start ablation.
+# Tests whether the trained teacher has learned to (A) generate a good solution
+# from only the problem statement, or (B) improve a mediocre working solution.
+# Runs three modes on a single problem: none (cold), warm_start, and
+# best_k2_combined (strong reference). The pure base model baseline is enabled
+# so we can compare teacher vs base on each input type.
 experiment_name: tttd-distill-qwen3-8b-ale-bench-multi-diverse-best-worst
-trial_name: trial0_eval_hint_ablation
+trial_name: trial0_eval_cold_warm_ablation
 is_tttd_config: true
 seed: 1
 enable_offload: false
@@ -29,25 +31,33 @@ ale_bench_eval_lite_version: false
 ale_bench_eval_num_workers: 16
 ale_bench_eval_n_parallel_problems: 10
 
-# Prompt framing for hint suffix. "generalize" pushes the model to identify
-# principles and write fresh code; "minimal" just asks for a solution without
-# referencing the hints.
-eval_hint_prompt_framing: generalize
-
-# Milestone hint extraction: each path has 3 milestones, and we extract 3 paths
-# so that each path is used for 5 candidates. This keeps the hint fixed enough
-# to measure the mode's effect on teacher output diversity while averaging over
-# a few different paths.
-eval_milestone_n_milestones: 3
-eval_milestone_n_paths: 3
-
-# If true, run private evaluation on all 15 candidates per problem and report
-# mean/median/std/min/max statistics. This is much slower, so it is off by
-# default for the full hint ablation. Toggle on when you need per-candidate stats.
+# Evaluate all 15 candidates privately (not just the selected one) and report
+# mean/median/std/min/max statistics. This is slower but useful for ablations.
 eval_private_eval_all_candidates: true
 
-# One entry per trained ALE-Bench problem. Paths point to the original trial0
-# training outputs so the eval can load the final teacher adapters.
+# Cold-start vs warm-start ablation.
+# - none: problem statement only (cold start).
+# - warm_start: a mediocre working solution is provided; model must improve it.
+# - best_k2_combined: strong reference solutions (focused upper bound).
+# - best_worst_k1: the actual hint mode used during distillation (one best + one
+#   worst combined); used here to check whether the student's scattered/right-skewed
+#   distribution originates from the teacher/hint or from the distillation process.
+eval_hint_modes:
+  - {mode: none, label: none}
+  - {mode: warm_start, label: warm_start}
+  - {mode: best, k: 2, label: best_k2_combined, combine: true}
+  - {mode: best_worst_combined, k: 1, label: best_worst_k1}
+
+# Enable baseline so we can see whether the teacher gains are specific to
+# training or just from the base model's generic coding ability.
+eval_hint_ablation_run_baseline: true
+
+# Percentile of accepted/non-zero states used for warm_start. 0.25 picks a
+# weak-but-working solution (lower = weaker starting point).
+eval_warm_start_percentile: 0.5
+
+# All trained ALE-Bench problems. The base model baseline reuses the same
+# teacher samplers to provide identical warm_start hints per problem.
 multi_teacher:
   - problem_id: ahc025
     sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc025/trial0_ahc025/sampler
@@ -247,7 +257,7 @@ sampler:
   checkpoint_dir: ${cluster.fileroot}/${experiment_name}/${trial_name}/sampler
   initial_exp_type: random
   env_type: ale_bench
-  problem_id: ahc025
+  problem_id: ahc039
   ale_bench_lite_version: false
   reward_scale: 100000.0
   eval_timeout: 600
@@ -273,7 +283,6 @@ saver:
   freq_steps: 1
   freq_secs: null
 
-# Eval-only: disable recover so the job exits cleanly after evaluation.
 recover:
   mode: 'off'
   experiment_name: ${experiment_name}

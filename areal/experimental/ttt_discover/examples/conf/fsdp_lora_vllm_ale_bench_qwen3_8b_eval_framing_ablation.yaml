@@ -37,6 +37,10 @@ eval_hint_framing_ablation:
 # Skip baseline for this quick framing-only ablation.
 eval_hint_ablation_run_baseline: false
 
+# Evaluate all 15 candidates privately (not just the selected one) and report
+# mean/median/std/min/max statistics. This is slower but useful for ablations.
+eval_private_eval_all_candidates: true
+
 # Only test one mode so we can cleanly compare framing effects.
 eval_hint_modes:
   - {mode: best, k: 2, label: best_k2_combined, combine: true}

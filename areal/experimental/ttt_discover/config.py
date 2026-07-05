@@ -560,6 +560,22 @@ class TTTDDistillConfig(TTTDPPOConfig):
             "pure base model with hints. Set to False for a quick framing-only ablation."
         },
     )
+    eval_private_eval_all_candidates: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, eval_teacher_hint_ablation_ale_bench.py runs private evaluation "
+            "on every generated candidate (not just the selected one) and reports "
+            "per-problem statistics such as mean/median/std/min/max."
+        },
+    )
+    eval_warm_start_percentile: float = field(
+        default=0.25,
+        metadata={
+            "help": "Percentile (0-1) of accepted/non-zero-reward states used by the "
+            "warm_start hint mode in eval_teacher_hint_ablation_ale_bench.py. "
+            "Lower values pick weaker (closer to worst_nonzero) starting solutions."
+        },
+    )
     test_construction_match: bool = field(
         default=False,
         metadata={

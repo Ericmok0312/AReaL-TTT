@@ -71,7 +71,10 @@ from areal.api.io_struct import FinetuneSpec
 from areal.experimental.ttt_discover.actor import TTTDActor
 from areal.experimental.ttt_discover.ale_bench_eval import (
     ale_bench_public_reward_fn,
+    average_all_candidates_stats,
     combine_ale_bench_results,
+    derive_selection_outputs_from_all_candidates,
+    evaluate_all_candidates_private,
     evaluate_problem_subset_with_public_scores,
 )
 from areal.experimental.ttt_discover.config import TTTDDistillConfig
@@ -96,8 +99,8 @@ logger = logging.getLogger("eval_teacher_hint_ablation_ale_bench")
 
 
 # Hint modes supported by this ablation.
-# These mirror ``PUCTSampler.get_hint_states`` plus a no-hint baseline and a
-# whole-path milestone mode.
+# These mirror ``PUCTSampler.get_hint_states`` plus a no-hint baseline, a
+# whole-path milestone mode, and a warm-start improvement mode.
 HINT_MODES = [
     "none",
     "best",
@@ -108,6 +111,7 @@ HINT_MODES = [
     "diverse_best",
     "diverse_worst_nonzero",
     "diverse_best_worst",
+    "warm_start",
 ]
 
 # Default hint combinations for the ablation. Each entry can be a plain mode
@@ -129,6 +133,7 @@ DEFAULT_EVAL_HINT_MODES: list[dict[str, Any] | str] = [
         "combine": True,
     },
     {"mode": "milestone", "label": "milestone"},
+    {"mode": "warm_start", "label": "warm_start"},
 ]
 
 # Global ALE-Bench session duration for evaluation (1 day).
@@ -461,6 +466,75 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
         )
         return (raw, label) if raw is not None else (None, label)
 
+    def _select_warm_start_state(self, sampler: Any) -> Any | None:
+        """Select a mediocre accepted state to use as a warm-start hint.
+
+        We sort by ``state.value`` (PUCT's normalized score, higher = better)
+        and pick the state at ``config.eval_warm_start_percentile``.  This
+        gives a working but clearly suboptimal starting solution, regardless
+        of whether the underlying problem is a minimization or maximization.
+        """
+        states = getattr(sampler, "_states", [])
+        candidates = [
+            s
+            for s in states
+            if getattr(s, "code", None)
+            and s.code.strip()
+            and getattr(s, "value", None) is not None
+            and s.value > 0
+        ]
+        if not candidates:
+            # Fallback: states with a positive raw score (ALE-Bench specific).
+            candidates = [
+                s
+                for s in states
+                if getattr(s, "code", None)
+                and s.code.strip()
+                and getattr(s, "raw_score", None) is not None
+                and s.raw_score > 0
+            ]
+        if not candidates:
+            # Last resort: any state that has code.
+            candidates = [
+                s
+                for s in states
+                if getattr(s, "code", None) and s.code.strip()
+            ]
+        if not candidates:
+            logger.warning("[WarmStart] No eligible warm-start state found")
+            return None
+
+        candidates.sort(key=lambda s: float(s.value))
+        percentile = float(
+            getattr(self.config, "eval_warm_start_percentile", 0.25)
+        )
+        idx = min(int(len(candidates) * percentile), len(candidates) - 1)
+        selected = candidates[idx]
+        logger.info(
+            f"[WarmStart] Selected state at percentile {percentile:.2f} "
+            f"(idx={idx}/{len(candidates)}, value={selected.value:.6f}, "
+            f"raw_score={getattr(selected, 'raw_score', None)})"
+        )
+        return selected
+
+    def _build_warm_start_hint(self, state: Any) -> str:
+        """Build a neutral hint that asks the model to improve an existing solution."""
+        fence = self._hint_code_fence()
+        code = state.code.strip()
+        score, score_label = self._display_score(state)
+
+        lines = [
+            "[Existing Solution]",
+            "Here is an existing C++20 solution for this problem.",
+            f"```{fence}\n{code}\n```",
+        ]
+        if score is not None:
+            lines.append(
+                f"This solution achieves a {score_label} of {score:.6f}."
+            )
+        lines.append("Improve it to achieve a better score.\n")
+        return "\n\n".join([""] + lines)
+
     def _extract_milestones_for_spec(self, spec: dict[str, Any]) -> list[dict]:
         """Extract milestone paths from a teacher spec's hint sampler.
 
@@ -706,6 +780,25 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
 
         for sid, spec in state_to_spec.items():
             counters[sid] = 0
+
+            if mode == "warm_start":
+                # Cache the selected warm-start state in the spec so the base
+                # model baseline and the teacher see exactly the same starting
+                # solution for each problem.
+                warm_state = spec.get("_warm_start_state")
+                if warm_state is None:
+                    warm_state = self._select_warm_start_state(
+                        spec["hint_sampler"]
+                    )
+                    spec["_warm_start_state"] = warm_state
+                if warm_state is None:
+                    state_hint_data[sid] = {"type": "fixed", "hint_text": ""}
+                else:
+                    state_hint_data[sid] = {
+                        "type": "fixed",
+                        "hint_text": self._build_warm_start_hint(warm_state),
+                    }
+                continue
 
             if mode == "milestone" or (
                 mode == "breakthrough" and spec.get("milestone_hints")
@@ -1128,8 +1221,47 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
             combined["selection_method"] = sel_method
             return combined
 
-        median_output = _run_private_for_selection("median")
-        best_public_output = _run_private_for_selection("best_public")
+        # If we are evaluating all candidates privately anyway, derive median and
+        # best_public from the same pool instead of running two extra private evals.
+        run_all_cands = getattr(
+            config, "eval_private_eval_all_candidates", False
+        )
+        all_candidates_output: dict[str, Any] | None = None
+        if run_all_cands:
+            logger.info(
+                f"[AleBenchEval-{mode_label}] Running private eval for all "
+                f"{n_candidates} candidates on {problem_id}"
+            )
+            local_results = evaluate_all_candidates_private(
+                [problem_id],
+                public_results_by_problem,
+                lite_version=getattr(config, "ale_bench_eval_lite_version", False),
+                session_duration_hours=_EVAL_SESSION_DURATION_HOURS,
+                ale_bench_num_workers=config.ale_bench_eval_num_workers,
+                n_parallel_problems=config.ale_bench_eval_n_parallel_problems,
+                problem_sessions=problem_sessions,
+                problem_score_types=problem_score_types,
+            )
+            result = local_results[0]
+            all_candidates_output = {
+                "problem_id": problem_id,
+                "score_type": self._score_type,
+                "private_results": result.get("private_results", []),
+                "private_stats": result.get("private_stats", {}),
+            }
+            derived = derive_selection_outputs_from_all_candidates(
+                public_results_by_problem,
+                local_results,
+                [problem_id],
+                training_problem_ids,
+                ["median", "best_public"],
+                problem_score_types,
+            )
+            median_output = derived["median"]
+            best_public_output = derived["best_public"]
+        else:
+            median_output = _run_private_for_selection("median")
+            best_public_output = _run_private_for_selection("best_public")
 
         output = {
             "mode": mode,
@@ -1145,6 +1277,7 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
             "task_metadata": task_metadata,
             "median": median_output,
             "best_public": best_public_output,
+            "all_candidates": all_candidates_output,
         }
 
         median_avg = median_output.get("average_all", {})
@@ -1159,6 +1292,18 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
             f"[Eval][{mode_label}] best_public  abs={best_public_avg.get('absolute_score', 0.0):.4f} "
             f"perf={best_public_avg.get('performance', 0.0):.4f}"
         )
+        if all_candidates_output is not None:
+            stats = all_candidates_output["private_stats"]
+            abs_stats = stats.get("absolute_score", {})
+            logger.info(
+                f"[Eval][{mode_label}] all_cands    "
+                f"mean={abs_stats.get('mean', 0.0):.4f} "
+                f"median={abs_stats.get('median', 0.0):.4f} "
+                f"std={abs_stats.get('std', 0.0):.4f} "
+                f"min={abs_stats.get('min', 0.0):.4f} "
+                f"max={abs_stats.get('max', 0.0):.4f} "
+                f"accepted={stats.get('count_accepted', 0)}/{stats.get('count', 0)}"
+            )
         logger.info("=" * 60)
 
         return output
@@ -1351,8 +1496,47 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
             combined["selection_method"] = sel_method
             return combined
 
-        median_output = _run_private_for_selection("median")
-        best_public_output = _run_private_for_selection("best_public")
+        # If we are evaluating all candidates privately anyway, derive median and
+        # best_public from the same pool instead of running two extra private evals.
+        run_all_cands = getattr(
+            config, "eval_private_eval_all_candidates", False
+        )
+        all_candidates_output: dict[str, Any] | None = None
+        if run_all_cands:
+            logger.info(
+                f"[Baseline-{mode_label}] Running private eval for all "
+                f"{n_candidates} candidates on {len(problem_ids)} problems"
+            )
+            local_results = evaluate_all_candidates_private(
+                problem_ids,
+                public_results_by_problem,
+                lite_version=lite_version,
+                session_duration_hours=_EVAL_SESSION_DURATION_HOURS,
+                ale_bench_num_workers=config.ale_bench_eval_num_workers,
+                n_parallel_problems=config.ale_bench_eval_n_parallel_problems,
+                problem_sessions=problem_sessions,
+                problem_score_types=problem_score_types,
+            )
+            all_candidates_output = {
+                "problem_ids": problem_ids,
+                "per_problem": local_results,
+                "average_stats": average_all_candidates_stats(
+                    [r.get("private_stats", {}) for r in local_results]
+                ),
+            }
+            derived = derive_selection_outputs_from_all_candidates(
+                public_results_by_problem,
+                local_results,
+                problem_ids,
+                training_problem_ids,
+                ["median", "best_public"],
+                problem_score_types,
+            )
+            median_output = derived["median"]
+            best_public_output = derived["best_public"]
+        else:
+            median_output = _run_private_for_selection("median")
+            best_public_output = _run_private_for_selection("best_public")
 
         median_avg = median_output.get("average_all", {})
         best_public_avg = best_public_output.get("average_all", {})
@@ -1368,6 +1552,18 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
             f"perf={best_public_avg.get('performance', 0.0):.4f} "
             f"success={best_public_avg.get('count', 0)}/{len(problem_ids)}"
         )
+        if all_candidates_output is not None:
+            avg_stats = all_candidates_output.get("average_stats", {})
+            abs_stats = avg_stats.get("absolute_score", {})
+            logger.info(
+                f"[Baseline-{mode_label}] all_cands    "
+                f"mean={abs_stats.get('mean', 0.0):.4f} "
+                f"median={abs_stats.get('median', 0.0):.4f} "
+                f"std={abs_stats.get('std', 0.0):.4f} "
+                f"min={abs_stats.get('min', 0.0):.4f} "
+                f"max={abs_stats.get('max', 0.0):.4f} "
+                f"accepted={avg_stats.get('count_accepted', 0):.1f}/{avg_stats.get('count', 0):.1f}"
+            )
         logger.info("=" * 60)
 
         return {
@@ -1383,6 +1579,7 @@ class TeacherHintAblationAleBenchTrainer(PPOTrainer):
             "task_metadata": task_metadata,
             "median": median_output,
             "best_public": best_public_output,
+            "all_candidates": all_candidates_output,
         }
 
     def _run_baseline_eval(

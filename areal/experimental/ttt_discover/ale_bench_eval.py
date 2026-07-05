@@ -848,6 +848,373 @@ def evaluate_problem_subset_with_public_scores(
     return [results_by_problem[pid] for pid in problem_ids]
 
 
+def _compute_private_stats(
+    private_results: list[dict[str, Any]], score_type: str
+) -> dict[str, Any]:
+    """Compute statistics over a list of per-candidate private results."""
+    successful = [r for r in private_results if "error" not in r]
+    count = len(private_results)
+    count_accepted = sum(
+        1
+        for r in successful
+        if str(r.get("judge_result", "")).upper() == "ACCEPTED"
+    )
+    stats: dict[str, Any] = {
+        "count": count,
+        "count_successful": len(successful),
+        "count_accepted": count_accepted,
+    }
+    if not successful:
+        for metric in ("absolute_score", "relative_score", "performance"):
+            stats[metric] = {
+                "mean": 0.0,
+                "median": 0.0,
+                "std": 0.0,
+                "min": 0.0,
+                "max": 0.0,
+                "p25": 0.0,
+                "p75": 0.0,
+                "skew": 0.0,
+                "kurtosis": 0.0,
+                "bimodality_coefficient": 0.0,
+            }
+        stats["best_candidate_idx"] = None
+        stats["best_absolute_score"] = 0.0
+        return stats
+
+    n = len(successful)
+    for metric in ("absolute_score", "relative_score", "performance"):
+        vals = [r[metric] for r in successful]
+        arr = np.array(vals, dtype=float)
+        mean = float(np.mean(arr))
+        std = float(np.std(arr))
+        skew = 0.0
+        kurt = 0.0
+        bc = 0.0
+        if std > 1e-9:
+            z = (arr - mean) / std
+            skew = float(np.mean(z ** 3))
+            # Excess kurtosis (Fisher), 0 for normal.
+            kurt = float(np.mean(z ** 4) - 3.0)
+            # Sarle's bimodality coefficient. BC > 0.55 suggests bimodality.
+            denom_term = 3.0 * (n - 1) ** 2 / ((n - 2) * (n - 3))
+            denom = kurt + denom_term
+            if abs(denom) > 1e-9:
+                bc = (skew ** 2 + 1.0) / denom
+        stats[metric] = {
+            "mean": mean,
+            "median": float(np.median(arr)),
+            "std": std,
+            "min": float(np.min(arr)),
+            "max": float(np.max(arr)),
+            "p25": float(np.percentile(arr, 25)),
+            "p75": float(np.percentile(arr, 75)),
+            "skew": skew,
+            "kurtosis": kurt,
+            "bimodality_coefficient": bc,
+        }
+
+    is_minimize = str(score_type).lower().strip() == "minimize"
+    abs_vals = [r["absolute_score"] for r in successful]
+    best_local_idx = (
+        int(np.argmin(abs_vals)) if is_minimize else int(np.argmax(abs_vals))
+    )
+    best_result = successful[best_local_idx]
+    stats["best_candidate_idx"] = best_result["idx"]
+    stats["best_absolute_score"] = best_result["absolute_score"]
+    return stats
+
+
+def average_all_candidates_stats(
+    stats_list: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Average per-problem all-candidate statistics across multiple problems."""
+    if not stats_list:
+        return {}
+
+    avg_stats: dict[str, Any] = {}
+    for key in ("count", "count_successful", "count_accepted"):
+        vals = [s.get(key, 0) for s in stats_list]
+        avg_stats[key] = float(np.mean(vals))
+
+    for metric in ("absolute_score", "relative_score", "performance"):
+        agg: dict[str, float] = {}
+        for subkey in ("mean", "median", "std", "min", "max"):
+            vals = [s.get(metric, {}).get(subkey, 0.0) for s in stats_list]
+            agg[subkey] = float(np.mean(vals))
+        avg_stats[metric] = agg
+
+    return avg_stats
+
+
+def derive_selection_outputs_from_all_candidates(
+    public_results_by_problem: dict[str, list[dict[str, Any]]],
+    all_candidates_results: Sequence[dict[str, Any]],
+    problem_ids: Sequence[str],
+    training_problem_ids: set[str],
+    selection_methods: Sequence[str],
+    problem_score_types: dict[str, str],
+) -> dict[str, dict[str, Any]]:
+    """Derive median/best_public outputs from already-completed private evals.
+
+    When every candidate has been evaluated privately, there is no need to run
+    additional private evals for the selected candidate. Instead, select the
+    candidate using the public scores and look up its private result from the
+    all-candidates pool.
+    """
+    results_by_problem = {r["problem_id"]: r for r in all_candidates_results}
+    outputs: dict[str, dict[str, Any]] = {}
+
+    for sel_method in selection_methods:
+        per_problem_results: list[dict[str, Any]] = []
+        for pid in problem_ids:
+            result = results_by_problem.get(pid)
+            public_candidates = public_results_by_problem.get(pid, [])
+            score_type = problem_score_types.get(pid, "minimize")
+
+            if result is None or result.get("error"):
+                per_problem_results.append(
+                    {
+                        "problem_id": pid,
+                        "best_candidate_idx": None,
+                        "error": result.get("error") if result else "missing result",
+                    }
+                )
+                continue
+
+            private_results = result.get("private_results", [])
+            best_idx = _select_best_candidate_index(
+                public_candidates, sel_method, score_type
+            )
+            private_result = next(
+                (r for r in private_results if r.get("idx") == best_idx), None
+            )
+            if private_result is None or "error" in private_result:
+                per_problem_results.append(
+                    {
+                        "problem_id": pid,
+                        "best_candidate_idx": best_idx,
+                        "error": "selected candidate private eval missing",
+                    }
+                )
+                continue
+
+            per_problem_results.append(
+                {
+                    "problem_id": pid,
+                    "best_candidate_idx": best_idx,
+                    "selection_method": sel_method,
+                    "candidates": public_candidates,
+                    "private": {
+                        "absolute_score": private_result["absolute_score"],
+                        "relative_score": private_result["relative_score"],
+                        "judge_result": str(
+                            private_result.get("judge_result", "UNKNOWN")
+                        ),
+                        "rank": int(private_result.get("rank", -1)),
+                        "performance": int(private_result.get("performance", -1)),
+                    },
+                }
+            )
+
+        combined = combine_ale_bench_results(
+            per_problem_results, problem_ids, training_problem_ids
+        )
+        combined["selection_method"] = sel_method
+        outputs[sel_method] = combined
+
+    return outputs
+
+
+def _private_eval_all_candidates_one_problem(
+    problem_id: str,
+    candidate_results: list[dict[str, Any]],
+    lite_version: bool,
+    session_duration_hours: float,
+    ale_bench_num_workers: int,
+    session: Any | None = None,
+    score_type: str | None = None,
+) -> dict[str, Any]:
+    """Run private evaluation on *every* candidate for one problem.
+
+    Returns a dict with per-candidate private results and aggregated statistics.
+    """
+    from ale_bench.session import CodeLanguage
+
+    result: dict[str, Any] = {
+        "problem_id": problem_id,
+        "candidates": candidate_results,
+        "private_results": [],
+        "private_stats": {},
+        "error": None,
+    }
+
+    if not candidate_results:
+        result["error"] = "no candidates"
+        return result
+
+    if score_type is None:
+        score_type = _get_problem_score_type(problem_id, lite_version)
+    result["score_type"] = score_type
+
+    owns_session = session is None
+    try:
+        if session is None:
+            session = _get_ale_bench_session(
+                problem_id=problem_id,
+                lite_version=lite_version,
+                session_duration_hours=session_duration_hours,
+                ale_bench_num_workers=ale_bench_num_workers,
+            )
+        else:
+            logger.info(
+                f"[_private_eval_all_candidates_one_problem][{problem_id}] "
+                f"Reusing provided session"
+            )
+
+        private_results: list[dict[str, Any]] = []
+        for cand in candidate_results:
+            code = cand.get("code", "")
+            try:
+                private_result, rank, performance = session.private_eval(
+                    code=code,
+                    code_language=CodeLanguage.CPP20,
+                )
+                private_results.append(
+                    {
+                        "idx": cand.get("idx", len(private_results)),
+                        "absolute_score": float(
+                            getattr(private_result, "overall_absolute_score", 0.0)
+                        ),
+                        "relative_score": float(
+                            getattr(private_result, "overall_relative_score", 0.0)
+                            or 0.0
+                        ),
+                        "judge_result": str(
+                            getattr(private_result, "overall_judge_result", "UNKNOWN")
+                        ),
+                        "rank": int(rank),
+                        "performance": int(performance),
+                    }
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[_private_eval_all_candidates_one_problem][{problem_id}] "
+                    f"candidate {cand.get('idx', len(private_results))} failed: {e}"
+                )
+                private_results.append(
+                    {
+                        "idx": cand.get("idx", len(private_results)),
+                        "error": f"{type(e).__name__}: {e}",
+                    }
+                )
+
+        result["private_results"] = private_results
+        result["private_stats"] = _compute_private_stats(private_results, score_type)
+        logger.info(
+            f"[_private_eval_all_candidates_one_problem][{problem_id}] done: "
+            f"evaluated {len(private_results)} candidates, "
+            f"best_idx={result['private_stats'].get('best_candidate_idx')}, "
+            f"mean_abs={result['private_stats'].get('absolute_score', {}).get('mean', 0.0):.2f}"
+        )
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+        result["traceback"] = traceback.format_exc()
+        logger.error(
+            f"[_private_eval_all_candidates_one_problem][{problem_id}] failed: {result['error']}"
+        )
+    finally:
+        if owns_session and session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    return result
+
+
+def evaluate_all_candidates_private(
+    problem_ids: list[str],
+    public_results_by_problem: dict[str, list[dict[str, Any]]],
+    lite_version: bool,
+    session_duration_hours: float,
+    ale_bench_num_workers: int,
+    n_parallel_problems: int = 1,
+    problem_sessions: dict[str, Any] | None = None,
+    problem_score_types: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Run private evaluation on every candidate for a subset of problems.
+
+    This mirrors ``evaluate_problem_subset_with_public_scores`` but evaluates
+    all candidates instead of selecting one, and returns per-problem statistics.
+    """
+    logger.info(
+        f"[evaluate_all_candidates_private] Starting private eval for "
+        f"{len(problem_ids)} problems, n_parallel={n_parallel_problems}"
+    )
+
+    problem_sessions = problem_sessions or {}
+    problem_score_types = problem_score_types or {}
+    results_by_problem: dict[str, dict[str, Any]] = {}
+    total = len(problem_ids)
+
+    if n_parallel_problems > 1:
+        with ProcessPoolExecutor(max_workers=n_parallel_problems) as executor:
+            futures = {
+                executor.submit(
+                    _private_eval_all_candidates_one_problem,
+                    problem_id,
+                    public_results_by_problem.get(problem_id, []),
+                    lite_version,
+                    session_duration_hours,
+                    ale_bench_num_workers,
+                    problem_sessions.get(problem_id),
+                    problem_score_types.get(problem_id),
+                ): problem_id
+                for problem_id in problem_ids
+            }
+            completed = 0
+            for future in as_completed(futures):
+                problem_id = futures[future]
+                result = future.result()
+                results_by_problem[problem_id] = result
+                completed += 1
+                stats = result.get("private_stats", {})
+                logger.info(
+                    f"[AllCandidatesPrivate][{completed}/{total}] {problem_id} done: "
+                    f"count={stats.get('count', 0)} "
+                    f"accepted={stats.get('count_accepted', 0)} "
+                    f"mean_abs={stats.get('absolute_score', {}).get('mean', 0.0):.2f}"
+                )
+        logger.info("[evaluate_all_candidates_private] All parallel problems done")
+    else:
+        for idx, problem_id in enumerate(problem_ids, start=1):
+            logger.info(
+                f"[AllCandidatesPrivate][{idx}/{total}] Evaluating problem {problem_id}"
+            )
+            result = _private_eval_all_candidates_one_problem(
+                problem_id,
+                public_results_by_problem.get(problem_id, []),
+                lite_version,
+                session_duration_hours,
+                ale_bench_num_workers,
+                problem_sessions.get(problem_id),
+                problem_score_types.get(problem_id),
+            )
+            results_by_problem[problem_id] = result
+            stats = result.get("private_stats", {})
+            logger.info(
+                f"[AllCandidatesPrivate][{idx}/{total}] {problem_id} done: "
+                f"count={stats.get('count', 0)} "
+                f"accepted={stats.get('count_accepted', 0)} "
+                f"mean_abs={stats.get('absolute_score', {}).get('mean', 0.0):.2f}"
+            )
+        logger.info("[evaluate_all_candidates_private] All problems done")
+
+    # Preserve the caller's problem order.
+    return [results_by_problem[pid] for pid in problem_ids]
+
+
 def combine_ale_bench_results(
     results: Sequence[dict[str, Any]],
     problem_ids: Sequence[str],
