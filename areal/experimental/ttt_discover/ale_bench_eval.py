@@ -84,6 +84,26 @@ def _reset_private_eval_counter(session: Any) -> None:
     )
 
 
+def _judge_result_is_accepted(judge_result: Any) -> bool:
+    """Return True if an ALE-Bench judge result represents ACCEPTED.
+
+    ALE-Bench returns ``JudgeResult`` enum instances.  When stored as strings they
+    may look like ``"ACCEPTED"`` or ``"JudgeResult.ACCEPTED"`` depending on how
+    they were converted.  This helper normalizes all common forms.
+    """
+    if judge_result is None:
+        return False
+    if isinstance(judge_result, str):
+        upper = judge_result.upper()
+        return upper == "ACCEPTED" or upper.endswith(".ACCEPTED")
+    try:
+        from ale_bench.result import JudgeResult
+
+        return judge_result == JudgeResult.ACCEPTED
+    except Exception:
+        return False
+
+
 def _get_problem_score_type(problem_id: str, lite_version: bool) -> str:
     """Load ALE-Bench problem metadata and return its score type.
 
@@ -136,7 +156,7 @@ def _select_best_candidate_index(
         ac = [
             i
             for i, c in enumerate(candidate_results)
-            if str(c.get("public", {}).get("judge_result", "")).upper() == "ACCEPTED"
+            if _judge_result_is_accepted(c.get("public", {}).get("judge_result"))
         ]
         return ac if ac else None
 
@@ -914,7 +934,7 @@ def _compute_private_stats(
     successful = [r for r in private_results if "error" not in r]
     count = len(private_results)
     count_accepted = sum(
-        1 for r in successful if str(r.get("judge_result", "")).upper() == "ACCEPTED"
+        1 for r in successful if _judge_result_is_accepted(r.get("judge_result"))
     )
     stats: dict[str, Any] = {
         "count": count,

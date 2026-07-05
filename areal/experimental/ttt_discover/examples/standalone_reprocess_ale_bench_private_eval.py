@@ -89,9 +89,24 @@ def _case_absolute_score(case: Any) -> float:
 
 
 def _is_accepted(candidate: dict[str, Any]) -> bool:
-    """Return True if the candidate's public judge result is ACCEPTED."""
+    """Return True if the candidate's public judge result is ACCEPTED.
+
+    ALE-Bench returns ``JudgeResult`` enum instances. When stored as strings they
+    may look like ``"ACCEPTED"`` or ``"JudgeResult.ACCEPTED"`` depending on how
+    they were converted, so we normalise both forms.
+    """
     judge_result = candidate.get("public", {}).get("judge_result")
-    return str(judge_result).upper() == "ACCEPTED"
+    if judge_result is None:
+        return False
+    if isinstance(judge_result, str):
+        upper = judge_result.upper()
+        return upper == "ACCEPTED" or upper.endswith(".ACCEPTED")
+    try:
+        from ale_bench.result import JudgeResult
+
+        return judge_result == JudgeResult.ACCEPTED
+    except Exception:
+        return False
 
 
 def _select_best_candidate_index(
