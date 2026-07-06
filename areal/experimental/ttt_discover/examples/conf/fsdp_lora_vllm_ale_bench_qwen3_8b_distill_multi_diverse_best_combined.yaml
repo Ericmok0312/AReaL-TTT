@@ -4,8 +4,8 @@ trial_name: trial0
 is_tttd_config: true
 seed: 1
 enable_offload: false
-max_steps: 20
-total_train_epochs: 20
+max_steps: 50
+total_train_epochs: 50
 enable_thinking: true
 reset_puct_stats_on_resume: false
 student_sampler_inherit_teacher_pool: false
@@ -29,7 +29,7 @@ ale_bench_eval_n_parallel_problems: 10
 # Multi-teacher hint selection: combined hint with k diverse best references per problem.
 # With hint_fixed=true the same references are reused across all training steps.
 multi_teacher_hint_mode: "diverse_best_combined"
-multi_teacher_hint_k: 2
+multi_teacher_hint_k: 1
 multi_teacher_hint_fixed: true
 
 # One entry per trained ALE-Bench problem.  The trainer builds a mixed batch with
