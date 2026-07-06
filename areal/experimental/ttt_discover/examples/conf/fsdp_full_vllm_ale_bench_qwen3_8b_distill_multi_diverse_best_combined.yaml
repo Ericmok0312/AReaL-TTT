@@ -15,7 +15,7 @@ privileged_prompt_mode: hint
 use_breakthrough_opd: false
 distill_from_scratch: true
 run_eval_step: false
-total_rollouts_per_step: 32
+total_rollouts_per_step: 256
 
 # ALE-Bench full-corpus evaluation (public->private, median selection)
 ale_bench_eval_enabled: false
@@ -172,7 +172,7 @@ rollout:
   backend: vllm:d4p1t1
 
 gconfig:
-  n_samples: 4
+  n_samples: 32
   min_new_tokens: 0
   max_new_tokens: 32768
   max_tokens: 32768
