@@ -29,6 +29,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal import PPOTrainer
@@ -1925,6 +1926,54 @@ class TTTDDistillTrainer(PPOTrainer):
             self._multi_teacher_fixed_hints[problem_id] = result
         return result
 
+    def _sample_hint_for_problem_synced(
+        self,
+        problem_id: str,
+        teacher_sampler,
+        teacher_dp_group: dist.ProcessGroup | None,
+        teacher_dp_rank: int,
+        teacher_dp_world_size: int,
+    ) -> tuple[str, str] | None:
+        """Sample a hint on teacher DP rank 0 and broadcast it to all ranks.
+
+        Teacher logp for each problem must use the same privileged hint on every
+        teacher DP rank; otherwise the KL target would be inconsistent across the
+        rollout batch after we redistribute results.  This helper samples once on
+        rank 0 and broadcasts the (hint_type, hint_text) pair.
+        """
+        if teacher_dp_world_size <= 1:
+            return self._sample_hint_for_problem(problem_id, teacher_sampler)
+
+        if teacher_dp_rank == 0:
+            hint_result = self._sample_hint_for_problem(problem_id, teacher_sampler)
+            if hint_result is None:
+                package = ("__NONE__", "")
+            else:
+                package = hint_result
+        else:
+            package = ("__NONE__", "")
+
+        package_list = [package]
+        dist.broadcast_object_list(package_list, src=0, group=teacher_dp_group)
+        hint_type, hint_text = package_list[0]
+
+        if hint_type == "__NONE__":
+            hint_result = None
+        else:
+            hint_result = (hint_type, hint_text)
+
+        # Keep fixed-hint cache consistent across ranks.
+        fixed = getattr(self.config, "multi_teacher_hint_fixed", False)
+        if fixed:
+            self._multi_teacher_fixed_hints[problem_id] = hint_result
+
+        # Advance counter consistently when a real hint was sampled.
+        if hint_result is not None:
+            counter = self._multi_teacher_hint_counters.get(problem_id, 0)
+            self._multi_teacher_hint_counters[problem_id] = counter + 1
+
+        return hint_result
+
     def _compute_privileged_teacher_logp(
         self, rollout_batch: dict[str, Any]
     ) -> torch.Tensor:
@@ -2218,12 +2267,15 @@ class TTTDDistillTrainer(PPOTrainer):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute per-problem teacher logp for multi-teacher distillation.
 
-        Each problem's rollouts are identified by ``_problem_ids``.  For every
-        problem we (1) load that problem's teacher LoRA adapter into the shared
-        teacher engine, (2) sample a privileged hint from that problem's
-        PUCTSampler, (3) build teacher prompts from the student prompts + hint,
-        and (4) align the resulting completion logps back to the student
-        sequence positions.
+        Rollout data is all-gathered across teacher DP ranks so that every problem
+        has its full ``n_samples`` rollouts visible on every rank.  Each teacher DP
+        rank then computes teacher logp for a disjoint slice of each problem's
+        rollouts (``k / n`` rollouts per rank).  This keeps the collective
+        :meth:`teacher.compute_logp` calls balanced without dummy batches, while
+        still loading the same LoRA adapter on all ranks at each step.
+
+        Results are all-reduced back so every rank recovers the full teacher_logp
+        tensor for its original local rollouts.
         """
         input_ids = rollout_batch["input_ids"]
         attention_mask = rollout_batch["attention_mask"]
@@ -2245,96 +2297,217 @@ class TTTDDistillTrainer(PPOTrainer):
                 problem_keys[(i // group_size) % len(problem_keys)]
                 for i in range(batch_size)
             ]
+            student_prompts = [""] * batch_size
 
-        # Group rollout indices by problem while preserving original order
-        problem_to_indices: dict[str, list[int]] = {}
+        # Group local rollout indices by problem while preserving original order
+        local_problem_to_indices: dict[str, list[int]] = {}
         for idx, pid in enumerate(problem_ids):
-            problem_to_indices.setdefault(pid, []).append(idx)
-
-        # Log local problem distribution so we can verify correctness across ranks.
-        logger.info(
-            f"[MultiTeacher-Logp] rank={self.actor.rank} "
-            f"dp_rank={self.actor.data_parallel_rank}/"
-            f"{self.actor.data_parallel_world_size} "
-            f"local_batch_size={batch_size} "
-            f"problems_seen={list(problem_to_indices.keys())} "
-            f"rollouts_per_problem="
-            f"{ {pid: len(idxs) for pid, idxs in problem_to_indices.items()} }"
-        )
-
-        prompt_lens = (attention_mask & (loss_mask == 0)).sum(dim=1).cpu().numpy()
-        comp_lens = loss_mask.sum(dim=1).cpu().numpy()
-
-        aligned_teacher_logp = torch.zeros(
-            (batch_size, student_seqlen), dtype=torch.float32, device=device
-        )
-
-        # Buffers for the privileged teacher inputs (used by dynamic metrics)
-        teacher_input_ids_rows: dict[int, torch.Tensor] = {}
-        teacher_attention_mask_rows: dict[int, torch.Tensor] = {}
-        teacher_loss_mask_rows: dict[int, torch.Tensor] = {}
-        global_max_teacher_len = 0
+            local_problem_to_indices.setdefault(pid, []).append(idx)
 
         enable_thinking = getattr(self.config, "enable_thinking", False)
         pad_id = self.tokenizer.pad_token_id or 0
 
-        # Synchronize the problem set across teacher DP ranks so every rank
-        # iterates over the same problems and loads the same LoRA adapter at
-        # each step. _load_peft_lora_adapter uses a collective
-        # broadcast_from_rank0, so all ranks must load the same adapter.
-        local_problem_list = sorted(problem_to_indices.keys())
         teacher_dp_group = getattr(self.teacher, "data_parallel_group", None)
-        if (
-            teacher_dp_group is not None
-            and dist.is_initialized()
-            and dist.get_world_size(teacher_dp_group) > 1
-        ):
-            gathered_problems = [None] * dist.get_world_size(teacher_dp_group)
-            dist.all_gather_object(
-                gathered_problems, local_problem_list, group=teacher_dp_group
+        teacher_dp_world_size = (
+            dist.get_world_size(teacher_dp_group)
+            if teacher_dp_group is not None and dist.is_initialized()
+            else 1
+        )
+        teacher_dp_rank = (
+            dist.get_rank(teacher_dp_group)
+            if teacher_dp_group is not None and dist.is_initialized()
+            else 0
+        )
+
+        # ===================================================================
+        # Step 1: All-gather rollout tensors and metadata across teacher DP ranks
+        # ===================================================================
+        if teacher_dp_world_size > 1:
+            local_max_len = int(input_ids.shape[1])
+            global_max_len_tensor = torch.tensor(
+                local_max_len, dtype=torch.int64, device=device
             )
-            global_problem_ids = sorted(
-                {pid for lst in gathered_problems if lst for pid in lst}
+            dist.all_reduce(
+                global_max_len_tensor, op=dist.ReduceOp.MAX, group=teacher_dp_group
+            )
+            global_max_len = int(global_max_len_tensor.item())
+
+            if input_ids.shape[1] < global_max_len:
+                input_ids_padded = F.pad(
+                    input_ids, (0, global_max_len - input_ids.shape[1]), value=pad_id
+                )
+                attention_mask_padded = F.pad(
+                    attention_mask,
+                    (0, global_max_len - attention_mask.shape[1]),
+                    value=False,
+                )
+                loss_mask_padded = F.pad(
+                    loss_mask, (0, global_max_len - loss_mask.shape[1]), value=0
+                )
+            else:
+                input_ids_padded = input_ids
+                attention_mask_padded = attention_mask
+                loss_mask_padded = loss_mask
+
+            gathered_input_ids = [
+                torch.empty_like(input_ids_padded)
+                for _ in range(teacher_dp_world_size)
+            ]
+            gathered_attention_mask = [
+                torch.empty_like(attention_mask_padded)
+                for _ in range(teacher_dp_world_size)
+            ]
+            gathered_loss_mask = [
+                torch.empty_like(loss_mask_padded)
+                for _ in range(teacher_dp_world_size)
+            ]
+            dist.all_gather(gathered_input_ids, input_ids_padded, group=teacher_dp_group)
+            dist.all_gather(
+                gathered_attention_mask, attention_mask_padded, group=teacher_dp_group
+            )
+            dist.all_gather(
+                gathered_loss_mask, loss_mask_padded, group=teacher_dp_group
+            )
+
+            global_input_ids = torch.cat(gathered_input_ids, dim=0)
+            global_attention_mask = torch.cat(gathered_attention_mask, dim=0)
+            global_loss_mask = torch.cat(gathered_loss_mask, dim=0)
+
+            del gathered_input_ids, gathered_attention_mask, gathered_loss_mask
+
+            local_metadata = {
+                "problem_ids": problem_ids,
+                "student_prompts": student_prompts,
+                "batch_size": batch_size,
+            }
+            all_metadata = [None] * teacher_dp_world_size
+            dist.all_gather_object(
+                all_metadata, local_metadata, group=teacher_dp_group
             )
         else:
-            global_problem_ids = local_problem_list
+            global_max_len = int(input_ids.shape[1])
+            global_input_ids = input_ids
+            global_attention_mask = attention_mask
+            global_loss_mask = loss_mask
+            all_metadata = [
+                {
+                    "problem_ids": problem_ids,
+                    "student_prompts": student_prompts,
+                    "batch_size": batch_size,
+                }
+            ]
+
+        # Reconstruct global metadata with deterministic ordering.
+        global_problem_ids_list: list[str] = []
+        global_student_prompts: list[str] = []
+        global_batch_sizes: list[int] = []
+        for meta in all_metadata:
+            if meta is None:
+                meta = {"problem_ids": [], "student_prompts": [], "batch_size": 0}
+            global_problem_ids_list.extend(meta["problem_ids"])
+            global_student_prompts.extend(meta["student_prompts"])
+            global_batch_sizes.append(meta["batch_size"])
+
+        global_batch_size = sum(global_batch_sizes)
+        assert global_input_ids.shape[0] == global_batch_size, (
+            f"[MultiTeacher-Logp] rank={self.actor.rank} gathered tensor batch dim "
+            f"({global_input_ids.shape[0]}) != metadata batch size ({global_batch_size})"
+        )
+
+        # Map global index -> problem_id and problem_id -> list of global indices.
+        global_problem_to_indices: dict[str, list[int]] = {}
+        offset = 0
+        for r, bs in enumerate(global_batch_sizes):
+            for local_idx in range(bs):
+                global_idx = offset + local_idx
+                pid = global_problem_ids_list[global_idx]
+                global_problem_to_indices.setdefault(pid, []).append(global_idx)
+            offset += bs
+
+        global_problem_ids = sorted(global_problem_to_indices.keys())
+        problem_id_to_idx: dict[str, int] = {
+            pid: i for i, pid in enumerate(global_problem_ids)
+        }
+
+        n_samples = self.config.gconfig.n_samples
+        for pid, idxs in global_problem_to_indices.items():
+            if len(idxs) % n_samples != 0:
+                logger.warning(
+                    f"[MultiTeacher-Logp] Problem {pid} has {len(idxs)} rollouts, "
+                    f"not divisible by n_samples={n_samples}"
+                )
 
         logger.info(
             f"[MultiTeacher-Logp] rank={self.actor.rank} "
-            f"global_problems={global_problem_ids} "
-            f"local_problems={local_problem_list}"
+            f"teacher_dp_rank={teacher_dp_rank}/{teacher_dp_world_size} "
+            f"local_batch_size={batch_size} global_batch_size={global_batch_size} "
+            f"global_max_len={global_max_len} n_problems={len(global_problem_ids)} "
+            f"local_problems={sorted(local_problem_to_indices.keys())} "
+            f"problem_distribution="
+            f"{ {pid: len(idxs) for pid, idxs in global_problem_to_indices.items()} }"
         )
 
+        prompt_lens = (
+            (global_attention_mask & (global_loss_mask == 0))
+            .sum(dim=1)
+            .cpu()
+            .numpy()
+        )
+        comp_lens = global_loss_mask.sum(dim=1).cpu().numpy()
+
+        aligned_teacher_logp_global = torch.zeros(
+            (global_batch_size, global_max_len), dtype=torch.float32, device=device
+        )
+        # Tracks which problem's adapter was used to compute each global row.
+        # Used after all-reduce to verify no cross-problem contamination.
+        teacher_problem_idx_global = torch.full(
+            (global_batch_size,), -1, dtype=torch.int64, device=device
+        )
+        teacher_input_ids_rows: dict[int, torch.Tensor] = {}
+        teacher_attention_mask_rows: dict[int, torch.Tensor] = {}
+        teacher_loss_mask_rows: dict[int, torch.Tensor] = {}
+        local_max_teacher_len = 0
+
+        # ===================================================================
+        # Step 2: Every rank loads the same adapter and computes a disjoint slice
+        # ===================================================================
         for problem_id in global_problem_ids:
             if problem_id not in self.teacher_samplers:
                 raise ValueError(
                     f"[MultiTeacher-Logp] Unknown problem_id in rollout batch: {problem_id}"
                 )
 
-            indices = problem_to_indices.get(problem_id, [])
+            all_indices = global_problem_to_indices[problem_id]
+            k = len(all_indices)
+            if k < teacher_dp_world_size:
+                raise RuntimeError(
+                    f"[MultiTeacher-Logp] Problem {problem_id} has {k} rollouts, "
+                    f"less than teacher DP world size {teacher_dp_world_size}. "
+                    f"Cannot distribute rollouts across ranks."
+                )
+
+            chunk_size = (k + teacher_dp_world_size - 1) // teacher_dp_world_size
+            start = min(teacher_dp_rank * chunk_size, k)
+            end = min(start + chunk_size, k)
+            rank_indices = all_indices[start:end]
 
             lora_path = self.teacher_lora_paths[problem_id]
             teacher_sampler = self.teacher_samplers[problem_id]
 
             logger.info(
                 f"[MultiTeacher-Logp] rank={self.actor.rank} "
-                f"problem={problem_id} local_rollouts={len(indices)} "
-                f"adapter={lora_path}"
+                f"problem={problem_id} total_rollouts={k} "
+                f"slice=[{start}:{end}] adapter={lora_path}"
             )
 
             # Load problem-specific teacher LoRA (collective across teacher ranks)
             self._load_peft_lora_adapter(self.teacher, lora_path)
 
-            # Ranks that do not have rollouts for this problem still need to
-            # participate in the teacher compute_logp collective.
-            if not indices:
-                # The microbatch splitter requires at least n_mbs rows (and at
-                # least 2 rows). Use the teacher's DP size to be safe.
-                n_dummy = max(
-                    2,
-                    getattr(self.config.teacher.mb_spec, "n_mbs", 2),
-                    self.teacher.data_parallel_world_size,
-                )
+            if not rank_indices:
+                # All ranks must call compute_logp with the same adapter; use a
+                # tiny dummy batch.  This path is only reached when k is not
+                # evenly divisible by teacher_dp_world_size.
+                n_dummy = max(2, getattr(self.config.teacher.mb_spec, "n_mbs", 2))
                 dummy_input_ids = torch.full(
                     (n_dummy, 1), pad_id, dtype=torch.int32, device=device
                 )
@@ -2356,32 +2529,38 @@ class TTTDDistillTrainer(PPOTrainer):
                     )
                 continue
 
-            # Sample a privileged hint for this problem
-            hint_result = self._sample_hint_for_problem(problem_id, teacher_sampler)
+            hint_result = self._sample_hint_for_problem_synced(
+                problem_id,
+                teacher_sampler,
+                teacher_dp_group,
+                teacher_dp_rank,
+                teacher_dp_world_size,
+            )
             hint_type = hint_result[0] if hint_result else "none"
             hint_text = hint_result[1] if hint_result else ""
 
             logger.info(
-                f"[MultiTeacher-Logp] problem={problem_id} rollouts={len(indices)} "
-                f"hint_type={hint_type} lora={lora_path}"
+                f"[MultiTeacher-Logp] problem={problem_id} "
+                f"slice_rollouts={len(rank_indices)} hint_type={hint_type}"
             )
 
-            # Build teacher sequences for every rollout of this problem
             problem_teacher_seqs: list[torch.Tensor] = []
             problem_teacher_loss_masks: list[torch.Tensor] = []
             problem_teacher_prompt_lens: list[int] = []
             problem_comp_lens: list[int] = []
+            problem_student_prompt_lens: list[int] = []
 
-            for idx in indices:
-                prompt_len = int(prompt_lens[idx])
-                comp_len = int(comp_lens[idx])
-                student_comp = (
-                    input_ids[idx, prompt_len : prompt_len + comp_len].cpu().tolist()
-                )
+            for global_idx in rank_indices:
+                prompt_len = int(prompt_lens[global_idx])
+                comp_len = int(comp_lens[global_idx])
+                student_comp = global_input_ids[
+                    global_idx, prompt_len : prompt_len + comp_len
+                ].cpu().tolist()
 
                 student_prompt = (
-                    student_prompts[idx]
-                    if idx < len(student_prompts) and student_prompts[idx]
+                    global_student_prompts[global_idx]
+                    if global_idx < len(global_student_prompts)
+                    and global_student_prompts[global_idx]
                     else ""
                 )
                 teacher_prompt = student_prompt + hint_text
@@ -2397,9 +2576,7 @@ class TTTDDistillTrainer(PPOTrainer):
                 )
 
                 teacher_seq = teacher_prompt_ids + student_comp
-                problem_teacher_seqs.append(
-                    torch.tensor(teacher_seq, dtype=torch.int32)
-                )
+                problem_teacher_seqs.append(torch.tensor(teacher_seq, dtype=torch.int32))
                 problem_teacher_loss_masks.append(
                     torch.tensor(
                         [0] * len(teacher_prompt_ids) + [1] * comp_len,
@@ -2408,27 +2585,23 @@ class TTTDDistillTrainer(PPOTrainer):
                 )
                 problem_teacher_prompt_lens.append(len(teacher_prompt_ids))
                 problem_comp_lens.append(comp_len)
+                problem_student_prompt_lens.append(prompt_len)
 
-            # Empty indices are handled above; this rank must have real
-            # teacher sequences if we reach here.
             assert problem_teacher_seqs, (
                 f"[MultiTeacher-Logp] rank={self.actor.rank} problem={problem_id} "
-                "has indices but no teacher sequences built"
+                "has slice but no teacher sequences built"
             )
 
-            # Pad problem batch to its own max length
             problem_max_len = max(len(seq) for seq in problem_teacher_seqs)
             problem_input_ids = torch.stack(
                 [
-                    torch.nn.functional.pad(
-                        seq, (0, problem_max_len - len(seq)), value=pad_id
-                    )
+                    F.pad(seq, (0, problem_max_len - len(seq)), value=pad_id)
                     for seq in problem_teacher_seqs
                 ]
             )
             problem_attention_mask = torch.stack(
                 [
-                    torch.nn.functional.pad(
+                    F.pad(
                         torch.ones(len(seq), dtype=torch.bool),
                         (0, problem_max_len - len(seq)),
                         value=False,
@@ -2438,9 +2611,7 @@ class TTTDDistillTrainer(PPOTrainer):
             )
             problem_loss_mask = torch.stack(
                 [
-                    torch.nn.functional.pad(
-                        mask, (0, problem_max_len - len(mask)), value=0
-                    )
+                    F.pad(mask, (0, problem_max_len - len(mask)), value=0)
                     for mask in problem_teacher_loss_masks
                 ]
             )
@@ -2455,71 +2626,161 @@ class TTTDDistillTrainer(PPOTrainer):
                 teacher_logps_list = self.teacher.compute_logp([problem_batch])
             teacher_logps_full = teacher_logps_list[0]
 
-            # Align logps back to the original rollout positions
-            problem_student_prompt_lens = [int(prompt_lens[idx]) for idx in indices]
             problem_aligned = align_teacher_completion_logps(
                 teacher_logps_full,
                 problem_teacher_prompt_lens,
                 problem_student_prompt_lens,
                 problem_comp_lens,
-                student_seqlen,
+                global_max_len,
             )
-            for j, idx in enumerate(indices):
-                aligned_teacher_logp[idx] = problem_aligned[j]
+            problem_idx = problem_id_to_idx[problem_id]
+            for j, global_idx in enumerate(rank_indices):
+                aligned_teacher_logp_global[global_idx] = problem_aligned[j]
+                teacher_problem_idx_global[global_idx] = problem_idx
 
-                # Store privileged teacher inputs for dynamic metrics
-                teacher_input_ids_rows[idx] = problem_input_ids[j]
-                teacher_attention_mask_rows[idx] = problem_attention_mask[j]
-                teacher_loss_mask_rows[idx] = problem_loss_mask[j]
-                global_max_teacher_len = max(global_max_teacher_len, problem_max_len)
+                teacher_input_ids_rows[global_idx] = problem_input_ids[j]
+                teacher_attention_mask_rows[global_idx] = problem_attention_mask[j]
+                teacher_loss_mask_rows[global_idx] = problem_loss_mask[j]
+                local_max_teacher_len = max(local_max_teacher_len, problem_max_len)
 
-        # Stack privileged teacher inputs, padding each row to global max length
-        if global_max_teacher_len > 0:
-            teacher_input_ids = torch.stack(
-                [
-                    torch.nn.functional.pad(
-                        teacher_input_ids_rows[i],
-                        (0, global_max_teacher_len - len(teacher_input_ids_rows[i])),
-                        value=pad_id,
-                    )
-                    for i in range(batch_size)
-                ]
+        # ===================================================================
+        # Step 3: All-reduce results so every rank sees the full global tensor
+        # ===================================================================
+        if teacher_dp_world_size > 1:
+            dist.all_reduce(
+                aligned_teacher_logp_global,
+                op=dist.ReduceOp.SUM,
+                group=teacher_dp_group,
             )
-            teacher_attention_mask = torch.stack(
-                [
-                    torch.nn.functional.pad(
-                        teacher_attention_mask_rows[i],
-                        (
-                            0,
-                            global_max_teacher_len
-                            - len(teacher_attention_mask_rows[i]),
-                        ),
-                        value=False,
-                    )
-                    for i in range(batch_size)
-                ]
+            dist.all_reduce(
+                teacher_problem_idx_global,
+                op=dist.ReduceOp.MAX,
+                group=teacher_dp_group,
             )
-            teacher_loss_mask = torch.stack(
-                [
-                    torch.nn.functional.pad(
-                        teacher_loss_mask_rows[i],
-                        (0, global_max_teacher_len - len(teacher_loss_mask_rows[i])),
-                        value=0,
-                    )
-                    for i in range(batch_size)
-                ]
+
+            local_max_teacher_len_tensor = torch.tensor(
+                local_max_teacher_len, dtype=torch.int64, device=device
             )
+            dist.all_reduce(
+                local_max_teacher_len_tensor,
+                op=dist.ReduceOp.MAX,
+                group=teacher_dp_group,
+            )
+            global_max_teacher_len = int(local_max_teacher_len_tensor.item())
         else:
-            teacher_input_ids = torch.empty((batch_size, 0), dtype=torch.int32)
-            teacher_attention_mask = torch.empty((batch_size, 0), dtype=torch.bool)
-            teacher_loss_mask = torch.empty((batch_size, 0), dtype=torch.int32)
+            global_max_teacher_len = local_max_teacher_len
 
-        # Sanity check: teacher logp tensor should match the student rollout rows.
+        if global_max_teacher_len > 0:
+            teacher_input_ids_global = torch.full(
+                (global_batch_size, global_max_teacher_len),
+                pad_id,
+                dtype=torch.int32,
+                device=device,
+            )
+            teacher_attention_mask_global = torch.zeros(
+                (global_batch_size, global_max_teacher_len),
+                dtype=torch.bool,
+                device=device,
+            )
+            teacher_loss_mask_global = torch.zeros(
+                (global_batch_size, global_max_teacher_len),
+                dtype=torch.int32,
+                device=device,
+            )
+
+            for global_idx, ids in teacher_input_ids_rows.items():
+                teacher_input_ids_global[global_idx, : len(ids)] = ids
+            for global_idx, mask in teacher_attention_mask_rows.items():
+                teacher_attention_mask_global[global_idx, : len(mask)] = mask
+            for global_idx, mask in teacher_loss_mask_rows.items():
+                teacher_loss_mask_global[global_idx, : len(mask)] = mask
+
+            if teacher_dp_world_size > 1:
+                dist.all_reduce(
+                    teacher_input_ids_global,
+                    op=dist.ReduceOp.SUM,
+                    group=teacher_dp_group,
+                )
+                dist.all_reduce(
+                    teacher_attention_mask_global,
+                    op=dist.ReduceOp.SUM,
+                    group=teacher_dp_group,
+                )
+                dist.all_reduce(
+                    teacher_loss_mask_global,
+                    op=dist.ReduceOp.SUM,
+                    group=teacher_dp_group,
+                )
+        else:
+            teacher_input_ids_global = torch.empty(
+                (global_batch_size, 0), dtype=torch.int32, device=device
+            )
+            teacher_attention_mask_global = torch.empty(
+                (global_batch_size, 0), dtype=torch.bool, device=device
+            )
+            teacher_loss_mask_global = torch.empty(
+                (global_batch_size, 0), dtype=torch.int32, device=device
+            )
+
+        # Extract this rank's original local portion.
+        local_start = sum(global_batch_sizes[:teacher_dp_rank])
+        local_end = local_start + batch_size
+
+        aligned_teacher_logp = aligned_teacher_logp_global[
+            local_start:local_end, :student_seqlen
+        ]
+        teacher_input_ids = teacher_input_ids_global[local_start:local_end]
+        teacher_attention_mask = teacher_attention_mask_global[local_start:local_end]
+        teacher_loss_mask = teacher_loss_mask_global[local_start:local_end]
+
+        # Sanity assertions
+        assert aligned_teacher_logp.shape[0] == batch_size, (
+            f"[MultiTeacher-Logp] rank={self.actor.rank} returned teacher_logp batch dim "
+            f"({aligned_teacher_logp.shape[0]}) != local batch size ({batch_size})"
+        )
+        assert aligned_teacher_logp.shape[1] == student_seqlen, (
+            f"[MultiTeacher-Logp] rank={self.actor.rank} returned teacher_logp seq dim "
+            f"({aligned_teacher_logp.shape[1]}) != local student_seqlen ({student_seqlen})"
+        )
+        # Verify each returned row was computed with the correct problem's adapter.
+        local_problem_idx_expected = torch.tensor(
+            [problem_id_to_idx[pid] for pid in problem_ids],
+            dtype=torch.int64,
+            device=device,
+        )
+        local_problem_idx_actual = teacher_problem_idx_global[local_start:local_end]
+        problem_mismatch = (
+            local_problem_idx_actual != local_problem_idx_expected
+        ).nonzero(as_tuple=True)[0]
+        if problem_mismatch.numel() > 0:
+            mismatch_global_indices = (local_start + problem_mismatch).tolist()
+            mismatch_problem_ids = [
+                global_problem_ids_list[g] for g in mismatch_global_indices
+            ]
+            mismatch_actual = local_problem_idx_actual[problem_mismatch].tolist()
+            raise RuntimeError(
+                f"[MultiTeacher-Logp] rank={self.actor.rank} detected "
+                f"{problem_mismatch.numel()} rollout(s) whose teacher_logp was "
+                f"computed with the wrong problem adapter. "
+                f"global_indices={mismatch_global_indices}, "
+                f"expected_problem_ids={mismatch_problem_ids}, "
+                f"actual_problem_indices={mismatch_actual}"
+            )
+
+        # Verify every rollout with a non-zero completion got teacher logps.
+        local_comp_lens = comp_lens[local_start:local_end]
+        expected_non_zero = int((local_comp_lens > 0).sum())
+        non_zero_count = (aligned_teacher_logp.abs().sum(dim=1) > 0).sum().item()
+        assert non_zero_count == expected_non_zero, (
+            f"[MultiTeacher-Logp] rank={self.actor.rank} only {non_zero_count}/"
+            f"{expected_non_zero} rollouts with completion have non-zero teacher_logp"
+        )
+
         logger.info(
-            f"[MultiTeacher-Logp] rank={self.actor.rank} "
+            f"[MultiTeacher-Logp] rank={self.actor.rank} done. "
             f"aligned_teacher_logp_shape={list(aligned_teacher_logp.shape)} "
-            f"student_input_ids_shape={list(input_ids.shape)} "
-            f"problems_processed={list(problem_to_indices.keys())}"
+            f"teacher_input_ids_shape={list(teacher_input_ids.shape)} "
+            f"problems_processed={global_problem_ids}"
         )
 
         return (
@@ -2528,7 +2789,6 @@ class TTTDDistillTrainer(PPOTrainer):
             teacher_attention_mask,
             teacher_loss_mask,
         )
-
     def _generate_ale_bench_eval_candidates(
         self, global_step: int
     ) -> tuple[dict[str, list[str]], dict[str, list[dict[str, Any]]]]:
