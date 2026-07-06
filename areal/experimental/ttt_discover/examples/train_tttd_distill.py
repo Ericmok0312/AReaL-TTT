@@ -2278,11 +2278,40 @@ class TTTDDistillTrainer(PPOTrainer):
         enable_thinking = getattr(self.config, "enable_thinking", False)
         pad_id = self.tokenizer.pad_token_id or 0
 
-        for problem_id, indices in problem_to_indices.items():
+        # Synchronize the problem set across teacher DP ranks so every rank
+        # iterates over the same problems and loads the same LoRA adapter at
+        # each step. _load_peft_lora_adapter uses a collective
+        # broadcast_from_rank0, so all ranks must load the same adapter.
+        local_problem_list = sorted(problem_to_indices.keys())
+        teacher_dp_group = getattr(self.teacher, "data_parallel_group", None)
+        if (
+            teacher_dp_group is not None
+            and dist.is_initialized()
+            and dist.get_world_size(teacher_dp_group) > 1
+        ):
+            gathered_problems = [None] * dist.get_world_size(teacher_dp_group)
+            dist.all_gather_object(
+                gathered_problems, local_problem_list, group=teacher_dp_group
+            )
+            global_problem_ids = sorted(
+                {pid for lst in gathered_problems if lst for pid in lst}
+            )
+        else:
+            global_problem_ids = local_problem_list
+
+        logger.info(
+            f"[MultiTeacher-Logp] rank={self.actor.rank} "
+            f"global_problems={global_problem_ids} "
+            f"local_problems={local_problem_list}"
+        )
+
+        for problem_id in global_problem_ids:
             if problem_id not in self.teacher_samplers:
                 raise ValueError(
                     f"[MultiTeacher-Logp] Unknown problem_id in rollout batch: {problem_id}"
                 )
+
+            indices = problem_to_indices.get(problem_id, [])
 
             lora_path = self.teacher_lora_paths[problem_id]
             teacher_sampler = self.teacher_samplers[problem_id]
@@ -2293,8 +2322,32 @@ class TTTDDistillTrainer(PPOTrainer):
                 f"adapter={lora_path}"
             )
 
-            # Load problem-specific teacher LoRA
+            # Load problem-specific teacher LoRA (collective across teacher ranks)
             self._load_peft_lora_adapter(self.teacher, lora_path)
+
+            # Ranks that do not have rollouts for this problem still need to
+            # participate in the teacher compute_logp collective.
+            if not indices:
+                dummy_input_ids = torch.full(
+                    (1, 1), pad_id, dtype=torch.int32, device=device
+                )
+                dummy_attention_mask = torch.zeros(
+                    (1, 1), dtype=torch.bool, device=device
+                )
+                dummy_loss_mask = torch.zeros(
+                    (1, 1), dtype=torch.int32, device=device
+                )
+                with torch.no_grad():
+                    _ = self.teacher.compute_logp(
+                        [
+                            {
+                                "input_ids": dummy_input_ids,
+                                "attention_mask": dummy_attention_mask,
+                                "loss_mask": dummy_loss_mask,
+                            }
+                        ]
+                    )
+                continue
 
             # Sample a privileged hint for this problem
             hint_result = self._sample_hint_for_problem(problem_id, teacher_sampler)
@@ -2349,8 +2402,12 @@ class TTTDDistillTrainer(PPOTrainer):
                 problem_teacher_prompt_lens.append(len(teacher_prompt_ids))
                 problem_comp_lens.append(comp_len)
 
-            if not problem_teacher_seqs:
-                continue
+            # Empty indices are handled above; this rank must have real
+            # teacher sequences if we reach here.
+            assert problem_teacher_seqs, (
+                f"[MultiTeacher-Logp] rank={self.actor.rank} problem={problem_id} "
+                "has indices but no teacher sequences built"
+            )
 
             # Pad problem batch to its own max length
             problem_max_len = max(len(seq) for seq in problem_teacher_seqs)
