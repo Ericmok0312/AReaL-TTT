@@ -101,7 +101,7 @@ actor:
     mem: 32
     cmd: python3 -m areal.infra.rpc.rpc_server
     env_vars: {}
-  backend: fsdp:d1p1t1
+  backend: fsdp:d4p1t1
   init_from_scratch: false
   disable_dropout: true
   gradient_checkpointing: true
@@ -154,7 +154,7 @@ cluster:
     type: nfs
     nfs_record_root: /tmp/areal/name_resolve
 
-allocation_mode: vllm[rollout]:d7p1t1+fsdp[actor]:d1p1t1
+allocation_mode: vllm[rollout]:d4p1t1+fsdp[actor]:d4p1t1
 
 scheduler:
   type: null
@@ -173,7 +173,7 @@ rollout:
   tokenizer_path: ${tokenizer_path}
   dump_to_file: true
   use_lora: ${actor.use_lora}
-  backend: vllm:d7p1t1
+  backend: vllm:d4p1t1
 
 gconfig:
   n_samples: 32
