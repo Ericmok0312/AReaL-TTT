@@ -207,6 +207,7 @@ class TTTDDistillTrainer(PPOTrainer):
         self.teacher_lora_paths: dict[str, str] = {}
         self.student_samplers: dict[str, StateSampler] = {}
         self._multi_teacher_hint_counters: dict[str, int] = {}
+        self._multi_teacher_fixed_hints: dict[str, tuple[str, str] | None] = {}
 
         # ALE-Bench full-corpus evaluation state
         self._ale_bench_eval_enabled = getattr(config, "ale_bench_eval_enabled", False)
@@ -1853,13 +1854,25 @@ class TTTDDistillTrainer(PPOTrainer):
         problem_id: str,
         teacher_sampler,
     ) -> tuple[str, str] | None:
-        """Return (hint_type, hint_text) for one problem, cycling hint pool.
+        """Return (hint_type, hint_text) for one problem.
 
-        Combined modes (``best_worst_combined`` and ``diverse_best_worst``)
-        always return a single hint containing both best and worst examples.
-        The counter only cycles when the selected mode yields multiple
-        standalone hints, e.g. ``best`` or ``diverse_best`` with ``k > 1``.
+        Combined modes (``best_worst_combined``, ``diverse_best_combined``,
+        and ``diverse_best_worst``) always return a single hint containing
+        multiple reference examples.  The counter only cycles when the
+        selected mode yields multiple standalone hints, e.g. ``best`` or
+        ``diverse_best`` with ``k > 1``.
+
+        When ``multi_teacher_hint_fixed`` is enabled, the hint is sampled
+        once per problem and reused for the whole training run so that the
+        reference code(s) stay constant across steps.
         """
+        fixed = getattr(self.config, "multi_teacher_hint_fixed", False)
+        if fixed and problem_id in self._multi_teacher_fixed_hints:
+            cached = self._multi_teacher_fixed_hints[problem_id]
+            if cached is not None:
+                return cached
+            return None
+
         mode = self.config.multi_teacher_hint_mode
         min_improvement = self.config.multi_teacher_hint_min_improvement
         deterministic = getattr(self.config, "multi_teacher_hint_deterministic", False)
@@ -1871,6 +1884,8 @@ class TTTDDistillTrainer(PPOTrainer):
             deterministic=deterministic,
         )
         if not hints:
+            if fixed:
+                self._multi_teacher_fixed_hints[problem_id] = None
             return None
 
         counter = self._multi_teacher_hint_counters.get(problem_id, 0)
@@ -1883,14 +1898,19 @@ class TTTDDistillTrainer(PPOTrainer):
             and isinstance(payload, (tuple, list))
             and len(payload) == 2
         ):
-            return (label, self._build_breakthrough_hint(payload[0], payload[1]))
-        if (
-            label in ("best_worst_combined", "diverse_best_worst")
+            result = (label, self._build_breakthrough_hint(payload[0], payload[1]))
+        elif (
+            label in ("best_worst_combined", "diverse_best_worst", "diverse_best_combined")
             and isinstance(payload, (tuple, list))
             and len(payload) == 2
         ):
-            return (label, self._build_best_worst_hint(payload[0], payload[1]))
-        return (label, self._build_hint(payload))
+            result = (label, self._build_best_worst_hint(payload[0], payload[1]))
+        else:
+            result = (label, self._build_hint(payload))
+
+        if fixed:
+            self._multi_teacher_fixed_hints[problem_id] = result
+        return result
 
     def _compute_privileged_teacher_logp(
         self, rollout_batch: dict[str, Any]

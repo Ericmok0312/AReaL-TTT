@@ -423,6 +423,7 @@ class TestComputePrivilegedTeacherLogpMulti:
         trainer.teacher_samplers = {"p1": teacher_sampler}
         trainer.teacher_lora_paths = {"p1": "/fake/lora"}
         trainer._multi_teacher_hint_counters = {"p1": 0}
+        trainer._multi_teacher_fixed_hints = {}
 
         trainer._load_peft_lora_adapter = MagicMock()
         trainer._build_hint = lambda state: "\n\n[Hint]\n"
@@ -480,3 +481,40 @@ class TestComputePrivilegedTeacherLogpMulti:
         trainer_multi._load_peft_lora_adapter.assert_called_once_with(
             trainer_multi.teacher, "/fake/lora"
         )
+
+    def test_multi_teacher_diverse_best_combined_fixed(self, trainer_multi):
+        """Combined diverse-best hints can be fixed per problem across steps."""
+        trainer_multi.config.multi_teacher_hint_mode = "diverse_best_combined"
+        trainer_multi.config.multi_teacher_hint_k = 2
+        trainer_multi.config.multi_teacher_hint_fixed = True
+
+        state1 = _make_state(code="int a();", value=0.9)
+        state2 = _make_state(code="int b();", value=0.8)
+        teacher_sampler = trainer_multi.teacher_samplers["p1"]
+        teacher_sampler.get_hint_states = MagicMock(
+            return_value=[("diverse_best_combined", ([state1, state2], []))]
+        )
+
+        student_prompt = "student prompt"
+        input_ids = torch.tensor(
+            [[10] * 15 + [20, 21], [10] * 15 + [22, 23]], dtype=torch.int32
+        )
+        attention_mask = torch.ones(2, 17, dtype=torch.bool)
+        loss_mask = torch.tensor(
+            [[0] * 15 + [1, 1], [0] * 15 + [1, 1]], dtype=torch.int32
+        )
+        rollout_batch = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "loss_mask": loss_mask,
+            "_student_prompts": [student_prompt, student_prompt],
+            "_problem_ids": ["p1", "p1"],
+        }
+
+        aligned1, *_ = trainer_multi._compute_privileged_teacher_logp(rollout_batch)
+        aligned2, *_ = trainer_multi._compute_privileged_teacher_logp(rollout_batch)
+
+        # Fixed hints should be sampled only once per problem.
+        assert teacher_sampler.get_hint_states.call_count == 1
+        assert aligned1.shape == (2, 17)
+        torch.testing.assert_close(aligned1, aligned2)

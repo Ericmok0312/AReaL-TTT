@@ -1903,6 +1903,8 @@ class PUCTSampler(StateSampler):
             - 'best_worst_combined': combined hint with the top-k best and top-k
               worst_nonzero states (few-shot reference).
             - 'diverse_best': best states from different PUCT branches.
+            - 'diverse_best_combined': combined hint with k diverse best states
+              (few-shot reference, no weak examples).
             - 'diverse_worst_nonzero': worst non-zero states from different branches.
             - 'diverse_best_worst': combined hint with k diverse best and k diverse
               worst states (few-shot reference).
@@ -1956,6 +1958,10 @@ class PUCTSampler(StateSampler):
         if mode == "diverse_best":
             for s in self.get_diverse_best_states(k=k):
                 hints.append(("diverse_best", s))
+        if mode == "diverse_best_combined":
+            best_states = self.get_diverse_best_states(k=k)
+            if best_states:
+                hints.append(("diverse_best_combined", (best_states, [])))
         if mode == "diverse_worst_nonzero":
             for s in self.get_diverse_worst_nonzero_states(k=k):
                 hints.append(("diverse_worst_nonzero", s))

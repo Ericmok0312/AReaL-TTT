@@ -421,6 +421,7 @@ class TTTDDistillConfig(TTTDPPOConfig):
             "'breakthrough' (largest parent->child improvement), "
             "'best_worst_combined' (single hint with best + worst_nonzero). "
             "'diverse_best' (best states from different PUCT branches), "
+            "'diverse_best_combined' (combined hint with k diverse best states), "
             "'diverse_worst_nonzero' (worst non-zero states from different branches), "
             "'diverse_best_worst' (cycle diverse best + diverse worst). "
             "Breakthrough and best_worst_combined are independent modes and are never mixed."
@@ -445,7 +446,16 @@ class TTTDDistillConfig(TTTDPPOConfig):
         metadata={
             "help": "Number of best/worst reference examples to include per category "
             "in combined or few-shot hint modes. Only used by modes that show "
-            "multiple references (best_worst_combined, diverse_best_worst)."
+            "multiple references (best_worst_combined, diverse_best_combined, "
+            "diverse_best_worst)."
+        },
+    )
+    multi_teacher_hint_fixed: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, the privileged hint for each problem is sampled once "
+            "from the teacher sampler and reused for the entire training run. "
+            "This keeps the reference code(s) constant across steps."
         },
     )
 
