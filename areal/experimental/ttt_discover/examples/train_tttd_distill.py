@@ -2328,14 +2328,21 @@ class TTTDDistillTrainer(PPOTrainer):
             # Ranks that do not have rollouts for this problem still need to
             # participate in the teacher compute_logp collective.
             if not indices:
+                # The microbatch splitter requires at least n_mbs rows (and at
+                # least 2 rows). Use the teacher's DP size to be safe.
+                n_dummy = max(
+                    2,
+                    getattr(self.config.teacher.mb_spec, "n_mbs", 2),
+                    self.teacher.data_parallel_world_size,
+                )
                 dummy_input_ids = torch.full(
-                    (1, 1), pad_id, dtype=torch.int32, device=device
+                    (n_dummy, 1), pad_id, dtype=torch.int32, device=device
                 )
                 dummy_attention_mask = torch.zeros(
-                    (1, 1), dtype=torch.bool, device=device
+                    (n_dummy, 1), dtype=torch.bool, device=device
                 )
                 dummy_loss_mask = torch.zeros(
-                    (1, 1), dtype=torch.int32, device=device
+                    (n_dummy, 1), dtype=torch.int32, device=device
                 )
                 with torch.no_grad():
                     _ = self.teacher.compute_logp(

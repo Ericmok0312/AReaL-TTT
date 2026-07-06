@@ -1,0 +1,294 @@
+# experiment: full-model student, diverse-best-combined hints, k=2, fixed per problem
+experiment_name: tttd-distill-qwen3-8b-ale-bench-multi-diverse-best-combined-fixed-full
+trial_name: trial0
+is_tttd_config: true
+seed: 1
+enable_offload: false
+max_steps: 50
+total_train_epochs: 50
+enable_thinking: true
+reset_puct_stats_on_resume: false
+student_sampler_inherit_teacher_pool: false
+use_privileged_teacher_logp: true
+teacher_sampler_strategy: puct
+privileged_prompt_mode: hint
+use_breakthrough_opd: false
+distill_from_scratch: true
+run_eval_step: false
+total_rollouts_per_step: 256
+
+# ALE-Bench full-corpus evaluation (public->private, median selection)
+ale_bench_eval_enabled: false
+ale_bench_eval_before_train: false
+ale_bench_eval_freq_steps: 10
+ale_bench_eval_n_candidates: 15
+ale_bench_eval_lite_version: false
+ale_bench_eval_num_workers: 16
+ale_bench_eval_n_parallel_problems: 10
+
+# Multi-teacher hint selection: combined hint with k diverse best references per problem.
+# With hint_fixed=true the same references are reused across all training steps.
+multi_teacher_hint_mode: "diverse_best_combined"
+multi_teacher_hint_k: 1
+multi_teacher_hint_fixed: true
+
+# One entry per trained ALE-Bench problem.  The trainer builds a mixed batch with
+# one group per problem (8 problems x 32 rollouts = 256 total rollouts per step).
+multi_teacher:
+  - problem_id: ahc025
+    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc025/trial0_ahc025/sampler
+    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc025/trial0_ahc025/default/epoch29epochstep29globalstep29
+  - problem_id: ahc026
+    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc026/trial0_ahc026/sampler
+    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc026/trial0_ahc026/default/epoch29epochstep29globalstep29
+  - problem_id: ahc027
+    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc027/trial0_ahc027/sampler
+    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc027/trial0_ahc027/default/epoch29epochstep29globalstep29
+  - problem_id: ahc039
+    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc039/trial0_ahc039/sampler
+    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc039/trial0_ahc039/default/epoch29epochstep29globalstep29
+  - problem_id: ahc046
+    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc046/trial0_ahc046/sampler
+    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc046/trial0_ahc046/default/epoch29epochstep29globalstep29
+  - problem_id: ahc011
+    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc011/trial0_ahc011/sampler
+    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc011/trial0_ahc011/default/epoch29epochstep29globalstep29
+  - problem_id: ahc015
+    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc015/trial0_ahc015/sampler
+    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc015/trial0_ahc015/default/epoch29epochstep29globalstep29
+  - problem_id: ahc016
+    sampler_checkpoint: ./outputs_ale_bench_async/tttd-async-qwen3-8b-ale-bench_ahc016/trial0_ahc016/sampler
+    lora_path: ./outputs_ale_bench_async/checkpoints/eric/tttd-async-qwen3-8b-ale-bench_ahc016/trial0_ahc016/default/epoch29epochstep29globalstep29
+
+# Shared teacher engine uses the base model with LoRA structure so the trainer
+# can load each problem's adapter before computing teacher_logp.
+teacher:
+  backend: fsdp:d4p1t1
+  rl_loss_weight: 0.0
+  distill_loss_weight: 1
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: Qwen/Qwen3-8B
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${actor.dtype}
+  mb_spec:
+    max_tokens_per_mb: 65536
+    n_mbs: 2
+    granularity: 1
+  optimizer: null
+  scheduling_spec: ${actor.scheduling_spec}
+  use_lora: true
+  peft_type: lora
+  lora_rank: 32
+  lora_alpha: 16
+  target_modules:
+  - all-linear
+
+# Student actor: full-model training (no LoRA)
+actor:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: Qwen/Qwen3-8B
+  dtype: bfloat16
+  mb_spec:
+    max_tokens_per_mb: 32768
+    n_mbs: 4
+    granularity: 1
+  scheduling_spec:
+  - task_type: worker
+    port_count: 2
+    gpu: 1
+    mem: 32
+    cmd: python3 -m areal.infra.rpc.rpc_server
+    env_vars: {}
+  backend: fsdp:d4p1t1
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  optimizer:
+    type: adam
+    lr: 1e-5
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.0
+  eps_clip: 0.2
+  temperature: ${gconfig.temperature}
+  reward_scaling: 10.0
+  reward_bias: -0.5
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  rejection_sampling:
+    level: token
+    action: mask
+    metric: ratio
+    upper: 5.0
+  reward_norm: null
+  adv_norm: null
+  max_new_tokens: ${gconfig.max_new_tokens}
+  use_lora: false
+  weight_update_mode: xccl
+  adv_estimator: mean_baseline
+  adv_estimator_beta: 1.0
+  adv_estimator_target_kl: 0.693
+  adv_estimator_beta_max: 1000000.0
+  adv_estimator_beta_iters: 60
+
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 1
+  n_gpus_per_node: 8
+  fileroot: /mnt/data/eric_tttopd/outputs_ale_bench_distill_multi
+  name_resolve:
+    type: nfs
+    nfs_record_root: /tmp/areal/name_resolve
+
+allocation_mode: vllm[rollout]:d4p1t1+fsdp[actor]:d4p1t1
+
+scheduler:
+  type: null
+
+rollout:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  max_concurrent_rollouts: 64
+  queue_size: null
+  consumer_batch_size: ${sampler.batch_size}
+  max_head_offpolicyness: 0
+  enable_rollout_tracing: false
+  pause_grace_period: 1.0
+  scheduling_spec: ${actor.scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+  use_lora: false
+  backend: vllm:d4p1t1
+
+gconfig:
+  n_samples: 32
+  min_new_tokens: 0
+  max_new_tokens: 32768
+  max_tokens: 32768
+  greedy: false
+  temperature: 1.0
+  top_p: 0.95
+  lora_name: tttd_lora_adapter
+
+max_prompt_thinking_tokens: 26000
+
+ref:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${actor.path}
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: false
+  dtype: ${actor.dtype}
+  mb_spec:
+    max_tokens_per_mb: 32768
+    n_mbs: 1
+  optimizer: null
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  scheduling_spec: ${actor.scheduling_spec}
+  backend: fsdp:d4p1t1
+
+vllm:
+  model: ${actor.path}
+  seed: ${seed}
+  skip_tokenizer_init: false
+  max_num_seqs: 256
+  no_enable_prefix_caching: false
+  dtype: ${actor.dtype}
+  max_model_len: 32768
+  gpu_memory_utilization: 0.8
+  enforce_eager: false
+  enable_lora: false
+  max_lora_rank: 32
+
+sampler:
+  type: puct
+  batch_size: 8
+  c_puct: 1.0
+  gamma: 0.95
+  max_children: 100
+  max_states: 100000
+  top_k: 1000
+  temperature: 1.0
+  save_freq: 1
+  checkpoint_dir: ${cluster.fileroot}/${experiment_name}/${trial_name}/sampler
+  initial_exp_type: random
+  env_type: ale_bench
+  problem_id: ahc025
+  ale_bench_lite_version: false
+  reward_scale: 100000.0
+  eval_timeout: 600
+  num_cpus: 2
+  budget_s: 1100
+  lazy_puct_sampling: false
+  vllm_concurrency: null
+  execution_concurrency: 64
+
+train_dataset:
+  batch_size: ${sampler.batch_size}
+  max_length: 32768
+
+valid_dataset:
+  batch_size: 8
+  max_length: 32768
+
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: 5
+  freq_secs: null
+
+recover:
+  mode: 'on'
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: 5
+  freq_secs: 3600
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 10
+  freq_steps: 10
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+    project: tttd-distill-qwen3-8b-ale-bench-multi
+    entity: null
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false
+
+eval_models:
+  baseline: null
+  step10: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch9epochstep9globalstep9
+  step20: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch19epochstep19globalstep19
+  step30: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch29epochstep29globalstep29
