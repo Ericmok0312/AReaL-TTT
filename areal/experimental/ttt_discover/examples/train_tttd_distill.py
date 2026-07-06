@@ -2760,7 +2760,9 @@ class TTTDDistillTrainer(PPOTrainer):
         teacher_loss_mask = teacher_loss_mask_global[local_start:local_end]
 
         # Validate reconstructed teacher token ids are in-vocab.
-        vocab_size = getattr(self.tokenizer, "vocab_size", len(self.tokenizer))
+        # Some tokenizers report a base vocab_size that excludes added tokens;
+        # use len(tokenizer) to include all valid token ids (e.g. Qwen3).
+        vocab_size = len(self.tokenizer)
         active_teacher_ids = teacher_input_ids[teacher_attention_mask]
         if active_teacher_ids.numel() > 0:
             max_id = int(active_teacher_ids.max().item())
