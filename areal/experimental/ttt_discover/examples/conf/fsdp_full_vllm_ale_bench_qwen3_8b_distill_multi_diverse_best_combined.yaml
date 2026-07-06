@@ -4,8 +4,8 @@ trial_name: trial0
 is_tttd_config: true
 seed: 1
 enable_offload: false
-max_steps: 1
-total_train_epochs: 1
+max_steps: 30
+total_train_epochs: 30
 enable_thinking: true
 reset_puct_stats_on_resume: false
 student_sampler_inherit_teacher_pool: false
@@ -15,7 +15,7 @@ privileged_prompt_mode: hint
 use_breakthrough_opd: false
 distill_from_scratch: true
 run_eval_step: false
-total_rollouts_per_step: 64
+total_rollouts_per_step: 256
 enable_dynamic_metrics: false
 
 # ALE-Bench full-corpus evaluation (public->private, median selection)
@@ -173,7 +173,7 @@ rollout:
   backend: vllm:d4p1t1
 
 gconfig:
-  n_samples: 8
+  n_samples: 32
   min_new_tokens: 0
   max_new_tokens: 32768
   max_tokens: 32768
