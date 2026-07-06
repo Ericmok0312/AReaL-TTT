@@ -405,7 +405,10 @@ class TTTDDistillTrainer(PPOTrainer):
         self._workflow_kwargs = {}
 
         # Initialize logger for dynamic metrics (overlap ratio, advantage, entropy gap)
-        self._init_dynamic_metrics_logger()
+        if getattr(self.config, "enable_dynamic_metrics", True):
+            self._init_dynamic_metrics_logger()
+        else:
+            self.dynamic_metrics_logger = None
 
     def _init_dynamic_metrics_logger(self):
         """Initialize TTTTrainingLogger to persist dynamic metrics to JSON."""
@@ -1318,19 +1321,20 @@ class TTTDDistillTrainer(PPOTrainer):
             # Middle steps use 1-based modulo: step 4, 9, 14, ... (i.e. (step+1)%5==0)
             # =====================================================================
             dynamic_metrics = {}
-            is_first_step = global_step == start_step
-            is_last_step = global_step == config.max_steps - 1
-            is_middle_5th = (global_step + 1) % 5 == 0
-            if self.teacher is not None and (
-                is_first_step or is_last_step or is_middle_5th
-            ):
-                try:
-                    torch.cuda.empty_cache()
-                    dynamic_metrics = self._compute_dynamic_metrics(rollout_batch, k=16)
-                except Exception as e:
-                    logger.warning(
-                        f"[Distill][Step {global_step}] Failed to compute dynamic metrics: {e}"
-                    )
+            if getattr(self.config, "enable_dynamic_metrics", True):
+                is_first_step = global_step == start_step
+                is_last_step = global_step == config.max_steps - 1
+                is_middle_5th = (global_step + 1) % 5 == 0
+                if self.teacher is not None and (
+                    is_first_step or is_last_step or is_middle_5th
+                ):
+                    try:
+                        torch.cuda.empty_cache()
+                        dynamic_metrics = self._compute_dynamic_metrics(rollout_batch, k=16)
+                    except Exception as e:
+                        logger.warning(
+                            f"[Distill][Step {global_step}] Failed to compute dynamic metrics: {e}"
+                        )
 
             # All-reduce dynamic metrics across DP ranks (weighted by token count)
             if dist.is_initialized() and dynamic_metrics:
@@ -2671,15 +2675,23 @@ class TTTDDistillTrainer(PPOTrainer):
             global_max_teacher_len = local_max_teacher_len
 
         if global_max_teacher_len > 0:
-            teacher_input_ids_global = torch.full(
+            # Use 0 as the fill value for input_ids during all-reduce; pad_id is
+            # typically non-zero (e.g. 151643 for Qwen3), so a SUM all-reduce would
+            # corrupt real token ids and produce out-of-vocab indices.  We track
+            # presence explicitly and restore pad_id afterwards.
+            teacher_input_ids_global = torch.zeros(
                 (global_batch_size, global_max_teacher_len),
-                pad_id,
+                dtype=torch.int32,
+                device=device,
+            )
+            teacher_input_ids_presence = torch.zeros(
+                (global_batch_size, global_max_teacher_len),
                 dtype=torch.int32,
                 device=device,
             )
             teacher_attention_mask_global = torch.zeros(
                 (global_batch_size, global_max_teacher_len),
-                dtype=torch.bool,
+                dtype=torch.int32,
                 device=device,
             )
             teacher_loss_mask_global = torch.zeros(
@@ -2690,14 +2702,23 @@ class TTTDDistillTrainer(PPOTrainer):
 
             for global_idx, ids in teacher_input_ids_rows.items():
                 teacher_input_ids_global[global_idx, : len(ids)] = ids
+                teacher_input_ids_presence[global_idx, : len(ids)] = 1
             for global_idx, mask in teacher_attention_mask_rows.items():
-                teacher_attention_mask_global[global_idx, : len(mask)] = mask
+                teacher_attention_mask_global[global_idx, : len(mask)] = mask.to(
+                    dtype=torch.int32
+                )
             for global_idx, mask in teacher_loss_mask_rows.items():
                 teacher_loss_mask_global[global_idx, : len(mask)] = mask
 
             if teacher_dp_world_size > 1:
+                # SUM is safe because each position is owned by exactly one rank.
                 dist.all_reduce(
                     teacher_input_ids_global,
+                    op=dist.ReduceOp.SUM,
+                    group=teacher_dp_group,
+                )
+                dist.all_reduce(
+                    teacher_input_ids_presence,
                     op=dist.ReduceOp.SUM,
                     group=teacher_dp_group,
                 )
@@ -2711,6 +2732,11 @@ class TTTDDistillTrainer(PPOTrainer):
                     op=dist.ReduceOp.SUM,
                     group=teacher_dp_group,
                 )
+
+            # Restore pad_id where no rank contributed real data.
+            teacher_input_ids_global[teacher_input_ids_presence == 0] = pad_id
+            teacher_attention_mask_global = teacher_attention_mask_global.bool()
+            teacher_loss_mask_global = teacher_loss_mask_global.to(dtype=torch.int32)
         else:
             teacher_input_ids_global = torch.empty(
                 (global_batch_size, 0), dtype=torch.int32, device=device
@@ -2732,6 +2758,20 @@ class TTTDDistillTrainer(PPOTrainer):
         teacher_input_ids = teacher_input_ids_global[local_start:local_end]
         teacher_attention_mask = teacher_attention_mask_global[local_start:local_end]
         teacher_loss_mask = teacher_loss_mask_global[local_start:local_end]
+
+        # Validate reconstructed teacher token ids are in-vocab.
+        vocab_size = getattr(self.tokenizer, "vocab_size", len(self.tokenizer))
+        active_teacher_ids = teacher_input_ids[teacher_attention_mask]
+        if active_teacher_ids.numel() > 0:
+            max_id = int(active_teacher_ids.max().item())
+            min_id = int(active_teacher_ids.min().item())
+            if max_id >= vocab_size or min_id < 0:
+                raise RuntimeError(
+                    f"[MultiTeacher-Logp] rank={self.actor.rank} reconstructed "
+                    f"teacher_input_ids out of vocab range: min={min_id}, "
+                    f"max={max_id}, vocab_size={vocab_size}. "
+                    f"This usually means the all-reduce corrupted token ids."
+                )
 
         # Sanity assertions
         assert aligned_teacher_logp.shape[0] == batch_size, (

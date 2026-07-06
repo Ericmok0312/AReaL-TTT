@@ -460,6 +460,14 @@ class TTTDDistillConfig(TTTDPPOConfig):
     )
 
     # Validation / logging
+    enable_dynamic_metrics: bool = field(
+        default=True,
+        metadata={
+            "help": "If True, compute and log dynamic metrics (overlap ratio, "
+            "advantage, entropy gap) every 5 steps. Disabling saves forward passes "
+            "and GPU memory during distillation."
+        },
+    )
     total_rollouts_per_step: int = field(
         default=512,
         metadata={"help": "Total number of rollouts per step across all ranks"},
