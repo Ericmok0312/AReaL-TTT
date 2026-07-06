@@ -765,6 +765,14 @@ class TTTDDistillConfig(TTTDPPOConfig):
             "median case score."
         },
     )
+    ale_bench_eval_session_duration_hours: float = field(
+        default=168.0,
+        metadata={
+            "help": "Time budget (in hours) passed to ale_bench.start for public and "
+            "private evaluation. Default is 168 hours (7 days) so long-running "
+            "evaluations are not killed prematurely."
+        },
+    )
 
     def __post_init__(self):
         # Convert multi_teacher entries from dict to dataclass

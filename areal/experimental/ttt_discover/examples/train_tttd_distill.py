@@ -22,6 +22,7 @@ import functools
 import json
 import os
 import queue
+import signal
 import sys
 import time
 from typing import Any
@@ -410,6 +411,41 @@ class TTTDDistillTrainer(PPOTrainer):
         else:
             self.dynamic_metrics_logger = None
 
+        # Guard to make close() idempotent when called from both signal handlers
+        # and the context manager's __exit__.
+        self._closed = False
+
+        # Register signal handlers so Ctrl+C (SIGINT) and local launcher SIGTERM
+        # trigger cleanup of ALE-Bench sessions, Docker containers, and engines.
+        self._register_signal_handlers()
+
+    def _register_signal_handlers(self):
+        """Register SIGINT/SIGTERM handlers that run close() before exiting."""
+
+        def _signal_handler(signum, frame):
+            sig_name = signal.Signals(signum).name
+            logger.info(
+                f"[Distill] Received {sig_name}; running cleanup before exit."
+            )
+            try:
+                self.close()
+            except Exception as e:
+                logger.warning(f"[Distill] Cleanup after {sig_name} failed: {e}")
+            # Re-raise the signal so the process still terminates.
+            signal.default_int_handler(signum, frame)
+
+        try:
+            signal.signal(signal.SIGINT, _signal_handler)
+            signal.signal(signal.SIGTERM, _signal_handler)
+        except ValueError:
+            # signal.signal can only be called from the main thread.  If the
+            # trainer is instantiated in a non-main thread, skip registration
+            # and rely on the context manager's __exit__ instead.
+            logger.warning(
+                "[Distill] Could not register signal handlers from non-main thread. "
+                "Cleanup on Ctrl+C may be incomplete."
+            )
+
     def _init_dynamic_metrics_logger(self):
         """Initialize TTTTrainingLogger to persist dynamic metrics to JSON."""
         config = self.config
@@ -724,6 +760,23 @@ class TTTDDistillTrainer(PPOTrainer):
 
         original_problem_id = getattr(config.sampler, "problem_id", "")
         original_num_cpus = getattr(config.sampler, "num_cpus", 2)
+        original_session_duration_seconds = getattr(
+            config.sampler, "ale_bench_session_duration_seconds", None
+        )
+        # Use the eval-specific duration for ALE-Bench eval sessions; the training
+        # env may use a much longer default (100 years) which is not appropriate
+        # for eval that should respect the official contest time budget.
+        eval_session_duration_seconds = int(
+            config.ale_bench_eval_session_duration_hours * 3600
+        )
+        config.sampler.ale_bench_session_duration_seconds = (
+            eval_session_duration_seconds
+        )
+        logger.info(
+            f"[AleBenchEval] Setting eval session duration to "
+            f"{config.ale_bench_eval_session_duration_hours}h "
+            f"({eval_session_duration_seconds}s)"
+        )
         # Use the eval-specific worker count for ALE-Bench sessions; the training
         # sampler may use a much smaller num_cpus which would make public eval slow.
         config.sampler.num_cpus = config.ale_bench_eval_num_workers
@@ -751,12 +804,22 @@ class TTTDDistillTrainer(PPOTrainer):
             try:
                 env = create_env_from_config(config)
                 self._ale_bench_eval_envs[problem_id] = env
+                logger.info(
+                    f"[AleBenchEval] Created env for {problem_id} "
+                    f"session_duration_seconds={env.session_duration_seconds}"
+                )
             except Exception as e:
                 logger.warning(
                     f"[AleBenchEval] Failed to create env for {problem_id}: {e}"
                 )
         config.sampler.problem_id = original_problem_id
         config.sampler.num_cpus = original_num_cpus
+        if original_session_duration_seconds is not None:
+            config.sampler.ale_bench_session_duration_seconds = (
+                original_session_duration_seconds
+            )
+        else:
+            delattr(config.sampler, "ale_bench_session_duration_seconds")
 
     def _initialize_engines(self):
         """Initialize training engines."""
@@ -2870,7 +2933,7 @@ class TTTDDistillTrainer(PPOTrainer):
             public_reward_fn = functools.partial(
                 ale_bench_public_reward_fn,
                 lite_version=config.ale_bench_eval_lite_version,
-                session_duration_hours=4.0,
+                session_duration_hours=config.ale_bench_eval_session_duration_hours,
                 ale_bench_num_workers=config.ale_bench_eval_num_workers,
             )
 
@@ -3063,7 +3126,7 @@ class TTTDDistillTrainer(PPOTrainer):
             eval_problem_ids,
             public_results_by_problem,
             lite_version=config.ale_bench_eval_lite_version,
-            session_duration_hours=4.0,
+            session_duration_hours=config.ale_bench_eval_session_duration_hours,
             ale_bench_num_workers=config.ale_bench_eval_num_workers,
             n_parallel_problems=config.ale_bench_eval_n_parallel_problems,
             problem_sessions=problem_sessions,
@@ -3086,7 +3149,7 @@ class TTTDDistillTrainer(PPOTrainer):
             {
                 "n_candidates": config.ale_bench_eval_n_candidates,
                 "lite_version": config.ale_bench_eval_lite_version,
-                "session_duration_hours": 4.0,
+                "session_duration_hours": config.ale_bench_eval_session_duration_hours,
                 "ale_bench_num_workers": config.ale_bench_eval_num_workers,
                 "n_parallel_problems": config.ale_bench_eval_n_parallel_problems,
                 "selection_method": selection_method,
@@ -3307,6 +3370,10 @@ class TTTDDistillTrainer(PPOTrainer):
 
     def close(self):
         """Cleanup resources."""
+        if self._closed:
+            return
+        self._closed = True
+
         # Save dynamic metrics checkpoint before cleanup
         if (
             hasattr(self, "dynamic_metrics_logger")
@@ -3320,6 +3387,26 @@ class TTTDDistillTrainer(PPOTrainer):
                     )
             except Exception as e:
                 logger.warning(f"[DynamicMetrics] Failed to save checkpoint: {e}")
+
+        # Close ALE-Bench training env sessions (multi-teacher) and the default env.
+        for attr_name in ("problem_envs", "env"):
+            envs = getattr(self, attr_name, None)
+            if envs is None:
+                continue
+            if not isinstance(envs, dict):
+                envs = {getattr(envs, "problem_id", "default"): envs}
+            for problem_id, env in list(envs.items()):
+                session = getattr(env, "session", None)
+                if session is not None:
+                    try:
+                        session.close()
+                        logger.info(
+                            f"[AleBenchTrain] Closed {attr_name} session for {problem_id}"
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"[AleBenchTrain] Failed to close {attr_name} session for {problem_id}: {e}"
+                        )
 
         # Close ALE-Bench eval env sessions to release Docker containers/tools.
         if hasattr(self, "_ale_bench_eval_envs"):

@@ -34,7 +34,7 @@ from areal.api.alloc_mode import ModelAllocation
 from areal.api.alloc_mode import _AllocationMode as AllocationMode
 from areal.api.cli_args import load_expr_config
 from areal.api.engine_api import WeightUpdateMeta
-from areal.api.io_struct import FinetuneSpec
+from areal.api.io_struct import FinetuneSpec, SaveLoadMeta
 from areal.experimental.ttt_discover.actor import TTTDActor
 from areal.experimental.ttt_discover.ale_bench_eval import (
     ale_bench_public_reward_fn,
@@ -382,6 +382,22 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
                 n_zeroed += 1
         logger.info(f"[LoadAdapter] Zeroed {n_zeroed} LoRA parameters")
 
+    def _detect_checkpoint_type(self, path: str) -> str:
+        """Detect whether a checkpoint path contains a LoRA adapter or full model weights."""
+        if not os.path.isdir(path):
+            return "unknown"
+        has_adapter = os.path.isfile(
+            os.path.join(path, "adapter_model.safetensors")
+        ) or os.path.isfile(os.path.join(path, "adapter_model.bin"))
+        if has_adapter:
+            return "lora"
+        for fn in os.listdir(path):
+            if fn.startswith("model") and fn.endswith(".safetensors"):
+                return "full"
+            if fn == "pytorch_model.bin":
+                return "full"
+        return "unknown"
+
     def _load_peft_lora_adapter(self, engine, path: str):
         """Load a PEFT LoRA adapter checkpoint into the FSDP-wrapped actor."""
         from safetensors.torch import load_file
@@ -423,17 +439,39 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
         logger.info("[LoadAdapter] LoRA adapter loaded into actor successfully")
 
     def _switch_model(self, label: str, version: int):
-        """Load the requested adapter and push weights to the inference engine."""
-        lora_path = self._eval_models[label]
+        """Load the requested checkpoint and push weights to the inference engine."""
+        model_path = self._eval_models[label]
 
-        if not lora_path:
+        if not model_path:
             logger.info(
-                f"[MultiEval-{label}] Evaluating pure base model (no LoRA adapter)"
+                f"[MultiEval-{label}] Evaluating pure base model (no adapter)"
             )
             self._zero_lora_weights(self.actor)
         else:
-            logger.info(f"[MultiEval-{label}] Loading LoRA from {lora_path}")
-            self._load_peft_lora_adapter(self.actor, lora_path)
+            ckpt_type = self._detect_checkpoint_type(model_path)
+            if ckpt_type == "lora":
+                logger.info(
+                    f"[MultiEval-{label}] Loading LoRA adapter from {model_path}"
+                )
+                self._load_peft_lora_adapter(self.actor, model_path)
+            elif ckpt_type == "full":
+                logger.info(
+                    f"[MultiEval-{label}] Loading full-model checkpoint from {model_path}"
+                )
+                meta = SaveLoadMeta(
+                    path=model_path,
+                    weight_format="hf",
+                    with_optim=False,
+                    tokenizer=None,
+                    processor=None,
+                )
+                self.actor.load(meta)
+            else:
+                raise ValueError(
+                    f"[MultiEval-{label}] Cannot detect checkpoint type at {model_path}. "
+                    "Expected a PEFT LoRA adapter (adapter_model.safetensors) or "
+                    "a full HuggingFace checkpoint (model*.safetensors / pytorch_model.bin)."
+                )
 
         logger.info(
             f"[MultiEval-{label}] Pushing weights to vLLM via update_weights()..."
@@ -704,6 +742,7 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
         output.update(
             {
                 "model": label,
+                "model_path": self._eval_models[label],
                 "lora_path": self._eval_models[label],
                 "n_candidates": config.ale_bench_eval_n_candidates,
                 "lite_version": config.ale_bench_eval_lite_version,
