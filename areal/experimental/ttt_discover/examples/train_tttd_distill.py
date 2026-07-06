@@ -1213,6 +1213,17 @@ class TTTDDistillTrainer(PPOTrainer):
             # Normalize batch to dict for TTTDActor methods
             rollout_batch = self._normalize_rollout_batch(rollout_batch)
 
+            # Log local problem distribution after redistribution for correctness checks.
+            step_problem_ids = rollout_batch.get("_problem_ids", [])
+            if step_problem_ids:
+                from collections import Counter
+
+                logger.info(
+                    f"[Distill][Step {global_step}] rank={self.actor.rank} "
+                    f"local_rollouts={len(step_problem_ids)} "
+                    f"local_problem_counts={dict(Counter(step_problem_ids))}"
+                )
+
             # Compute global reward statistics
             local_rollouts = rollout_batch["rewards"].shape[0]
             step_rewards = rollout_batch["rewards"].cpu().numpy()
@@ -1809,7 +1820,9 @@ class TTTDDistillTrainer(PPOTrainer):
                 f"Expected a PEFT checkpoint with adapter_model.safetensors."
             )
 
-        logger.info(f"[LoadAdapter] Loading LoRA adapter from {path}")
+        logger.info(
+            f"[LoadAdapter] rank={dist.get_rank()} loading LoRA adapter from {path}"
+        )
 
         if dist.get_rank() == 0:
             raw_state = load_file(adapter_path)
@@ -2238,6 +2251,17 @@ class TTTDDistillTrainer(PPOTrainer):
         for idx, pid in enumerate(problem_ids):
             problem_to_indices.setdefault(pid, []).append(idx)
 
+        # Log local problem distribution so we can verify correctness across ranks.
+        logger.info(
+            f"[MultiTeacher-Logp] rank={self.actor.rank} "
+            f"dp_rank={self.actor.data_parallel_rank}/"
+            f"{self.actor.data_parallel_world_size} "
+            f"local_batch_size={batch_size} "
+            f"problems_seen={list(problem_to_indices.keys())} "
+            f"rollouts_per_problem="
+            f"{ {pid: len(idxs) for pid, idxs in problem_to_indices.items()} }"
+        )
+
         prompt_lens = (attention_mask & (loss_mask == 0)).sum(dim=1).cpu().numpy()
         comp_lens = loss_mask.sum(dim=1).cpu().numpy()
 
@@ -2262,6 +2286,12 @@ class TTTDDistillTrainer(PPOTrainer):
 
             lora_path = self.teacher_lora_paths[problem_id]
             teacher_sampler = self.teacher_samplers[problem_id]
+
+            logger.info(
+                f"[MultiTeacher-Logp] rank={self.actor.rank} "
+                f"problem={problem_id} local_rollouts={len(indices)} "
+                f"adapter={lora_path}"
+            )
 
             # Load problem-specific teacher LoRA
             self._load_peft_lora_adapter(self.teacher, lora_path)
@@ -2419,6 +2449,14 @@ class TTTDDistillTrainer(PPOTrainer):
             teacher_input_ids = torch.empty((batch_size, 0), dtype=torch.int32)
             teacher_attention_mask = torch.empty((batch_size, 0), dtype=torch.bool)
             teacher_loss_mask = torch.empty((batch_size, 0), dtype=torch.int32)
+
+        # Sanity check: teacher logp tensor should match the student rollout rows.
+        logger.info(
+            f"[MultiTeacher-Logp] rank={self.actor.rank} "
+            f"aligned_teacher_logp_shape={list(aligned_teacher_logp.shape)} "
+            f"student_input_ids_shape={list(input_ids.shape)} "
+            f"problems_processed={list(problem_to_indices.keys())}"
+        )
 
         return (
             aligned_teacher_logp,
