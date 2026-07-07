@@ -1737,6 +1737,47 @@ class PUCTSampler(StateSampler):
             candidates.sort(key=lambda s: s.value, reverse=False)
             return self._diverse_top_k(candidates, k)
 
+    def get_percentile_band_states(
+        self,
+        k: int = 1,
+        percentile_low: float = 0.5,
+        percentile_high: float = 1.0,
+    ) -> list[State]:
+        """Return up to k states whose value falls in a percentile band.
+
+        This is useful for distillation hints that should not only show the
+        absolute best solution (e.g. top-1), but instead sample reference
+        codes from a performance band such as the top 50%.
+
+        Parameters
+        ----------
+        k : int
+            Maximum number of states to return.
+        percentile_low : float
+            Lower percentile bound in [0, 1].
+        percentile_high : float
+            Upper percentile bound in [0, 1].
+
+        Returns
+        -------
+        list[State]
+            Up to k randomly sampled states from the band.  If the band
+            contains fewer than k states, all of them are returned.
+        """
+        with self._lock:
+            candidates = [s for s in self._states if s.value is not None]
+            if not candidates:
+                return []
+            values = np.array([s.value for s in candidates], dtype=np.float64)
+            low = float(np.percentile(values, percentile_low * 100.0))
+            high = float(np.percentile(values, percentile_high * 100.0))
+            band = [s for s in candidates if low <= s.value <= high]
+            if not band:
+                return []
+            if len(band) <= k:
+                return band
+            return random.sample(band, k)
+
     def extract_milestone_paths(
         self,
         n_paths: int = 10,
@@ -1890,6 +1931,8 @@ class PUCTSampler(StateSampler):
         k: int = 1,
         min_improvement: float = 0.001,
         deterministic: bool = False,
+        percentile_low: float = 0.5,
+        percentile_high: float = 1.0,
     ) -> list[tuple[str, State | tuple[State, State]]]:
         """Extract a pool of privileged hint states for multi-teacher distillation.
 
@@ -1908,6 +1951,12 @@ class PUCTSampler(StateSampler):
             - 'diverse_worst_nonzero': worst non-zero states from different branches.
             - 'diverse_best_worst': combined hint with k diverse best and k diverse
               worst states (few-shot reference).
+            - 'percentile_band_combined': combined hint with up to k states sampled
+              uniformly at random from a performance percentile band (default top
+              50%, configurable via ``percentile_low``/``percentile_high``).
+            - 'percentile_band': sample up to k states from a performance percentile
+              band and return them as separate hints.  The trainer can assign one
+              hint per rollout instead of concatenating them.
             'breakthrough' and combined best/worst modes are independent and are
             never mixed within a single hint.
         k : int
@@ -1917,6 +1966,10 @@ class PUCTSampler(StateSampler):
         deterministic : bool
             If True, breakthrough transitions are selected deterministically
             by improvement magnitude.  Best/worst hints are already deterministic.
+        percentile_low : float
+            Lower percentile bound (in [0, 1]) for ``percentile_band_combined``.
+        percentile_high : float
+            Upper percentile bound (in [0, 1]) for ``percentile_band_combined``.
 
         Returns
         -------
@@ -1970,6 +2023,22 @@ class PUCTSampler(StateSampler):
             worst_states = self.get_diverse_worst_nonzero_states(k=k)
             if best_states or worst_states:
                 hints.append(("diverse_best_worst", (best_states, worst_states)))
+        if mode == "percentile_band_combined":
+            band_states = self.get_percentile_band_states(
+                k=k,
+                percentile_low=percentile_low,
+                percentile_high=percentile_high,
+            )
+            if band_states:
+                hints.append(("percentile_band_combined", (band_states, [])))
+        if mode == "percentile_band":
+            band_states = self.get_percentile_band_states(
+                k=k,
+                percentile_low=percentile_low,
+                percentile_high=percentile_high,
+            )
+            for s in band_states:
+                hints.append(("percentile_band", s))
 
         if not hints:
             logger.warning(

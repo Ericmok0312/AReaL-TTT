@@ -210,6 +210,7 @@ class TTTDDistillTrainer(PPOTrainer):
         self.student_samplers: dict[str, StateSampler] = {}
         self._multi_teacher_hint_counters: dict[str, int] = {}
         self._multi_teacher_fixed_hints: dict[str, tuple[str, str] | None] = {}
+        self._multi_teacher_fixed_rollout_hints: dict[str, list[str]] = {}
 
         # ALE-Bench full-corpus evaluation state
         self._ale_bench_eval_enabled = getattr(config, "ale_bench_eval_enabled", False)
@@ -1958,11 +1959,17 @@ class TTTDDistillTrainer(PPOTrainer):
         min_improvement = self.config.multi_teacher_hint_min_improvement
         deterministic = getattr(self.config, "multi_teacher_hint_deterministic", False)
         hint_k = getattr(self.config, "multi_teacher_hint_k", 1)
+        percentile_low = getattr(self.config, "multi_teacher_hint_percentile_low", 0.5)
+        percentile_high = getattr(
+            self.config, "multi_teacher_hint_percentile_high", 1.0
+        )
         hints = teacher_sampler.get_hint_states(
             mode=mode,
             k=hint_k,
             min_improvement=min_improvement,
             deterministic=deterministic,
+            percentile_low=percentile_low,
+            percentile_high=percentile_high,
         )
         if not hints:
             if fixed:
@@ -1981,7 +1988,12 @@ class TTTDDistillTrainer(PPOTrainer):
         ):
             result = (label, self._build_breakthrough_hint(payload[0], payload[1]))
         elif (
-            label in ("best_worst_combined", "diverse_best_worst", "diverse_best_combined")
+            label in (
+                "best_worst_combined",
+                "diverse_best_worst",
+                "diverse_best_combined",
+                "percentile_band_combined",
+            )
             and isinstance(payload, (tuple, list))
             and len(payload) == 2
         ):
@@ -2041,6 +2053,127 @@ class TTTDDistillTrainer(PPOTrainer):
 
         return hint_result
 
+    def _sample_per_rollout_hints_for_problem(
+        self,
+        problem_id: str,
+        teacher_sampler,
+        n_rollouts: int,
+    ) -> list[str] | None:
+        """Return one hint text per rollout for modes that return separate hints.
+
+        The current supported mode is ``percentile_band``: it samples ``k``
+        reference states from the configured performance percentile band, builds
+        a single-reference hint for each, and repeats/cycles the hints so that
+        the ``n_rollouts`` rollouts of this problem share the ``k`` references
+        as evenly as possible.
+
+        Parameters
+        ----------
+        problem_id : str
+            ALE-Bench problem id.
+        teacher_sampler : PUCTSampler
+            The loaded teacher sampler for this problem.
+        n_rollouts : int
+            Total number of rollouts for this problem in the current global
+            batch.
+
+        Returns
+        -------
+        list[str] | None
+            A list of length ``n_rollouts`` containing the per-rollout hint
+            text, or ``None`` when the configured mode is not a per-rollout
+            hint mode.
+        """
+        if n_rollouts <= 0:
+            return []
+
+        mode = self.config.multi_teacher_hint_mode
+        if mode != "percentile_band":
+            return None
+
+        fixed = getattr(self.config, "multi_teacher_hint_fixed", False)
+        if fixed and problem_id in self._multi_teacher_fixed_rollout_hints:
+            cached = self._multi_teacher_fixed_rollout_hints[problem_id]
+            if len(cached) == n_rollouts:
+                return cached
+
+        hint_k = getattr(self.config, "multi_teacher_hint_k", 1)
+        percentile_low = getattr(self.config, "multi_teacher_hint_percentile_low", 0.5)
+        percentile_high = getattr(
+            self.config, "multi_teacher_hint_percentile_high", 1.0
+        )
+        states = teacher_sampler.get_percentile_band_states(
+            k=hint_k,
+            percentile_low=percentile_low,
+            percentile_high=percentile_high,
+        )
+        if not states:
+            logger.warning(
+                f"[PerRolloutHints-{problem_id}] No states in percentile band "
+                f"[{percentile_low}, {percentile_high}]. Falling back to best state."
+            )
+            states = teacher_sampler.get_best_state(k=1)
+        if not states:
+            logger.warning(
+                f"[PerRolloutHints-{problem_id}] No reference states available. "
+                "Using empty hint."
+            )
+            state_hints = [""]
+        else:
+            state_hints = [self._build_hint(s) for s in states]
+
+        # Distribute the k sampled references evenly across n_rollouts.
+        per_rollout_hints = [
+            state_hints[i % len(state_hints)] for i in range(n_rollouts)
+        ]
+
+        if fixed:
+            self._multi_teacher_fixed_rollout_hints[problem_id] = per_rollout_hints
+        return per_rollout_hints
+
+    def _sample_per_rollout_hints_for_problem_synced(
+        self,
+        problem_id: str,
+        teacher_sampler,
+        teacher_dp_group: dist.ProcessGroup | None,
+        teacher_dp_rank: int,
+        teacher_dp_world_size: int,
+        n_rollouts: int,
+    ) -> list[str] | None:
+        """Sample per-rollout hints on teacher DP rank 0 and broadcast them.
+
+        Every teacher DP rank must build the same teacher prompts for the same
+        global rollouts, so the sampled reference codes and their assignment to
+        rollouts are computed on rank 0 and broadcast as a list of strings.
+        """
+        if teacher_dp_world_size <= 1:
+            return self._sample_per_rollout_hints_for_problem(
+                problem_id, teacher_sampler, n_rollouts
+            )
+
+        if teacher_dp_rank == 0:
+            hints = self._sample_per_rollout_hints_for_problem(
+                problem_id, teacher_sampler, n_rollouts
+            )
+            package = hints if hints is not None else "__NONE__"
+        else:
+            package = "__NONE__"
+
+        package_list = [package]
+        dist.broadcast_object_list(package_list, src=0, group=teacher_dp_group)
+        result = package_list[0]
+
+        if result == "__NONE__":
+            hints = None
+        else:
+            hints = result
+
+        fixed = getattr(self.config, "multi_teacher_hint_fixed", False)
+        if fixed and hints is not None:
+            self._multi_teacher_fixed_rollout_hints[problem_id] = hints
+
+        return hints
+
     def _compute_privileged_teacher_logp(
         self, rollout_batch: dict[str, Any]
     ) -> torch.Tensor:
@@ -2069,7 +2202,6 @@ class TTTDDistillTrainer(PPOTrainer):
         attention_mask = rollout_batch["attention_mask"]
         loss_mask = rollout_batch["loss_mask"]
         batch_size, student_seqlen = input_ids.shape
-        device = input_ids.device
         group_size = self.config.gconfig.n_samples
 
         # ------------------------------------------------------------------
@@ -2596,20 +2728,47 @@ class TTTDDistillTrainer(PPOTrainer):
                     )
                 continue
 
-            hint_result = self._sample_hint_for_problem_synced(
-                problem_id,
-                teacher_sampler,
-                teacher_dp_group,
-                teacher_dp_rank,
-                teacher_dp_world_size,
+            use_per_rollout_hints = (
+                self.config.multi_teacher_hint_mode == "percentile_band"
             )
-            hint_type = hint_result[0] if hint_result else "none"
-            hint_text = hint_result[1] if hint_result else ""
+            per_rollout_hint_map: dict[int, str] = {}
+            if use_per_rollout_hints:
+                per_rollout_hints = (
+                    self._sample_per_rollout_hints_for_problem_synced(
+                        problem_id,
+                        teacher_sampler,
+                        teacher_dp_group,
+                        teacher_dp_rank,
+                        teacher_dp_world_size,
+                        len(all_indices),
+                    )
+                )
+                if per_rollout_hints is None:
+                    per_rollout_hints = [""] * len(all_indices)
+                for pos, global_idx in enumerate(all_indices):
+                    per_rollout_hint_map[global_idx] = per_rollout_hints[pos]
+                hint_type = "percentile_band"
+                n_distinct_refs = len(set(per_rollout_hints))
+                logger.info(
+                    f"[MultiTeacher-Logp] problem={problem_id} "
+                    f"slice_rollouts={len(rank_indices)} hint_type={hint_type} "
+                    f"n_distinct_refs={n_distinct_refs}"
+                )
+            else:
+                hint_result = self._sample_hint_for_problem_synced(
+                    problem_id,
+                    teacher_sampler,
+                    teacher_dp_group,
+                    teacher_dp_rank,
+                    teacher_dp_world_size,
+                )
+                hint_type = hint_result[0] if hint_result else "none"
+                hint_text = hint_result[1] if hint_result else ""
 
-            logger.info(
-                f"[MultiTeacher-Logp] problem={problem_id} "
-                f"slice_rollouts={len(rank_indices)} hint_type={hint_type}"
-            )
+                logger.info(
+                    f"[MultiTeacher-Logp] problem={problem_id} "
+                    f"slice_rollouts={len(rank_indices)} hint_type={hint_type}"
+                )
 
             problem_teacher_seqs: list[torch.Tensor] = []
             problem_teacher_loss_masks: list[torch.Tensor] = []
@@ -2630,6 +2789,8 @@ class TTTDDistillTrainer(PPOTrainer):
                     and global_student_prompts[global_idx]
                     else ""
                 )
+                if use_per_rollout_hints:
+                    hint_text = per_rollout_hint_map.get(global_idx, "")
                 teacher_prompt = student_prompt + hint_text
 
                 messages = [{"role": "user", "content": teacher_prompt}]

@@ -423,7 +423,11 @@ class TTTDDistillConfig(TTTDPPOConfig):
             "'diverse_best' (best states from different PUCT branches), "
             "'diverse_best_combined' (combined hint with k diverse best states), "
             "'diverse_worst_nonzero' (worst non-zero states from different branches), "
-            "'diverse_best_worst' (cycle diverse best + diverse worst). "
+            "'diverse_best_worst' (cycle diverse best + diverse worst), "
+            "'percentile_band_combined' (random sample of k states from a performance "
+            "percentile band, combined into one hint), "
+            "'percentile_band' (random sample of k states, returned as separate hints "
+            "so the trainer can assign one per rollout). "
             "Breakthrough and best_worst_combined are independent modes and are never mixed."
         },
     )
@@ -456,6 +460,22 @@ class TTTDDistillConfig(TTTDPPOConfig):
             "help": "If True, the privileged hint for each problem is sampled once "
             "from the teacher sampler and reused for the entire training run. "
             "This keeps the reference code(s) constant across steps."
+        },
+    )
+    multi_teacher_hint_percentile_low: float = field(
+        default=0.5,
+        metadata={
+            "help": "Lower percentile bound (in [0, 1]) for "
+            "'percentile_band_combined' hint mode. "
+            "For example, 0.5 means the band starts at the median."
+        },
+    )
+    multi_teacher_hint_percentile_high: float = field(
+        default=1.0,
+        metadata={
+            "help": "Upper percentile bound (in [0, 1]) for "
+            "'percentile_band_combined' hint mode. "
+            "1.0 means the band includes the best state."
         },
     )
 
