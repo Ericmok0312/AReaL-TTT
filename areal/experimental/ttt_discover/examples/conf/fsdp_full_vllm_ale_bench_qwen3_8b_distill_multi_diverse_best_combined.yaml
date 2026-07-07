@@ -1,6 +1,6 @@
 # experiment: full-model student, diverse-best-combined hints, k=2, fixed per problem
 experiment_name: tttd-distill-qwen3-8b-ale-bench-multi-diverse-best-combined-fixed-full
-trial_name: trial0
+trial_name: trial1
 is_tttd_config: true
 seed: 1
 enable_offload: false
@@ -289,7 +289,7 @@ perf_tracer:
     enabled: false
 
 eval_models:
-  step5: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch4epochstep4globalstep4
-  step10: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch9epochstep9globalstep9
-  step15: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch14epochstep14globalstep14
-  #step30: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch29epochstep29globalstep29
+  step5: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/trial0/default/epoch4epochstep4globalstep4
+  step10: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/trial0/default/epoch9epochstep9globalstep9
+  step15: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/trial0/default/epoch14epochstep14globalstep14
+  #step30: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/trial0/default/epoch29epochstep29globalstep29

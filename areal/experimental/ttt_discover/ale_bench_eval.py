@@ -482,6 +482,36 @@ def _private_eval_one_problem(
     result["score_type"] = score_type
     best_code = candidate_results[best_idx].get("code", best_code)
 
+    # Log all candidates' public scores sorted by the selection score.
+    sorted_candidates = sorted(
+        enumerate(candidate_results),
+        key=lambda item: item[1]
+        .get("public", {})
+        .get(
+            "overall_absolute_score"
+            if selection_method in ("median", "best_public")
+            else "median_case_score",
+            float("-inf"),
+        ),
+        reverse=(score_type != "minimize"),
+    )
+    score_key = (
+        "overall_absolute_score"
+        if selection_method in ("median", "best_public")
+        else "median_case_score"
+    )
+    candidate_log_lines = [
+        f"  cand {idx}: {score_key}={c.get('public', {}).get(score_key, float('nan')):.2f} "
+        f"judge={c.get('public', {}).get('judge_result', 'UNKNOWN')}"
+        for idx, c in sorted_candidates
+    ]
+    logger.info(
+        f"[_private_eval_one_problem][{problem_id}] Candidate public scores "
+        f"(sorted by {score_key}, {score_type}):\n"
+        + "\n".join(candidate_log_lines)
+        + f"\n  => selected best candidate {best_idx}"
+    )
+
     owns_session = session is None
     step_ts = time.time()
     try:
@@ -506,6 +536,7 @@ def _private_eval_one_problem(
             )
         eval_ts = time.time()
         logger.info(f"[_private_eval_one_problem][{problem_id}] Calling private_eval()")
+        _reset_private_eval_counter(session)
         private_result, rank, performance = session.private_eval(
             code=best_code,
             code_language=CodeLanguage.CPP20,
