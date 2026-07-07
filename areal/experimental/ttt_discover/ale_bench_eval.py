@@ -431,6 +431,7 @@ def _private_eval_one_problem(
     lite_version: bool,
     session_duration_hours: float,
     ale_bench_num_workers: int,
+    session: Any | None = None,
     selection_method: str = "median",
     score_type: str | None = None,
 ) -> dict[str, Any]:
@@ -440,11 +441,14 @@ def _private_eval_one_problem(
     (e.g. produced by ``ale_bench_public_reward_fn``).  The best candidate is
     selected according to ``selection_method``.
 
-    A fresh ALE-Bench session is created for this single private evaluation and
-    closed afterwards.  Sessions are intentionally not reused across calls or
-    workers to avoid fork-safety and resource-accounting issues.
+    If a session is provided (e.g. an env session shared with public eval), it
+    is reused for the single ``private_eval`` call.  Otherwise a cached session
+    is obtained via ``_get_ale_bench_session``.  Provided sessions are owned by
+    the caller and are not closed here.
 
     Args:
+        session: Optional pre-built ALE-Bench session to reuse. If provided,
+            the caller retains ownership and this function will not close it.
         selection_method: ``"median"`` for official ALE-Bench median selection
             (closest to median of ``overall_absolute_score``),
             ``"median_case_score"`` for legacy highest per-candidate median, or
@@ -452,9 +456,8 @@ def _private_eval_one_problem(
         score_type: ``"minimize"`` or ``"maximize"``. If not provided, loaded
             from the problem metadata.
     """
-    from datetime import timedelta
+    import time
 
-    from ale_bench import start
     from ale_bench.session import CodeLanguage
 
     result: dict[str, Any] = {
@@ -479,31 +482,28 @@ def _private_eval_one_problem(
     result["score_type"] = score_type
     best_code = candidate_results[best_idx].get("code", best_code)
 
-    import time
-
-    session: Any | None = None
+    owns_session = session is None
     step_ts = time.time()
     try:
         logger.info(
             f"[_private_eval_one_problem][{problem_id}] "
             f"private_eval best candidate {best_idx}"
         )
-        logger.info(
-            f"[_private_eval_one_problem][{problem_id}] Calling start() "
-            f"(lite={lite_version}, num_workers={ale_bench_num_workers})"
-        )
-        session = start(
-            problem_id=problem_id,
-            lite_version=lite_version,
-            use_same_time_scale=False,
-            session_duration=timedelta(hours=session_duration_hours),
-            num_workers=ale_bench_num_workers,
-            run_visualization_server=False,
-        )
-        logger.info(
-            f"[_private_eval_one_problem][{problem_id}] start() returned "
-            f"after {time.time() - step_ts:.1f}s"
-        )
+        if session is None:
+            logger.info(
+                f"[_private_eval_one_problem][{problem_id}] "
+                f"No provided session, using _get_ale_bench_session"
+            )
+            session = _get_ale_bench_session(
+                problem_id=problem_id,
+                lite_version=lite_version,
+                session_duration_hours=session_duration_hours,
+                ale_bench_num_workers=ale_bench_num_workers,
+            )
+        else:
+            logger.info(
+                f"[_private_eval_one_problem][{problem_id}] Reusing provided session"
+            )
         eval_ts = time.time()
         logger.info(f"[_private_eval_one_problem][{problem_id}] Calling private_eval()")
         private_result, rank, performance = session.private_eval(
@@ -539,10 +539,10 @@ def _private_eval_one_problem(
             f"[_private_eval_one_problem][{problem_id}] failed: {result['error']}"
         )
     finally:
-        if session is not None:
+        if owns_session and session is not None:
             logger.info(
-                f"[_private_eval_one_problem][{problem_id}] Closing session "
-                f"(total {time.time() - step_ts:.1f}s)"
+                f"[_private_eval_one_problem][{problem_id}] "
+                f"Closing owned session (total {time.time() - step_ts:.1f}s)"
             )
             try:
                 session.close()
@@ -889,11 +889,7 @@ def evaluate_problem_subset_with_public_scores(
         f"n_parallel={n_parallel_problems}, selection={selection_method}"
     )
 
-    if problem_sessions:
-        logger.warning(
-            "[evaluate_problem_subset_with_public_scores] "
-            "problem_sessions is deprecated and ignored; each worker creates its own session."
-        )
+    problem_sessions = problem_sessions or {}
     problem_score_types = problem_score_types or {}
 
     results_by_problem: dict[str, dict[str, Any]] = {}
@@ -918,6 +914,7 @@ def evaluate_problem_subset_with_public_scores(
                     lite_version,
                     session_duration_hours,
                     ale_bench_num_workers,
+                    problem_sessions.get(problem_id),
                     selection_method,
                     problem_score_types.get(problem_id),
                 ): problem_id
@@ -961,6 +958,7 @@ def evaluate_problem_subset_with_public_scores(
                 lite_version,
                 session_duration_hours,
                 ale_bench_num_workers,
+                problem_sessions.get(problem_id),
                 selection_method,
                 problem_score_types.get(problem_id),
             )

@@ -707,10 +707,13 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             f"[AleBenchEval-{label}] Running private eval for {len(eval_problem_ids)} problems"
         )
 
-        # Each private evaluation creates and closes its own ALE-Bench session.
-        # Sharing parent env.session objects across forked workers is unsafe
-        # because ALE-Bench sessions hold file descriptors / locks that are not
-        # fork-safe.
+        # Reuse the env sessions created for public evaluation.  Each session is
+        # already tied to a single problem and supports exactly one private_eval.
+        problem_sessions = {
+            problem_id: env.session
+            for problem_id, env in self._ale_bench_eval_envs.items()
+            if hasattr(env, "session") and env.session is not None
+        }
         selection_method = getattr(config, "ale_bench_eval_selection_method", "median")
         local_results = evaluate_problem_subset_with_public_scores(
             eval_problem_ids,
@@ -719,6 +722,7 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             session_duration_hours=4.0,
             ale_bench_num_workers=config.ale_bench_eval_num_workers,
             n_parallel_problems=config.ale_bench_eval_n_parallel_problems,
+            problem_sessions=problem_sessions,
             selection_method=selection_method,
         )
         logger.info(
