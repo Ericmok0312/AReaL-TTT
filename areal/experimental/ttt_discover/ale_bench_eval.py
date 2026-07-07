@@ -241,11 +241,18 @@ def _get_ale_bench_session(
     ale_bench_num_workers: int,
 ) -> Any:
     """Get or create a cached ALE-Bench session for the given problem."""
+    import time
+
     from ale_bench import start
 
     key = (problem_id, lite_version, session_duration_hours, ale_bench_num_workers)
     session = _ale_bench_sessions.get(key)
     if session is None:
+        logger.info(
+            f"[_get_ale_bench_session][{problem_id}] Cache miss, calling start() "
+            f"(lite={lite_version}, workers={ale_bench_num_workers})"
+        )
+        start_ts = time.time()
         session = start(
             problem_id=problem_id,
             lite_version=lite_version,
@@ -254,7 +261,13 @@ def _get_ale_bench_session(
             num_workers=ale_bench_num_workers,
             run_visualization_server=False,
         )
+        elapsed = time.time() - start_ts
+        logger.info(
+            f"[_get_ale_bench_session][{problem_id}] start() returned in {elapsed:.1f}s"
+        )
         _ale_bench_sessions[key] = session
+    else:
+        logger.info(f"[_get_ale_bench_session][{problem_id}] Cache hit")
     return session
 
 
@@ -466,11 +479,18 @@ def _private_eval_one_problem(
     result["score_type"] = score_type
     best_code = candidate_results[best_idx].get("code", best_code)
 
+    import time
+
     session: Any | None = None
+    step_ts = time.time()
     try:
         logger.info(
             f"[_private_eval_one_problem][{problem_id}] "
             f"private_eval best candidate {best_idx}"
+        )
+        logger.info(
+            f"[_private_eval_one_problem][{problem_id}] Calling start() "
+            f"(lite={lite_version}, num_workers={ale_bench_num_workers})"
         )
         session = start(
             problem_id=problem_id,
@@ -480,9 +500,19 @@ def _private_eval_one_problem(
             num_workers=ale_bench_num_workers,
             run_visualization_server=False,
         )
+        logger.info(
+            f"[_private_eval_one_problem][{problem_id}] start() returned "
+            f"after {time.time() - step_ts:.1f}s"
+        )
+        eval_ts = time.time()
+        logger.info(f"[_private_eval_one_problem][{problem_id}] Calling private_eval()")
         private_result, rank, performance = session.private_eval(
             code=best_code,
             code_language=CodeLanguage.CPP20,
+        )
+        logger.info(
+            f"[_private_eval_one_problem][{problem_id}] private_eval() returned "
+            f"after {time.time() - eval_ts:.1f}s"
         )
         result["private"] = {
             "absolute_score": float(
@@ -510,6 +540,10 @@ def _private_eval_one_problem(
         )
     finally:
         if session is not None:
+            logger.info(
+                f"[_private_eval_one_problem][{problem_id}] Closing session "
+                f"(total {time.time() - step_ts:.1f}s)"
+            )
             try:
                 session.close()
             except Exception:
@@ -846,6 +880,9 @@ def evaluate_problem_subset_with_public_scores(
         List of per-problem result dictionaries in the same order as
         ``problem_ids``.
     """
+    import time
+
+    overall_ts = time.time()
     logger.info(
         f"[evaluate_problem_subset_with_public_scores] "
         f"Starting private eval for {len(problem_ids)} problems, "
@@ -865,8 +902,13 @@ def evaluate_problem_subset_with_public_scores(
     if n_parallel_problems > 1:
         external_executor = executor is not None
         if executor is None:
+            logger.info(
+                f"[evaluate_problem_subset_with_public_scores] "
+                f"Creating ProcessPoolExecutor with {n_parallel_problems} workers"
+            )
             executor = ProcessPoolExecutor(max_workers=n_parallel_problems)
         try:
+            submit_ts = time.time()
             futures = {
                 executor.submit(
                     _private_eval_one_problem,
@@ -881,20 +923,30 @@ def evaluate_problem_subset_with_public_scores(
                 ): problem_id
                 for problem_id in problem_ids
             }
+            logger.info(
+                f"[evaluate_problem_subset_with_public_scores] "
+                f"Submitted {len(futures)} tasks in {time.time() - submit_ts:.1f}s"
+            )
             completed = 0
             for future in as_completed(futures):
                 problem_id = futures[future]
+                wait_ts = time.time()
                 result = future.result(timeout=per_problem_timeout)
                 results_by_problem[problem_id] = result
                 completed += 1
                 private = result.get("private", {})
                 logger.info(
-                    f"[PrivateEval][{completed}/{total}] {problem_id} done: "
+                    f"[PrivateEval][{completed}/{total}] {problem_id} done "
+                    f"(waited {time.time() - wait_ts:.1f}s): "
                     f"abs={private.get('absolute_score', 0.0):.2f} "
                     f"rank={private.get('rank', -1)} perf={private.get('performance', -1)}"
                 )
         finally:
             if not external_executor:
+                logger.info(
+                    "[evaluate_problem_subset_with_public_scores] "
+                    "Shutting down ProcessPoolExecutor"
+                )
                 executor.shutdown(wait=True)
         logger.info(
             "[evaluate_problem_subset_with_public_scores] All parallel problems done"
@@ -920,6 +972,11 @@ def evaluate_problem_subset_with_public_scores(
                 f"rank={private.get('rank', -1)} perf={private.get('performance', -1)}"
             )
         logger.info("[evaluate_problem_subset_with_public_scores] All problems done")
+
+    logger.info(
+        f"[evaluate_problem_subset_with_public_scores] "
+        f"Finished {len(problem_ids)} problems in {time.time() - overall_ts:.1f}s"
+    )
 
     # Preserve the caller's problem order.
     return [results_by_problem[pid] for pid in problem_ids]
