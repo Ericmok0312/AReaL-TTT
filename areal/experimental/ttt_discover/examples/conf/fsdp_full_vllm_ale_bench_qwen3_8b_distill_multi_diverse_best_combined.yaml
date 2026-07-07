@@ -22,10 +22,10 @@ enable_dynamic_metrics: false
 ale_bench_eval_enabled: false
 ale_bench_eval_before_train: false
 ale_bench_eval_freq_steps: 10
-ale_bench_eval_n_candidates: 1
+ale_bench_eval_n_candidates: 15
 ale_bench_eval_lite_version: false
-ale_bench_eval_num_workers: 16
-ale_bench_eval_n_parallel_problems: 8
+ale_bench_eval_num_workers: 64
+ale_bench_eval_n_parallel_problems: 1
 
 # Multi-teacher hint selection: combined hint with k diverse best references per problem.
 # With hint_fixed=true the same references are reused across all training steps.
