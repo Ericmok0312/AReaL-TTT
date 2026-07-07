@@ -64,7 +64,7 @@ multi_teacher:
 # Shared teacher engine uses the base model with LoRA structure so the trainer
 # can load each problem's adapter before computing teacher_logp.
 teacher:
-  backend: fsdp:d4p1t1
+  backend: fsdp:d1p1t1
   rl_loss_weight: 0.0
   distill_loss_weight: 1
   experiment_name: ${experiment_name}
@@ -103,7 +103,7 @@ actor:
     mem: 32
     cmd: python3 -m areal.infra.rpc.rpc_server
     env_vars: {}
-  backend: fsdp:d4p1t1
+  backend: fsdp:d1p1t1
   init_from_scratch: false
   disable_dropout: true
   gradient_checkpointing: true
@@ -151,7 +151,7 @@ cluster:
     type: nfs
     nfs_record_root: /tmp/areal/name_resolve
 
-allocation_mode: vllm[rollout]:d4p1t1+fsdp[actor]:d4p1t1
+allocation_mode: vllm[rollout]:d7p1t1+fsdp[actor]:d1p1t1
 
 scheduler:
   type: null
@@ -170,7 +170,7 @@ rollout:
   tokenizer_path: ${tokenizer_path}
   dump_to_file: true
   use_lora: false
-  backend: vllm:d4p1t1
+  backend: vllm:d7p1t1
 
 gconfig:
   n_samples: 32
@@ -200,7 +200,7 @@ ref:
     type: colocation
     target: actor
   scheduling_spec: ${actor.scheduling_spec}
-  backend: fsdp:d4p1t1
+  backend: fsdp:d1p1t1
 
 vllm:
   model: ${actor.path}
@@ -289,7 +289,7 @@ perf_tracer:
     enabled: false
 
 eval_models:
-  baseline: null
+  step5: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch4epochstep4globalstep4
   step10: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch9epochstep9globalstep9
-  step20: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch19epochstep19globalstep19
-  step30: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch29epochstep29globalstep29
+  step15: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch14epochstep14globalstep14
+  #step30: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/${trial_name}/default/epoch29epochstep29globalstep29
