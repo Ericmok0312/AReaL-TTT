@@ -478,6 +478,16 @@ class TTTDDistillConfig(TTTDPPOConfig):
             "1.0 means the band includes the best state."
         },
     )
+    multi_teacher_hint_percentile_diverse: bool = field(
+        default=True,
+        metadata={
+            "help": "If True (default), 'percentile_band' and "
+            "'percentile_band_combined' modes use lineage-aware diverse "
+            "sampling within the percentile band instead of uniform random "
+            "sampling.  This avoids returning multiple nearly-identical "
+            "reference codes from the same PUCT branch."
+        },
+    )
 
     # Validation / logging
     enable_dynamic_metrics: bool = field(

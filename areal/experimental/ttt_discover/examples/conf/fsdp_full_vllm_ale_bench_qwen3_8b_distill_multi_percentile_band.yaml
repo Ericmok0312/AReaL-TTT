@@ -35,6 +35,7 @@ multi_teacher_hint_k: 8
 multi_teacher_hint_fixed: false
 multi_teacher_hint_percentile_low: 0.5
 multi_teacher_hint_percentile_high: 1.0
+multi_teacher_hint_percentile_diverse: true
 
 # One entry per trained ALE-Bench problem.  The trainer builds a mixed batch with
 # one group per problem (8 problems x 32 rollouts = 256 total rollouts per step).

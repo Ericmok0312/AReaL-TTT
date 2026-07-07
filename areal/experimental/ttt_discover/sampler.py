@@ -1742,6 +1742,7 @@ class PUCTSampler(StateSampler):
         k: int = 1,
         percentile_low: float = 0.5,
         percentile_high: float = 1.0,
+        diverse: bool = True,
     ) -> list[State]:
         """Return up to k states whose value falls in a percentile band.
 
@@ -1757,12 +1758,18 @@ class PUCTSampler(StateSampler):
             Lower percentile bound in [0, 1].
         percentile_high : float
             Upper percentile bound in [0, 1].
+        diverse : bool
+            If True (default), randomly shuffle the band and then greedily
+            pick states from different PUCT lineages using ``_diverse_top_k``.
+            This gives random sampling while avoiding references that are
+            nearly-identical refinements of the same branch.  If False,
+            sample uniformly at random from the band.
 
         Returns
         -------
         list[State]
-            Up to k randomly sampled states from the band.  If the band
-            contains fewer than k states, all of them are returned.
+            Up to k sampled states from the band.  If the band contains fewer
+            than k states, all of them are returned.
         """
         with self._lock:
             candidates = [s for s in self._states if s.value is not None]
@@ -1776,6 +1783,9 @@ class PUCTSampler(StateSampler):
                 return []
             if len(band) <= k:
                 return band
+            if diverse:
+                random.shuffle(band)
+                return self._diverse_top_k(band, k)
             return random.sample(band, k)
 
     def extract_milestone_paths(
@@ -1933,6 +1943,7 @@ class PUCTSampler(StateSampler):
         deterministic: bool = False,
         percentile_low: float = 0.5,
         percentile_high: float = 1.0,
+        percentile_diverse: bool = True,
     ) -> list[tuple[str, State | tuple[State, State]]]:
         """Extract a pool of privileged hint states for multi-teacher distillation.
 
@@ -1970,6 +1981,9 @@ class PUCTSampler(StateSampler):
             Lower percentile bound (in [0, 1]) for ``percentile_band_combined``.
         percentile_high : float
             Upper percentile bound (in [0, 1]) for ``percentile_band_combined``.
+        percentile_diverse : bool
+            If True (default), ``percentile_band*`` modes prefer states from
+            different PUCT lineages instead of uniform random sampling.
 
         Returns
         -------
@@ -2028,6 +2042,7 @@ class PUCTSampler(StateSampler):
                 k=k,
                 percentile_low=percentile_low,
                 percentile_high=percentile_high,
+                diverse=percentile_diverse,
             )
             if band_states:
                 hints.append(("percentile_band_combined", (band_states, [])))
@@ -2036,6 +2051,7 @@ class PUCTSampler(StateSampler):
                 k=k,
                 percentile_low=percentile_low,
                 percentile_high=percentile_high,
+                diverse=percentile_diverse,
             )
             for s in band_states:
                 hints.append(("percentile_band", s))

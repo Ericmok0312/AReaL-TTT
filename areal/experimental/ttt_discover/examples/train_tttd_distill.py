@@ -1963,6 +1963,9 @@ class TTTDDistillTrainer(PPOTrainer):
         percentile_high = getattr(
             self.config, "multi_teacher_hint_percentile_high", 1.0
         )
+        percentile_diverse = getattr(
+            self.config, "multi_teacher_hint_percentile_diverse", True
+        )
         hints = teacher_sampler.get_hint_states(
             mode=mode,
             k=hint_k,
@@ -1970,6 +1973,7 @@ class TTTDDistillTrainer(PPOTrainer):
             deterministic=deterministic,
             percentile_low=percentile_low,
             percentile_high=percentile_high,
+            percentile_diverse=percentile_diverse,
         )
         if not hints:
             if fixed:
@@ -2102,11 +2106,30 @@ class TTTDDistillTrainer(PPOTrainer):
         percentile_high = getattr(
             self.config, "multi_teacher_hint_percentile_high", 1.0
         )
+        percentile_diverse = getattr(
+            self.config, "multi_teacher_hint_percentile_diverse", True
+        )
         states = teacher_sampler.get_percentile_band_states(
             k=hint_k,
             percentile_low=percentile_low,
             percentile_high=percentile_high,
+            diverse=percentile_diverse,
         )
+        if states:
+            def _fmt_state_id(s):
+                sid = getattr(s, "id", "?")
+                if sid is not None and hasattr(sid, "__len__") and len(sid) > 8:
+                    return sid[:8]
+                return str(sid)
+
+            logger.info(
+                f"[PerRolloutHints-{problem_id}] Sampled {len(states)} refs from "
+                f"band [{percentile_low}, {percentile_high}]: "
+                + ", ".join(
+                    f"{_fmt_state_id(s)}(value={s.value:.6f})"
+                    for s in states
+                )
+            )
         if not states:
             logger.warning(
                 f"[PerRolloutHints-{problem_id}] No states in percentile band "
