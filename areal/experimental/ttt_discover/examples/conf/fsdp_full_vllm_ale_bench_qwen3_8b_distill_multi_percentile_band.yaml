@@ -4,8 +4,8 @@ trial_name: trial0
 is_tttd_config: true
 seed: 1
 enable_offload: false
-max_steps: 30
-total_train_epochs: 30
+max_steps: 15
+total_train_epochs: 15
 enable_thinking: true
 reset_puct_stats_on_resume: false
 student_sampler_inherit_teacher_pool: false
