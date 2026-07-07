@@ -152,6 +152,19 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
         if self._ale_bench_eval_envs:
             self.env = next(iter(self._ale_bench_eval_envs.values()))
 
+        # Create a single eval workflow instance and reuse it for all public
+        # evaluations.  This keeps the AsyncRewardWrapper/ProcessPoolExecutor
+        # alive across problems/models so that worker processes do not exit
+        # between public and private eval (which would trigger atexit handlers
+        # inherited from the main process and delete ALE-Bench tool dirs).
+        self._eval_workflow: MultiProblemTTTDiscoverWorkflowV2 | None = None
+        if self._ale_bench_eval_envs:
+            self._eval_workflow = self._create_eval_workflow()
+            logger.info(
+                f"[AleBenchEval] Created anchor eval workflow with "
+                f"{self._eval_workflow.async_reward_fn.max_workers} reward workers"
+            )
+
         # Determine which models to evaluate
         eval_models = getattr(config, "eval_models", None)
         if eval_models is None:
@@ -372,6 +385,42 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
         config.sampler.problem_id = original_problem_id
         config.sampler.num_cpus = original_num_cpus
 
+    def _create_eval_workflow(self) -> MultiProblemTTTDiscoverWorkflowV2:
+        """Create a single reusable eval workflow for ALE-Bench public eval."""
+        config = self.config
+        n_candidates = config.ale_bench_eval_n_candidates
+
+        base_eval_gconfig = config.eval_gconfig or config.gconfig
+        eval_gconfig = base_eval_gconfig.new(n_samples=n_candidates)
+
+        public_reward_fn = functools.partial(
+            ale_bench_public_reward_fn,
+            lite_version=config.ale_bench_eval_lite_version,
+            session_duration_hours=4.0,
+            ale_bench_num_workers=config.ale_bench_eval_num_workers,
+        )
+
+        # Public eval can be CPU/Docker heavy; allow concurrent reward workers so
+        # multiple problems' public evaluations overlap.  Cap at n_parallel_problems
+        # to avoid oversubscribing the CPU pool used by each ALE-Bench session.
+        max_reward_workers = max(1, config.ale_bench_eval_n_parallel_problems)
+
+        eval_workflow_kwargs = dict(
+            env=self.env,
+            problem_envs=self._ale_bench_eval_envs,
+            gconfig=eval_gconfig,
+            tokenizer=self.tokenizer,
+            enable_thinking=config.enable_thinking,
+            max_prompt_thinking_tokens=config.max_prompt_thinking_tokens,
+            batch_size=1,
+            group_size=n_candidates,
+            lazy_sampling=False,
+            reward_fn=public_reward_fn,
+            max_reward_workers=max_reward_workers,
+            distill_mode=True,
+        )
+        return MultiProblemTTTDiscoverWorkflowV2(**eval_workflow_kwargs)
+
     def _zero_lora_weights(self, engine):
         """Zero out all LoRA parameters so the model behaves like the pure base model."""
         logger.info("[LoadAdapter] Zeroing out LoRA weights for base model evaluation")
@@ -544,35 +593,12 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
         if not eval_problem_ids:
             return local_candidates, public_results_by_problem, {}
 
-        base_eval_gconfig = config.eval_gconfig or config.gconfig
-        eval_gconfig = base_eval_gconfig.new(n_samples=n_candidates)
-
-        public_reward_fn = functools.partial(
-            ale_bench_public_reward_fn,
-            lite_version=config.ale_bench_eval_lite_version,
-            session_duration_hours=4.0,
-            ale_bench_num_workers=config.ale_bench_eval_num_workers,
-        )
-
-        # Public eval can be CPU/Docker heavy; allow concurrent reward workers so
-        # multiple problems' public evaluations overlap.  Cap at n_parallel_problems
-        # to avoid oversubscribing the CPU pool used by each ALE-Bench session.
-        max_reward_workers = max(1, config.ale_bench_eval_n_parallel_problems)
-        eval_workflow_kwargs = dict(
-            env=self.env,
-            problem_envs=self._ale_bench_eval_envs,
-            gconfig=eval_gconfig,
-            tokenizer=self.tokenizer,
-            enable_thinking=config.enable_thinking,
-            max_prompt_thinking_tokens=config.max_prompt_thinking_tokens,
-            batch_size=1,
-            group_size=n_candidates,
-            lazy_sampling=False,
-            reward_fn=public_reward_fn,
-            max_reward_workers=max_reward_workers,
-            distill_mode=True,
-        )
-        eval_workflow_cls = MultiProblemTTTDiscoverWorkflowV2
+        eval_workflow = self._eval_workflow
+        if eval_workflow is None:
+            raise ValueError(
+                "No eval workflow available. ALE-Bench eval may be disabled or "
+                "no problem envs were created."
+            )
 
         data_list: list[dict[str, Any]] = []
         for problem_id in eval_problem_ids:
@@ -606,8 +632,8 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
         for data in data_list:
             task_id = self.eval_rollout.submit(
                 data,
-                eval_workflow_cls,
-                workflow_kwargs=eval_workflow_kwargs,
+                eval_workflow,
+                workflow_kwargs=None,
                 group_size=n_candidates,
                 is_eval=True,
             )
@@ -865,6 +891,19 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
                         )
 
         self.stats_logger.close()
+
+        # Shutdown the anchor eval workflow after ALE-Bench sessions are closed.
+        # This releases the AsyncRewardWrapper ProcessPoolExecutor workers; doing
+        # it after session.close() prevents worker atexit handlers from deleting
+        # tool dirs while the main sessions are still in use.
+        if hasattr(self, "_eval_workflow") and self._eval_workflow is not None:
+            try:
+                self._eval_workflow.shutdown()
+                logger.info("[AleBenchEval] Eval workflow shutdown completed.")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[AleBenchEval] Error shutting down eval workflow: {e}")
+            self._eval_workflow = None
+
         if hasattr(self, "eval_rollout") and self.eval_rollout is not None:
             self.eval_rollout.destroy()
         if hasattr(self, "rollout") and self.rollout is not None:
