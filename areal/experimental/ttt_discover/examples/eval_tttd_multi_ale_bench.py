@@ -443,9 +443,7 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
         model_path = self._eval_models[label]
 
         if not model_path:
-            logger.info(
-                f"[MultiEval-{label}] Evaluating pure base model (no adapter)"
-            )
+            logger.info(f"[MultiEval-{label}] Evaluating pure base model (no adapter)")
             self._zero_lora_weights(self.actor)
         else:
             ckpt_type = self._detect_checkpoint_type(model_path)
@@ -709,14 +707,10 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             f"[AleBenchEval-{label}] Running private eval for {len(eval_problem_ids)} problems"
         )
 
-        # Reuse the env sessions created in _setup_ale_bench_eval.  Each worker
-        # gets a forked copy of the session, runs exactly one private_eval, and
-        # returns; the parent session is protected from child-process cleanup.
-        problem_sessions = {
-            problem_id: env.session
-            for problem_id, env in self._ale_bench_eval_envs.items()
-            if hasattr(env, "session") and env.session is not None
-        }
+        # Each private evaluation creates and closes its own ALE-Bench session.
+        # Sharing parent env.session objects across forked workers is unsafe
+        # because ALE-Bench sessions hold file descriptors / locks that are not
+        # fork-safe.
         selection_method = getattr(config, "ale_bench_eval_selection_method", "median")
         local_results = evaluate_problem_subset_with_public_scores(
             eval_problem_ids,
@@ -725,7 +719,6 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             session_duration_hours=4.0,
             ale_bench_num_workers=config.ale_bench_eval_num_workers,
             n_parallel_problems=config.ale_bench_eval_n_parallel_problems,
-            problem_sessions=problem_sessions,
             selection_method=selection_method,
         )
         logger.info(

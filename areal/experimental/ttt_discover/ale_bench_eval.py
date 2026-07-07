@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import atexit
 import json
-import multiprocessing
 import os
 import traceback
 from collections.abc import Sequence
@@ -46,22 +45,6 @@ def _case_absolute_score(case) -> float:
         if val is not None:
             return float(val)
     return 0.0
-
-
-def _maybe_unregister_child_atexit(session: Any) -> None:
-    """Prevent a forked worker from closing a session owned by the parent.
-
-    ALE-Bench registers ``session.close`` with :mod:`atexit`.  When a session is
-    passed to a ``ProcessPoolExecutor`` worker via ``fork()``, the child process
-    inherits the same object and will delete the parent's ``tool_dir`` on exit
-    unless we unregister the handler in the child.
-    """
-    if multiprocessing.current_process().name == "MainProcess":
-        return
-    try:
-        atexit.unregister(session.close)
-    except Exception:
-        pass
 
 
 def _reset_private_eval_counter(session: Any) -> None:
@@ -435,7 +418,6 @@ def _private_eval_one_problem(
     lite_version: bool,
     session_duration_hours: float,
     ale_bench_num_workers: int,
-    session: Any | None = None,
     selection_method: str = "median",
     score_type: str | None = None,
 ) -> dict[str, Any]:
@@ -445,9 +427,11 @@ def _private_eval_one_problem(
     (e.g. produced by ``ale_bench_public_reward_fn``).  The best candidate is
     selected according to ``selection_method``.
 
+    A fresh ALE-Bench session is created for this single private evaluation and
+    closed afterwards.  Sessions are intentionally not reused across calls or
+    workers to avoid fork-safety and resource-accounting issues.
+
     Args:
-        session: Optional pre-built ALE-Bench session to reuse. If provided,
-            the caller retains ownership and this function will not close it.
         selection_method: ``"median"`` for official ALE-Bench median selection
             (closest to median of ``overall_absolute_score``),
             ``"median_case_score"`` for legacy highest per-candidate median, or
@@ -455,6 +439,9 @@ def _private_eval_one_problem(
         score_type: ``"minimize"`` or ``"maximize"``. If not provided, loaded
             from the problem metadata.
     """
+    from datetime import timedelta
+
+    from ale_bench import start
     from ale_bench.session import CodeLanguage
 
     result: dict[str, Any] = {
@@ -479,24 +466,20 @@ def _private_eval_one_problem(
     result["score_type"] = score_type
     best_code = candidate_results[best_idx].get("code", best_code)
 
-    owns_session = session is None
+    session: Any | None = None
     try:
         logger.info(
             f"[_private_eval_one_problem][{problem_id}] "
             f"private_eval best candidate {best_idx}"
         )
-        if session is None:
-            session = _get_ale_bench_session(
-                problem_id=problem_id,
-                lite_version=lite_version,
-                session_duration_hours=session_duration_hours,
-                ale_bench_num_workers=ale_bench_num_workers,
-            )
-        else:
-            logger.info(
-                f"[_private_eval_one_problem][{problem_id}] Reusing provided session"
-            )
-            _maybe_unregister_child_atexit(session)
+        session = start(
+            problem_id=problem_id,
+            lite_version=lite_version,
+            use_same_time_scale=False,
+            session_duration=timedelta(hours=session_duration_hours),
+            num_workers=ale_bench_num_workers,
+            run_visualization_server=False,
+        )
         private_result, rank, performance = session.private_eval(
             code=best_code,
             code_language=CodeLanguage.CPP20,
@@ -526,7 +509,7 @@ def _private_eval_one_problem(
             f"[_private_eval_one_problem][{problem_id}] failed: {result['error']}"
         )
     finally:
-        if owns_session and session is not None:
+        if session is not None:
             try:
                 session.close()
             except Exception:
@@ -823,6 +806,8 @@ def evaluate_problem_subset_with_public_scores(
     problem_sessions: dict[str, Any] | None = None,
     selection_method: str = "median",
     problem_score_types: dict[str, str] | None = None,
+    per_problem_timeout: float | None = None,
+    executor: ProcessPoolExecutor | None = None,
 ) -> list[dict[str, Any]]:
     """Run only private evaluation after public scores are already known.
 
@@ -851,6 +836,11 @@ def evaluate_problem_subset_with_public_scores(
             or ``"maximize"``. Used for ``"best_public"`` and
             ``"median_case_score"`` selection. If a problem is missing, the
             score type is loaded from problem metadata.
+        per_problem_timeout: Optional timeout in seconds for each problem's
+            private evaluation. If None, wait indefinitely.
+        executor: Optional external ProcessPoolExecutor to use. If provided, the
+            caller is responsible for shutting it down. If None, a temporary
+            executor is created and destroyed inside this function.
 
     Returns:
         List of per-problem result dictionaries in the same order as
@@ -862,14 +852,21 @@ def evaluate_problem_subset_with_public_scores(
         f"n_parallel={n_parallel_problems}, selection={selection_method}"
     )
 
-    problem_sessions = problem_sessions or {}
+    if problem_sessions:
+        logger.warning(
+            "[evaluate_problem_subset_with_public_scores] "
+            "problem_sessions is deprecated and ignored; each worker creates its own session."
+        )
     problem_score_types = problem_score_types or {}
 
     results_by_problem: dict[str, dict[str, Any]] = {}
     total = len(problem_ids)
 
     if n_parallel_problems > 1:
-        with ProcessPoolExecutor(max_workers=n_parallel_problems) as executor:
+        external_executor = executor is not None
+        if executor is None:
+            executor = ProcessPoolExecutor(max_workers=n_parallel_problems)
+        try:
             futures = {
                 executor.submit(
                     _private_eval_one_problem,
@@ -879,7 +876,6 @@ def evaluate_problem_subset_with_public_scores(
                     lite_version,
                     session_duration_hours,
                     ale_bench_num_workers,
-                    problem_sessions.get(problem_id),
                     selection_method,
                     problem_score_types.get(problem_id),
                 ): problem_id
@@ -888,7 +884,7 @@ def evaluate_problem_subset_with_public_scores(
             completed = 0
             for future in as_completed(futures):
                 problem_id = futures[future]
-                result = future.result()
+                result = future.result(timeout=per_problem_timeout)
                 results_by_problem[problem_id] = result
                 completed += 1
                 private = result.get("private", {})
@@ -897,6 +893,9 @@ def evaluate_problem_subset_with_public_scores(
                     f"abs={private.get('absolute_score', 0.0):.2f} "
                     f"rank={private.get('rank', -1)} perf={private.get('performance', -1)}"
                 )
+        finally:
+            if not external_executor:
+                executor.shutdown(wait=True)
         logger.info(
             "[evaluate_problem_subset_with_public_scores] All parallel problems done"
         )
@@ -910,7 +909,6 @@ def evaluate_problem_subset_with_public_scores(
                 lite_version,
                 session_duration_hours,
                 ale_bench_num_workers,
-                problem_sessions.get(problem_id),
                 selection_method,
                 problem_score_types.get(problem_id),
             )
@@ -1117,14 +1115,11 @@ def _private_eval_all_candidates_one_problem(
     ALE-Bench hard-codes ``maximum_resource_usage.num_call_private_eval=1``.
     To evaluate multiple candidates on the same session without rebuilding Rust
     tools, this function resets the session's private-eval counter before each
-    candidate.  If ``session`` is provided (e.g. an env session shared with
-    public eval), it is reused; otherwise a fresh session is created.
+    candidate.  Sessions are not shared across processes; each worker creates
+    and caches its own session via ``_get_ale_bench_session``.
 
     Returns a dict with per-candidate private results and aggregated statistics.
     """
-    from datetime import timedelta
-
-    from ale_bench import start
     from ale_bench.session import CodeLanguage
 
     result: dict[str, Any] = {
@@ -1143,23 +1138,13 @@ def _private_eval_all_candidates_one_problem(
         score_type = _get_problem_score_type(problem_id, lite_version)
     result["score_type"] = score_type
 
-    owns_session = session is None
     try:
-        if session is None:
-            session = start(
-                problem_id=problem_id,
-                lite_version=lite_version,
-                use_same_time_scale=False,
-                session_duration=timedelta(hours=session_duration_hours),
-                num_workers=ale_bench_num_workers,
-                run_visualization_server=False,
-            )
-        else:
-            logger.info(
-                f"[_private_eval_all_candidates_one_problem][{problem_id}] "
-                f"Reusing provided session for {len(candidate_results)} candidates"
-            )
-            _maybe_unregister_child_atexit(session)
+        session = _get_ale_bench_session(
+            problem_id=problem_id,
+            lite_version=lite_version,
+            session_duration_hours=session_duration_hours,
+            ale_bench_num_workers=ale_bench_num_workers,
+        )
 
         private_results: list[dict[str, Any]] = []
         n_total = len(candidate_results)
@@ -1232,12 +1217,6 @@ def _private_eval_all_candidates_one_problem(
         logger.error(
             f"[_private_eval_all_candidates_one_problem][{problem_id}] failed: {result['error']}"
         )
-    finally:
-        if owns_session and session is not None:
-            try:
-                session.close()
-            except Exception:
-                pass
 
     return result
 
@@ -1251,6 +1230,8 @@ def evaluate_all_candidates_private(
     n_parallel_problems: int = 1,
     problem_sessions: dict[str, Any] | None = None,
     problem_score_types: dict[str, str] | None = None,
+    per_problem_timeout: float | None = None,
+    executor: ProcessPoolExecutor | None = None,
 ) -> list[dict[str, Any]]:
     """Run private evaluation on every candidate for a subset of problems.
 
@@ -1267,12 +1248,16 @@ def evaluate_all_candidates_private(
         ale_bench_num_workers: ``num_workers`` passed to ``ale_bench.start``.
         n_parallel_problems: Number of problems to evaluate concurrently in a
             local process pool.
-        problem_sessions: Optional mapping from problem_id to pre-built
-            ALE-Bench session.  If provided, the session is reused (with the
-            private-eval counter reset before each candidate) instead of
-            creating a new session inside each worker.
+        problem_sessions: Deprecated and ignored. ALE-Bench sessions are not
+            safe to share across forked workers. Each worker creates and caches
+            its own session via ``_get_ale_bench_session``.
         problem_score_types: Optional mapping from problem_id to ``"minimize"``
             or ``"maximize"``.  Used for private-score statistics.
+        per_problem_timeout: Optional timeout in seconds for each problem's
+            private evaluation. If None, wait indefinitely.
+        executor: Optional external ProcessPoolExecutor to use. If provided, the
+            caller is responsible for shutting it down. If None, a temporary
+            executor is created and destroyed inside this function.
 
     Returns:
         List of per-problem result dictionaries in the same order as
@@ -1283,13 +1268,20 @@ def evaluate_all_candidates_private(
         f"{len(problem_ids)} problems, n_parallel={n_parallel_problems}"
     )
 
-    problem_sessions = problem_sessions or {}
+    if problem_sessions:
+        logger.warning(
+            "[evaluate_all_candidates_private] "
+            "problem_sessions is deprecated and ignored; each worker creates its own session."
+        )
     problem_score_types = problem_score_types or {}
     results_by_problem: dict[str, dict[str, Any]] = {}
     total = len(problem_ids)
 
     if n_parallel_problems > 1:
-        with ProcessPoolExecutor(max_workers=n_parallel_problems) as executor:
+        external_executor = executor is not None
+        if executor is None:
+            executor = ProcessPoolExecutor(max_workers=n_parallel_problems)
+        try:
             futures = {
                 executor.submit(
                     _private_eval_all_candidates_one_problem,
@@ -1298,7 +1290,7 @@ def evaluate_all_candidates_private(
                     lite_version,
                     session_duration_hours,
                     ale_bench_num_workers,
-                    problem_sessions.get(problem_id),
+                    None,
                     problem_score_types.get(problem_id),
                 ): problem_id
                 for problem_id in problem_ids
@@ -1306,7 +1298,7 @@ def evaluate_all_candidates_private(
             completed = 0
             for future in as_completed(futures):
                 problem_id = futures[future]
-                result = future.result()
+                result = future.result(timeout=per_problem_timeout)
                 results_by_problem[problem_id] = result
                 completed += 1
                 stats = result.get("private_stats", {})
@@ -1316,6 +1308,9 @@ def evaluate_all_candidates_private(
                     f"accepted={stats.get('count_accepted', 0)} "
                     f"mean_abs={stats.get('absolute_score', {}).get('mean', 0.0):.2f}"
                 )
+        finally:
+            if not external_executor:
+                executor.shutdown(wait=True)
         logger.info("[evaluate_all_candidates_private] All parallel problems done")
     else:
         for idx, problem_id in enumerate(problem_ids, start=1):
