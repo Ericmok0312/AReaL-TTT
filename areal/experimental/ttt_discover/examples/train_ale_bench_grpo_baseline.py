@@ -51,11 +51,11 @@ def _patch_async_reward_wrapper() -> None:
             max_retries: int = 3,
         ):
             # ALE-Bench starts one Docker-backed session per worker/problem.
-            # The default heuristic can spawn too many workers and overwhelm
-            # Docker, causing repeated session creation.  Use a single worker
-            # to serialize public evaluations and avoid session storms.
+            # Since we now pre-create envs in the main process, workers reuse
+            # those sessions instead of calling start() themselves.  Use the
+            # same default as TTT-Discover training.
             if max_workers is None:
-                max_workers = 1
+                max_workers = 64
             super().__init__(
                 reward_fn,
                 timeout_seconds=timeout_seconds,
