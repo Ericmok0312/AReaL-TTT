@@ -293,6 +293,6 @@ perf_tracer:
     enabled: false
 
 eval_models:
-  step2: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/trial0/default/epoch1epochstep1globalstep1
+  #step2: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/trial0/default/epoch1epochstep1globalstep1
   step5: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/trial0/default/epoch4epochstep4globalstep4
   #step15: ${cluster.fileroot}/checkpoints/eric/${experiment_name}/trial0/default/epoch14epochstep14globalstep14
