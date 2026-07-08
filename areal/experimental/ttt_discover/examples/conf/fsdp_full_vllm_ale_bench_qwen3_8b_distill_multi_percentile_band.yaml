@@ -68,7 +68,7 @@ multi_teacher:
 # Shared teacher engine uses the base model with LoRA structure so the trainer
 # can load each problem's adapter before computing teacher_logp.
 teacher:
-  backend: fsdp:d4p1t1
+  backend: fsdp:d1p1t1
   rl_loss_weight: 0.0
   distill_loss_weight: 1
   experiment_name: ${experiment_name}
@@ -107,7 +107,7 @@ actor:
     mem: 32
     cmd: python3 -m areal.infra.rpc.rpc_server
     env_vars: {}
-  backend: fsdp:d4p1t1
+  backend: fsdp:d1p1t1
   init_from_scratch: false
   disable_dropout: true
   gradient_checkpointing: true
@@ -155,7 +155,7 @@ cluster:
     type: nfs
     nfs_record_root: /tmp/areal/name_resolve
 
-allocation_mode: vllm[rollout]:d4p1t1+fsdp[actor]:d4p1t1
+allocation_mode: vllm[rollout]:d7p1t1+fsdp[actor]:d1p1t1
 
 scheduler:
   type: null
@@ -174,7 +174,7 @@ rollout:
   tokenizer_path: ${tokenizer_path}
   dump_to_file: true
   use_lora: false
-  backend: vllm:d4p1t1
+  backend: vllm:d7p1t1
 
 gconfig:
   n_samples: 32
@@ -204,7 +204,7 @@ ref:
     type: colocation
     target: actor
   scheduling_spec: ${actor.scheduling_spec}
-  backend: fsdp:d4p1t1
+  backend: fsdp:d1p1t1
 
 vllm:
   model: ${actor.path}
@@ -214,7 +214,7 @@ vllm:
   no_enable_prefix_caching: false
   dtype: ${actor.dtype}
   max_model_len: 32768
-  gpu_memory_utilization: 0.7
+  gpu_memory_utilization: 0.9
   enforce_eager: false
   enable_lora: false
   max_lora_rank: 32
