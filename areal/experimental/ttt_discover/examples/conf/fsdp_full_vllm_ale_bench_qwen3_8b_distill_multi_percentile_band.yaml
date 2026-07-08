@@ -214,7 +214,7 @@ vllm:
   no_enable_prefix_caching: false
   dtype: ${actor.dtype}
   max_model_len: 32768
-  gpu_memory_utilization: 0.8
+  gpu_memory_utilization: 0.7
   enforce_eager: false
   enable_lora: false
   max_lora_rank: 32
