@@ -36,6 +36,35 @@ from areal.experimental.ttt_discover.ale_bench_baseline_reward import (
 from areal.utils.hf_utils import load_hf_tokenizer
 
 
+# ALE-Bench session creation can take >15s on the first evaluation, but
+# AReaL's RLVRWorkflow hard-codes AsyncRewardWrapper(timeout_seconds=15).
+# Monkey-patch the class seen by RLVRWorkflow to use a generous timeout.
+def _patch_async_reward_wrapper() -> None:
+    from areal.api.reward_api import AsyncRewardWrapper
+
+    class _AsyncRewardWrapperWithTimeout(AsyncRewardWrapper):
+        def __init__(
+            self,
+            reward_fn,
+            timeout_seconds: float = 1200,
+            max_workers: int | None = None,
+            max_retries: int = 3,
+        ):
+            super().__init__(
+                reward_fn,
+                timeout_seconds=timeout_seconds,
+                max_workers=max_workers,
+                max_retries=max_retries,
+            )
+
+    import areal.workflow.rlvr as _rlvr_mod
+
+    _rlvr_mod.AsyncRewardWrapper = _AsyncRewardWrapperWithTimeout
+
+
+_patch_async_reward_wrapper()
+
+
 @dataclass
 class AleBenchGRPOConfig(GRPOConfig):
     """GRPO config extended with ALE-Bench baseline knobs."""
