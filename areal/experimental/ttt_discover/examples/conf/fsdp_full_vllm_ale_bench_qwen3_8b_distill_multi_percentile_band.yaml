@@ -4,8 +4,8 @@ trial_name: trial0
 is_tttd_config: true
 seed: 1
 enable_offload: false
-max_steps: 15
-total_train_epochs: 15
+max_steps: 5
+total_train_epochs: 5
 enable_thinking: true
 reset_puct_stats_on_resume: false
 student_sampler_inherit_teacher_pool: false
@@ -98,7 +98,7 @@ actor:
   dtype: bfloat16
   mb_spec:
     max_tokens_per_mb: 32768
-    n_mbs: 4
+    n_mbs: 8
     granularity: 1
   scheduling_spec:
   - task_type: worker
