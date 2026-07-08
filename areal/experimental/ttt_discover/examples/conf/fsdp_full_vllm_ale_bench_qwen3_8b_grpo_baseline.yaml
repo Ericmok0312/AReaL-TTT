@@ -23,7 +23,7 @@ ale_bench_problem_ids:
   - ahc015
   - ahc016
 ale_bench_lite_version: false
-ale_bench_num_workers: 1
+ale_bench_num_workers: 2
 ale_bench_n_repeats: 20
 
 tokenizer_path: ${actor.path}

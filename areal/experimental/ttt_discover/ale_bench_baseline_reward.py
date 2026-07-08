@@ -14,6 +14,7 @@ This module is meant to be used with AReaL's standard ``PPOTrainer`` and
 
 from __future__ import annotations
 
+import pickle
 from typing import Any
 
 from areal.experimental.ttt_discover.envs.ale_bench import AleBenchEnv
@@ -53,6 +54,16 @@ Execution time limit: {time_limit} sec / Memory limit: {memory_limit} MiB
 """
 
 
+def _is_picklable(obj: Any) -> bool:
+    """Return True if ``obj`` can be pickled for ProcessPoolExecutor workers."""
+    try:
+        pickle.dumps(obj)
+        return True
+    except Exception as exc:
+        logger.warning(f"[AleBenchBaselineReward] Object is not picklable: {exc}")
+        return False
+
+
 def _get_env(
     problem_id: str, lite_version: bool, log_dir: str, num_cpus: int
 ) -> AleBenchEnv:
@@ -90,10 +101,26 @@ class AleBenchBaselineRewardFn:
         lite_version: bool = False,
         log_dir: str = "./outputs_ale_bench",
         num_cpus: int = 2,
+        problem_ids: list[str] | None = None,
     ):
         self.lite_version = lite_version
         self.log_dir = log_dir
         self.num_cpus = num_cpus
+
+        # Pre-create ALE-Bench envs in the main process and carry them into
+        # ProcessPoolExecutor workers.  This avoids the slow/problematic
+        # ``ale_bench.start()`` call inside forked workers.
+        self._envs: dict[str, AleBenchEnv] = {}
+        if problem_ids:
+            for problem_id in problem_ids:
+                env = _get_env(problem_id, lite_version, log_dir, num_cpus)
+                if _is_picklable(env):
+                    self._envs[problem_id] = env
+                else:
+                    logger.warning(
+                        f"[AleBenchBaselineReward] Env for {problem_id} is not "
+                        "picklable; workers will create it lazily."
+                    )
 
     def __call__(
         self,
@@ -110,7 +137,11 @@ class AleBenchBaselineRewardFn:
         both maximization and minimization problems to a higher-is-better scale.
         """
         try:
-            env = _get_env(problem_id, self.lite_version, self.log_dir, self.num_cpus)
+            env = self._envs.get(problem_id)
+            if env is None:
+                env = _get_env(
+                    problem_id, self.lite_version, self.log_dir, self.num_cpus
+                )
             code = env.extract_code(completions)
             if code is None or not code.strip():
                 logger.warning(
