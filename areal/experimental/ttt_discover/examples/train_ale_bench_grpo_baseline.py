@@ -50,6 +50,11 @@ def _patch_async_reward_wrapper() -> None:
             max_workers: int | None = None,
             max_retries: int = 3,
         ):
+            # ALE-Bench starts one Docker-backed session per worker/problem.
+            # The default heuristic can spawn too many workers and overwhelm
+            # Docker, causing repeated session creation.  Cap at 4 workers.
+            if max_workers is None:
+                max_workers = 4
             super().__init__(
                 reward_fn,
                 timeout_seconds=timeout_seconds,
