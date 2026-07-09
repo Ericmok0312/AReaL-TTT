@@ -1,0 +1,216 @@
+# ALE-Bench evaluation config for GRPO baseline full-model checkpoints.
+#
+# Evaluates the base model plus the two saved GRPO checkpoints on the full
+# ALE-Bench corpus using public→private median selection.
+#
+# Run with:
+#   python -m areal.infra.launcher.local \
+#       areal/experimental/ttt_discover/examples/eval_tttd_multi_ale_bench.py \
+#       --config areal/experimental/ttt_discover/examples/conf/fsdp_full_vllm_ale_bench_qwen3_8b_grpo_baseline_eval.yaml
+
+is_tttd_config: true
+experiment_name: ale-bench-grpo-baseline-full-qwen3-8b
+trial_name: trial0
+
+seed: 1
+enable_offload: false
+total_train_epochs: 1
+enable_thinking: true
+max_prompt_thinking_tokens: 26000
+
+# ALE-Bench full-corpus evaluation (public→private, median selection)
+ale_bench_eval_enabled: false
+ale_bench_eval_before_train: false
+ale_bench_eval_freq_steps: 10
+ale_bench_eval_n_candidates: 15
+ale_bench_eval_lite_version: false
+ale_bench_eval_num_workers: 64
+ale_bench_eval_n_parallel_problems: 1
+
+# Training problem IDs (used to compute out-of-training averages).
+# Only problem_id is required for evaluation; sampler_checkpoint/lora_path are
+# left empty because GRPO baseline does not use teacher samplers/adapters.
+multi_teacher:
+  - problem_id: ahc025
+  - problem_id: ahc026
+  - problem_id: ahc027
+  - problem_id: ahc039
+  - problem_id: ahc046
+  - problem_id: ahc011
+  - problem_id: ahc015
+  - problem_id: ahc016
+
+# Models to evaluate: base model + the two GRPO checkpoints.
+eval_models:
+  #baseline: null
+  step4: /mnt/data/eric_tttopd/outputs_ale_bench_grpo_baseline_full/checkpoints/eric/ale-bench-grpo-baseline-full-qwen3-8b/trial0/default/epoch0epochstep4globalstep4
+  step9: /mnt/data/eric_tttopd/outputs_ale_bench_grpo_baseline_full/checkpoints/eric/ale-bench-grpo-baseline-full-qwen3-8b/trial0/default/epoch0epochstep9globalstep9
+
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 1
+  n_gpus_per_node: 8
+  fileroot: /mnt/data/eric_tttopd/outputs_ale_bench_grpo_baseline_full
+  name_resolve:
+    type: nfs
+    nfs_record_root: /tmp/areal/name_resolve
+
+scheduler:
+  type: null
+
+# vLLM uses 7 GPUs, actor uses 1 GPU.
+allocation_mode: vllm[rollout]:d7p1t1+fsdp[actor]:d1p1t1
+
+rollout:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  backend: vllm:d7p1t1
+  scheduling_spec: ${actor.scheduling_spec}
+  max_concurrent_rollouts: 64
+  queue_size: null
+  consumer_batch_size: 8
+  max_head_offpolicyness: 0
+  enable_rollout_tracing: false
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+  use_lora: ${actor.use_lora}
+
+gconfig:
+  n_samples: 16
+  min_new_tokens: 0
+  max_new_tokens: 32768
+  max_tokens: 32768
+  greedy: false
+  temperature: 1.0
+  top_p: 0.95
+
+actor:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: Qwen/Qwen3-8B
+  backend: fsdp:d1p1t1
+  dtype: bfloat16
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  mb_spec:
+    max_tokens_per_mb: 32768
+    n_mbs: 8
+    granularity: 1
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars: {}
+  optimizer:
+    type: adam
+    lr: 1.0e-6
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.0
+  eps_clip: 0.2
+  temperature: ${gconfig.temperature}
+  reward_scaling: 10.0
+  reward_bias: -0.5
+  kl_ctl: 0.001
+  kl_estimator: k3
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  rejection_sampling:
+    metric: ratio
+    upper: 5.0
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+  adv_norm: null
+  max_new_tokens: ${gconfig.max_new_tokens}
+  use_lora: false
+  weight_update_mode: xccl
+
+ref: null
+critic: null
+
+vllm:
+  model: ${actor.path}
+  seed: ${seed}
+  skip_tokenizer_init: false
+  max_num_seqs: 256
+  no_enable_prefix_caching: false
+  dtype: ${actor.dtype}
+  max_model_len: 32768
+  gpu_memory_utilization: 0.9
+  enforce_eager: false
+  enable_lora: false
+
+sglang:
+  model_path: ${actor.path}
+  random_seed: ${seed}
+  skip_tokenizer_init: true
+  dtype: ${actor.dtype}
+  max_running_requests: null
+  context_length: 32768
+  mem_fraction_static: 0.8
+  enable_lora: false
+
+# Minimal sampler config required by TTTDDistillConfig.  The actual evaluation
+# creates fresh per-problem envs, so these values are mostly placeholders.
+sampler:
+  type: puct
+  batch_size: 8
+  env_type: ale_bench
+  problem_id: ahc025
+  ale_bench_lite_version: false
+  reward_scale: 100000.0
+  eval_timeout: 600
+  num_cpus: 2
+  lazy_puct_sampling: false
+
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: 5
+  freq_secs: null
+
+recover:
+  mode: 'on'
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: 5
+  freq_secs: 3600
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: 10
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false

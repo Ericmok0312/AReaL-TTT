@@ -336,17 +336,21 @@ def ale_bench_public_reward_fn(
         return 0.0, result, "", 0.0
 
     try:
-        from ale_bench.session import CodeLanguage
-
-        # Prefer the env's already-built session; creating a fresh session inside
-        # a ProcessPoolExecutor worker re-extracts the problem data and rebuilds
+        # Prefer the env's evaluation helper, which reuses the already-built
+        # session and automatically recreates it if ALE-Bench reports the
+        # session as finished/closed.  Creating a fresh session inside a
+        # ProcessPoolExecutor worker re-extracts the problem data and rebuilds
         # the Rust tools, which is very slow.
-        if env is not None and hasattr(env, "session") and env.session is not None:
-            session = env.session
+        if env is not None and hasattr(env, "_eval_code"):
             logger.info(
-                f"[ale_bench_public_reward_fn][{problem_id}] Reusing env.session"
+                f"[ale_bench_public_reward_fn][{problem_id}] "
+                f"Running public_eval via env._eval_code "
+                f"(code_len={len(code)}, session_workers={ale_bench_num_workers})"
             )
+            public_result = env._eval_code(code)
         else:
+            from ale_bench.session import CodeLanguage
+
             logger.info(
                 f"[ale_bench_public_reward_fn][{problem_id}] Getting session "
                 f"(lite={lite_version}, workers={ale_bench_num_workers})"
@@ -357,14 +361,14 @@ def ale_bench_public_reward_fn(
                 session_duration_hours=session_duration_hours,
                 ale_bench_num_workers=ale_bench_num_workers,
             )
-        logger.info(
-            f"[ale_bench_public_reward_fn][{problem_id}] Running public_eval "
-            f"(code_len={len(code)}, session_workers={ale_bench_num_workers})"
-        )
-        public_result = session.public_eval(
-            code=code,
-            code_language=CodeLanguage.CPP20,
-        )
+            logger.info(
+                f"[ale_bench_public_reward_fn][{problem_id}] Running public_eval "
+                f"(code_len={len(code)}, session_workers={ale_bench_num_workers})"
+            )
+            public_result = session.public_eval(
+                code=code,
+                code_language=CodeLanguage.CPP20,
+            )
         case_scores = [_case_absolute_score(c) for c in public_result.case_results]
         median_score = float(np.median(case_scores)) if case_scores else 0.0
         public_rank = -1

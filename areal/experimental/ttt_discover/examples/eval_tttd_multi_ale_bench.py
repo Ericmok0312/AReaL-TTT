@@ -157,6 +157,11 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
         # alive across problems/models so that worker processes do not exit
         # between public and private eval (which would trigger atexit handlers
         # inherited from the main process and delete ALE-Bench tool dirs).
+        #
+        # The main-process env sessions used for private evaluation are
+        # recreated between models because ALE-Bench sessions become unusable
+        # after a private_eval call.  Public-eval workers detect finished/closed
+        # sessions via env._eval_code() and recreate them on demand.
         self._eval_workflow: MultiProblemTTTDiscoverWorkflowV2 | None = None
         if self._ale_bench_eval_envs:
             self._eval_workflow = self._create_eval_workflow()
@@ -420,6 +425,48 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             distill_mode=True,
         )
         return MultiProblemTTTDiscoverWorkflowV2(**eval_workflow_kwargs)
+
+    def _reset_ale_bench_eval_sessions(self):
+        """Recreate ALE-Bench env sessions in the main process for the next model.
+
+        ALE-Bench sessions become unusable after a ``private_eval`` call.  This
+        method closes the current main-process env sessions and creates fresh
+        ones so that the next model's private evaluation starts with open
+        sessions.  Public-eval workers detect finished/closed sessions via
+        ``env._eval_code()`` and recreate them on demand, so the workflow itself
+        is kept alive.
+        """
+        if not self._ale_bench_eval_enabled:
+            return
+        if self.actor.rank != 0:
+            return
+
+        logger.info("[AleBenchEval] Recreating ALE-Bench env sessions for next model")
+
+        # Recreate each main-process env session.  _recreate_session() closes
+        # the old session and builds a fresh one while keeping the env object
+        # and its configuration intact.
+        for problem_id, env in list(self._ale_bench_eval_envs.items()):
+            try:
+                env._recreate_session()
+                logger.info(f"[AleBenchEval] Recreated env session for {problem_id}")
+            except Exception as e:
+                logger.warning(
+                    f"[AleBenchEval] Failed to recreate session for {problem_id}: {e}"
+                )
+
+        # Update the fallback env reference in case the dict ordering changed.
+        self.env = None
+        if self._ale_bench_eval_envs:
+            self.env = next(iter(self._ale_bench_eval_envs.values()))
+
+        # Clear any stale cached sessions in the public-eval helper module.
+        # These are not used when env is available, but cleaning them avoids
+        # accidental reuse of a closed session.
+        try:
+            close_all_cached_ale_bench_sessions()
+        except Exception as e:
+            logger.warning(f"[AleBenchEval] Failed to close cached sessions: {e}")
 
     def _zero_lora_weights(self, engine):
         """Zero out all LoRA parameters so the model behaves like the pure base model."""
@@ -813,6 +860,10 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
             if dist.is_initialized():
                 dist.barrier()
             self._switch_model(label, version=idx)
+            # ALE-Bench env sessions used for private_eval become unusable after
+            # one model.  Recreate them before evaluating subsequent models.
+            if idx > 0:
+                self._reset_ale_bench_eval_sessions()
             all_results[label] = self._run_ale_bench_eval_for_model(
                 label, global_step=idx
             )
@@ -889,6 +940,12 @@ class TTTDAleBenchMultiEvalTrainer(PPOTrainer):
                         logger.warning(
                             f"[AleBenchEval] Failed to close session for {problem_id}: {e}"
                         )
+
+        # Also close any cached sessions held by the public-eval helper module.
+        try:
+            close_all_cached_ale_bench_sessions()
+        except Exception as e:
+            logger.warning(f"[AleBenchEval] Failed to close cached sessions: {e}")
 
         self.stats_logger.close()
 

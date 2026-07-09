@@ -33,7 +33,6 @@ import threading
 from typing import Any
 
 from ale_bench.code_language import CodeLanguage, JudgeVersion
-from ale_bench.error import AleBenchError
 from ale_bench.result import JudgeResult
 from ale_bench.start import start
 
@@ -377,7 +376,13 @@ Execution time limit: {time_limit} sec / Memory limit: {memory_limit} MiB
         )
 
     def _eval_code(self, code: str) -> Any:
-        """Run ALE-Bench evaluation, recreating the session if it has finished."""
+        """Run ALE-Bench evaluation, recreating the session if it has finished.
+
+        ALE-Bench sessions may become unusable after their resource budget is
+        exhausted (``session is finished``) or after a ``private_eval`` closes
+        the session (``session is closed``).  In those cases we rebuild the
+        session once and retry.
+        """
         max_retries = 1
         last_error: Exception | None = None
         for attempt in range(max_retries + 1):
@@ -397,13 +402,16 @@ Execution time limit: {time_limit} sec / Memory limit: {memory_limit} MiB
                         memory_limit=self.problem.constraints.memory_limit,
                         skip_local_visualization=True,
                     )
-            except AleBenchError as e:
+            except Exception as e:
                 last_error = e
                 error_msg = str(e)
-                if "session is finished" in error_msg.lower() and attempt < max_retries:
+                if (
+                    "session is finished" in error_msg.lower()
+                    or "session is closed" in error_msg.lower()
+                ) and attempt < max_retries:
                     logger.warning(
-                        f"[AleBenchEnv] session finished on attempt {attempt + 1}, "
-                        f"recreating session and retrying"
+                        f"[AleBenchEnv] session unusable on attempt {attempt + 1} "
+                        f"({error_msg}); recreating session and retrying"
                     )
                     self._recreate_session()
                 else:
