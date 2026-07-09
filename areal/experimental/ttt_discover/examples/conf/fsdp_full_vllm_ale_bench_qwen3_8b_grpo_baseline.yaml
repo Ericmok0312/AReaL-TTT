@@ -25,6 +25,10 @@ ale_bench_problem_ids:
 ale_bench_lite_version: false
 ale_bench_num_workers: 2
 ale_bench_n_repeats: 20
+# Public-eval raw scores are much smaller than private-eval standings totals.
+# Use a fixed divisor so that avg_raw_score / reward_scale stays in a range
+# that is readable in logs and safe for float32 group normalization.
+ale_bench_reward_scale: 100000.0
 
 tokenizer_path: ${actor.path}
 
@@ -57,7 +61,7 @@ rollout:
   use_lora: ${actor.use_lora}
 
 gconfig:
-  n_samples: 32
+  n_samples: 16
   min_new_tokens: 0
   max_new_tokens: 32768
   max_tokens: 32768

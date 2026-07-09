@@ -90,6 +90,7 @@ class AleBenchGRPOConfig(GRPOConfig):
     ale_bench_lite_version: bool = False
     ale_bench_num_workers: int = 2
     ale_bench_n_repeats: int = 10
+    ale_bench_reward_scale: float | None = None
     enable_thinking: bool = True
 
 
@@ -143,6 +144,7 @@ def main(args: list[str]) -> None:
         log_dir=config.cluster.fileroot,
         num_cpus=config.ale_bench_num_workers,
         problem_ids=config.ale_bench_problem_ids,
+        reward_scale=config.ale_bench_reward_scale,
     )
 
     workflow_kwargs = dict(

@@ -24,7 +24,7 @@ logger = logging.getLogger("AleBenchBaselineReward")
 
 # Per-worker environment cache.  Each ProcessPoolExecutor worker keeps its own
 # cache, so ALE-Bench sessions are reused across rollouts for the same problem.
-_ENV_CACHE: dict[tuple[str, bool, str, int], AleBenchEnv] = {}
+_ENV_CACHE: dict[tuple[str, bool, str, int, float | None], AleBenchEnv] = {}
 
 
 def build_ale_bench_prompt(problem_id: str, lite_version: bool = False) -> str:
@@ -65,20 +65,26 @@ def _is_picklable(obj: Any) -> bool:
 
 
 def _get_env(
-    problem_id: str, lite_version: bool, log_dir: str, num_cpus: int
+    problem_id: str,
+    lite_version: bool,
+    log_dir: str,
+    num_cpus: int,
+    reward_scale: float | None = None,
 ) -> AleBenchEnv:
     """Return a cached ``AleBenchEnv`` for the given problem."""
-    key = (problem_id, lite_version, log_dir, num_cpus)
+    key = (problem_id, lite_version, log_dir, num_cpus, reward_scale)
     if key not in _ENV_CACHE:
         logger.info(
             f"[AleBenchBaselineReward] Creating env for {problem_id} "
-            f"(lite={lite_version}, log_dir={log_dir}, num_cpus={num_cpus})"
+            f"(lite={lite_version}, log_dir={log_dir}, num_cpus={num_cpus}, "
+            f"reward_scale={reward_scale})"
         )
         _ENV_CACHE[key] = AleBenchEnv(
             problem_id=problem_id,
             lite_version=lite_version,
             log_dir=log_dir,
             num_cpus=num_cpus,
+            reward_scale=reward_scale,
         )
     return _ENV_CACHE[key]
 
@@ -94,6 +100,12 @@ class AleBenchBaselineRewardFn:
         Scratch directory passed to ``AleBenchEnv``.
     num_cpus
         Number of ALE-Bench workers used per public evaluation.
+    reward_scale
+        Per-problem reward normalization divisor forwarded to ``AleBenchEnv``.
+        If None, the env auto-computes the scale from private-eval standings,
+        which is usually orders of magnitude too large for public-eval rewards.
+        A fixed value such as ``1e5`` makes early-training rewards visible and
+        keeps float32 group normalization healthy.
     """
 
     def __init__(
@@ -102,10 +114,12 @@ class AleBenchBaselineRewardFn:
         log_dir: str = "./outputs_ale_bench",
         num_cpus: int = 2,
         problem_ids: list[str] | None = None,
+        reward_scale: float | None = None,
     ):
         self.lite_version = lite_version
         self.log_dir = log_dir
         self.num_cpus = num_cpus
+        self.reward_scale = reward_scale
 
         # Pre-create ALE-Bench envs in the main process and carry them into
         # ProcessPoolExecutor workers.  This avoids the slow/problematic
@@ -113,7 +127,9 @@ class AleBenchBaselineRewardFn:
         self._envs: dict[str, AleBenchEnv] = {}
         if problem_ids:
             for problem_id in problem_ids:
-                env = _get_env(problem_id, lite_version, log_dir, num_cpus)
+                env = _get_env(
+                    problem_id, lite_version, log_dir, num_cpus, reward_scale
+                )
                 if _is_picklable(env):
                     self._envs[problem_id] = env
                 else:
@@ -140,7 +156,11 @@ class AleBenchBaselineRewardFn:
             env = self._envs.get(problem_id)
             if env is None:
                 env = _get_env(
-                    problem_id, self.lite_version, self.log_dir, self.num_cpus
+                    problem_id,
+                    self.lite_version,
+                    self.log_dir,
+                    self.num_cpus,
+                    self.reward_scale,
                 )
             code = env.extract_code(completions)
             if code is None or not code.strip():
