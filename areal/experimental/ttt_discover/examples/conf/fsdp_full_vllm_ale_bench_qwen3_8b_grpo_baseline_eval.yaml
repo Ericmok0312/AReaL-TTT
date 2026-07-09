@@ -43,8 +43,8 @@ multi_teacher:
 # Models to evaluate: base model + the two GRPO checkpoints.
 eval_models:
   #baseline: null
-  step4: /mnt/data/eric_tttopd/outputs_ale_bench_grpo_baseline_full/checkpoints/eric/ale-bench-grpo-baseline-full-qwen3-8b/trial0/default/epoch0epochstep4globalstep4
-  step9: /mnt/data/eric_tttopd/outputs_ale_bench_grpo_baseline_full/checkpoints/eric/ale-bench-grpo-baseline-full-qwen3-8b/trial0/default/epoch0epochstep9globalstep9
+  step5: /mnt/data/eric_tttopd/outputs_ale_bench_grpo_baseline_full/checkpoints/eric/ale-bench-grpo-baseline-full-qwen3-8b/trial0/default/epoch0epochstep4globalstep4
+  step10: /mnt/data/eric_tttopd/outputs_ale_bench_grpo_baseline_full/checkpoints/eric/ale-bench-grpo-baseline-full-qwen3-8b/trial0/default/epoch0epochstep9globalstep9
 
 tokenizer_path: ${actor.path}
 
